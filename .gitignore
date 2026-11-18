@@ -1,0 +1,70 @@
+# Bring your own game. Nothing from the disc, title update or map packs is committed.
+*.iso
+*.xiso
+*.xbe
+!xboxrecomp-toolkit/tools/conformance/test.xbe
+*.xbx
+*.map
+game/
+game_files/
+tu15-content/
+update15-extract/
+Update 1.5 - Maps/
+SaveData/
+SaveData.*/
+DiskConfig.bin
+*.cachemap
+# Reference decomp and XDK material (not ours to publish)
+halo2-decompiled/
+XDK*.exe
+*Recovery*.zip
+
+# Title update delta patches (derived from Microsoft's TU binary; held back pending a decision)
+*.bsdiff
+
+# Emulator, BIOS, EEPROM and HDD images
+xemu*/
+*.qcow2
+*.img
+mcpx*.bin
+*bios*.bin
+eeprom*.bin
+*.eeprom
+*.vhd
+*.vhdx
+
+# Build output
+build/
+build-*/
+out/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.dmp
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Release packages, backups, captures, logs
+*.zip
+pkg-*/
+backup-*/
+shots*/
+screenshots/
+scratch-*/
+*.log
+*.rdc
+*.draws.csv
+perf/
+runs/
+
+# Secrets
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.pfx
+*.ppk
+.env

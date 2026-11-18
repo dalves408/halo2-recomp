@@ -1,0 +1,37 @@
+/* Shared video settings for Halo 2 Native 1.5 (F1 overlay and Config.exe). */
+#ifndef HALO2_SETTINGS_H
+#define HALO2_SETTINGS_H
+
+#include <stddef.h>
+
+typedef struct Halo2Settings {
+    int resolution_scale; /* 1..5 */
+    int fullscreen;       /* 0/1 */
+    int vsync;            /* 0/1 */
+    int anisotropy;       /* 1=off, or 2/4/8/16 */
+    int fxaa;             /* 0/1 */
+    int msaa;             /* 1=off, or 2/4/8 */
+} Halo2Settings;
+
+void halo2_settings_defaults(Halo2Settings *s);
+void halo2_settings_ini_path(char *buf, size_t n);
+int  halo2_settings_load(Halo2Settings *s);
+int  halo2_settings_save(const Halo2Settings *s);
+
+/* Apply environment overrides from the ini (only keys not already in the
+ * environment) and remember the loaded values. Call before the D3D11 back
+ * end is installed. */
+void halo2_settings_boot(void);
+
+const Halo2Settings *halo2_settings_get(void);
+void halo2_settings_copy(Halo2Settings *s);
+
+/* Write the struct, save the ini, and queue a live GPU apply. The GPU
+ * thread picks the change up through halo2_settings_pump(). */
+int  halo2_settings_apply(const Halo2Settings *s, int save);
+
+void halo2_gpu_apply_live(const Halo2Settings *s);
+void halo2_settings_pump(void);
+const char *halo2_settings_last_apply(void);
+
+#endif

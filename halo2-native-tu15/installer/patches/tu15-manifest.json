@@ -1,0 +1,29 @@
+{
+  "title": "Halo 2",
+  "title_id": "4D530064",
+  "update": "TU 0000000300000803 (cert version 0x803, April 2007, '1.5')",
+  "retail_id": "Halo 2 retail 1.0 (cert version 3), USA/Europe disc",
+  "files": [
+    {
+      "name": "default.xbe",
+      "source_sha256": "03215919bb7163259257d361f4c7bf802a7ab12aa85e2689436369b5c427935d",
+      "source_size": 4861952,
+      "target_sha256": "21b207e7efdacaf6124a0822837f8be570766a42505057f7fd2d2ba8f409c4fd",
+      "target_size": 4919296,
+      "patch": "patches/default.xbe.tu15.bsdiff",
+      "patch_sha256": "6c818189d5c18cb7957975db7bca53033f215ec9c270d8ea438fe1205387173b",
+      "patch_size": 270291
+    },
+    {
+      "name": "downloader.xbe",
+      "source_sha256": "9b10c5796f7375dc73352d7751ae45a81db8be3906ab3f523d21f7ff1c03c698",
+      "source_size": 1134592,
+      "target_sha256": "1c42be8d10e7b97eec68d7be50ab3e2a9e086c0e9b21aea25975fda08785856d",
+      "target_size": 1134592,
+      "patch": "patches/downloader.xbe.tu15.bsdiff",
+      "patch_sha256": "aa963d9fdb6038962ed9db412de0d1584ee333c6f9233737ad649f05b6fb6c36",
+      "patch_size": 869
+    }
+  ],
+  "notes": "The TU itself ships only default.xbe and downloader.xbe (+ContentMeta.xbx). patch_v3.lvl and the maps belong to the map packs (separate optional download). $u is NOT installed: the recompiled exe already is the 1.5 code."
+}
