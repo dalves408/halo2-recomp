@@ -45,3 +45,21 @@ patch(p, "    MEM32(ebp + -8) = 7;\n    goto loc_001939FA;\n\nloc_001939FA: ;",
       "    MEM32(ebp + -8) = 7;\n    goto loc_001939FA;\n\n" + "".join(
           f"loc_{a:08X}: ;\n    MEM32(ebp + -8) = {v};\n    goto loc_001939FA;\n\n" for a, v in ((0x1939D8, 12), (0x1939E1, 13), (0x1939EA, 14), (0x1939F3, 15)))
       + "loc_001939FA: ;", "loc_001939D8: ;")
+
+# 3. XNet 0x003DE27B (secure address for a service, behind stub 0x003D73F6): the lifter took
+#    0x003DE2BA -- the second byte of `jz 0x003DE2FF` at 0x003DE2B9 -- for a function start,
+#    so sub_003DE27B stops at 0x003DE2BB and its success path (the code at 0x003DE2BB) never
+#    runs: the function returned the lookup pointer, the logon read that as an error, and
+#    Xbox Live sign-in ended in 0x80151001 with no packet sent to the security gateway.
+#    sub_003DE2BA holds a correct translation of 0x003DE2BB on, after one bogus `inc esp`.
+p = find("void sub_003DE2BA(void)")
+patch(p, "loc_003DE2BA: ;\n    esp++;\n",
+      "loc_003DE2BA: ;\n    /* 0x003DE2BA is mid-instruction (hand fix): the real code starts at\n"
+      "     * 0x003DE2BB, reached only as sub_003DE27B's fall-through. */\n",
+      "reached only as sub_003DE27B's fall-through")
+p = find("void sub_003DE27B(void)")
+patch(p, "    if (CMP_EQ(_fa, _fb)) { g_seh_ebp = ebp; sub_003DE2FF(); return; } /* je: equal / zero */\n\n}",
+      "    if (CMP_EQ(_fa, _fb)) { g_seh_ebp = ebp; sub_003DE2FF(); return; } /* je: equal / zero */\n"
+      "    /* fall through to 0x003DE2BB (hand fix, see sub_003DE2BA) */\n"
+      "    g_seh_ebp = ebp; sub_003DE2BA(); return;\n}",
+      "fall through to 0x003DE2BB (hand fix")

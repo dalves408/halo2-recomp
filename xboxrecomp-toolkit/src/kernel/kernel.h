@@ -940,6 +940,7 @@ enum {
     XBOX_IRQ_APU,
     XBOX_IRQ_OHCI,
     XBOX_IRQ_PGRAPH,
+    XBOX_IRQ_NIC,       /* the Ethernet controller (nvnet.c) */
     XBOX_IRQ_LINES
 };
 /* What xbox_IrqPost tells the device model to do. */

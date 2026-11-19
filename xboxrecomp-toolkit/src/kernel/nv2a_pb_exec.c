@@ -6269,6 +6269,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                         (unsigned)s_gpu.flip_read, (unsigned)s_gpu.flip_write, (unsigned)s_gpu.flip_modulo, 10);
             }
         }
+        /* An anti-aliased frame is shown from the buffer it was filtered into.
+         * XDK D3D renders a multisampled frame into a supersampled buffer
+         * (2x the pitch: 1280x960 for 640x480), and Present filters it into
+         * the 640x480 front buffer with a textured draw, then flips that.
+         * Halo 2's disc downloader then starts the next frame in the big
+         * buffer before the flip is seen here, so "the buffer drawn last"
+         * named the supersampled one and the window showed its top half
+         * stretched. Scanout is the bound target in that case. */
+        if (s_gpu.drawn_offset && s_gpu.color_offset && s_gpu.drawn_offset != s_gpu.color_offset
+            && s_gpu.pitch && s_gpu.drawn_pitch == 2u * s_gpu.pitch) {
+            s_gpu.drawn_offset = s_gpu.color_offset;
+            s_gpu.drawn_pitch = s_gpu.pitch;
+        }
         s_frame_in_guest = !backend_draws();
         if (backend_draws() && s_xbackend && s_xbackend->readback) {
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;

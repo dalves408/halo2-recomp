@@ -42,12 +42,14 @@
 #include <xbox/xboxrecomp.h>
 #include <kernel/nv2a_backend.h>
 #include <usb/ohci.h>
+#include <kernel/nvnet.h>
 #include "gpu/d3d11_backend.h"
 #include "settings.h"
 #include "overlay.h"
 #include "perf_counters.h"
 #include "perf_sampler.h"
 #include "kernel/recomp_perf.h"
+#include "h2_frame.h"
 
 /* Hybrid laptops: ask the NVIDIA (Optimus) and AMD (PowerXpress) drivers to run
  * this process on the discrete GPU. The D3D11 backend also asks DXGI for the
@@ -96,12 +98,23 @@ extern ptrdiff_t g_xbox_mem_offset;
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
+#ifdef H2_DOWNLOADER
+/* The disc's content downloader (Downloader.xbe, the same title id), built as
+ * its own program; the game hands over to it with XLaunchNewImage. */
+#define YOUR_GAME_ENTRY_POINT   0x0001BEFF  /* downloader.xbe entry point */
+#define YOUR_GAME_XBE_PATH      "game/downloader.xbe"
+#else
 #define YOUR_GAME_ENTRY_POINT   0x002DA9DE  /* XBE entry point VA (TU 1.5 / cert 0x803; base 1.0 was 0x002D0AEE) */
 #define YOUR_GAME_XBE_PATH      "game/default.xbe"
+#endif
 #define YOUR_GAME_DIR           "game"
 
 /* Halo 2's XDK Direct3D device and its completion fields. */
+#ifdef H2_DOWNLOADER
+#define HALO2_D3D_DEVICE_PTR    0x0004F4C8u /* downloader.xbe: matched to the game's 0x00411568 by code bytes */
+#else
 #define HALO2_D3D_DEVICE_PTR    0x00411568u /* TU 1.5 (base 1.0: 0x00407488; D3D section moved +0xA0E0) */
+#endif
 #define HALO2_D3D_FENCE_GET_PTR 0x30u
 #define HALO2_D3D_FENCE_EVENT  0x1DCCu
 #define HALO2_D3D_FENCE_NOTIFY 5u
@@ -448,6 +461,37 @@ static DWORD WINAPI halo2_dsp_probe(LPVOID arg)
 
 int g_halo2_single_vblank;
 
+#ifndef H2_DOWNLOADER
+/* 30 fps on Xbox Live, 60 fps everywhere else.
+ *
+ * Halo 2 simulates 30 ticks a second whatever the frame rate (0x004F2C5C
+ * counts them). At 60 fps a frame is not tied to a tick: measured in an
+ * Insignia match, a quarter of the ticks were shown for 1 frame and a quarter
+ * for 3 (2026-11-19), which reads as jitter. Until frames are paced to ticks,
+ * an Xbox Live match goes back to the console's one frame per tick. Only a
+ * match counts: the router seeing game traffic on UDP 3074 (8 or more packets
+ * in a second, nvnet_nat.c), not a signed-in console's keep-alives with the
+ * security gateway. Campaign and system link (which never goes through the
+ * router) keep 60 fps, signed in or not; 10 s after the match traffic stops
+ * it is 60 again. RECOMP_HALO2_LIVE_60=1 keeps 60 fps in Live matches too. */
+int nat_live_match_recent(unsigned ms);   /* toolkit nvnet_nat.c */
+static DWORD WINAPI halo2_live_fps_watch(LPVOID unused)
+{
+    int in_match_was = 0;
+    (void)unused;
+    for (;;) {
+        int in_match = nat_live_match_recent(10000);
+        Sleep(500);
+        if (in_match == in_match_was)
+            continue;
+        in_match_was = in_match;
+        g_halo2_single_vblank = !in_match;
+        fprintf(stderr, "[FPS] %s\n", in_match ? "Xbox Live match: 30 fps (one frame per simulation tick)"
+                                               : "no Xbox Live match: back to 60 fps");
+    }
+}
+#endif
+
 int main(void)
 {
     void *xbe_data = NULL;
@@ -456,6 +500,31 @@ int main(void)
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+#ifndef H2_DOWNLOADER
+    {   /* The process the player started is only the window (h2_frame.c): the
+         * game and its downloader run inside it as their own processes. */
+        int frame_exit = 0;
+        if (h2_frame_main(&frame_exit))
+            return frame_exit;
+    }
+#endif
+    {   /* Inside the frame: draw into it (toolkit fb_present.c, RECOMP_FB_PARENT). */
+        const char *frame = getenv("H2_FRAME_HWND");
+        if (frame && *frame && !getenv("RECOMP_FB_PARENT"))
+            _putenv_s("RECOMP_FB_PARENT", frame);
+    }
+    {   /* Windows 11 throttles a process with no visible top-level window of
+         * its own, which a process drawing inside the frame is: it ignores the
+         * 1 ms timer resolution and runs on efficiency settings. CounterStrikeXB
+         * froze within a minute that way; opt out of both. */
+        PROCESS_POWER_THROTTLING_STATE pt;
+        memset(&pt, 0, sizeof pt);
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        pt.StateMask = 0;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
+    }
 
     const char *single_vblank = getenv("RECOMP_HALO2_SINGLE_VBLANK");
     /* 60 FPS by default (frame target one vblank instead of two); game speed
@@ -470,6 +539,20 @@ int main(void)
     if (!getenv("RECOMP_TITLE_KEVENTS")) _putenv_s("RECOMP_TITLE_KEVENTS", "1");
     if (!getenv("RECOMP_DISPATCH_GATE")) _putenv_s("RECOMP_DISPATCH_GATE", "1");
     if (!getenv("RECOMP_USB")) _putenv_s("RECOMP_USB", "1");
+#ifdef H2_DOWNLOADER
+    /* The disc downloader's XAPI takes its controllers from the bring-up scan
+     * (ohci.c, RECOMP_USB_PLUG). Marked as the downloader's own, because the
+     * environment goes with the hand-over back to the game. */
+    if (!getenv("RECOMP_USB_PLUG")) {
+        _putenv_s("RECOMP_USB_PLUG", "boot");
+        _putenv_s("H2_USB_PLUG_SET_BY_DOWNLOADER", "1");
+    }
+#else
+    if (getenv("H2_USB_PLUG_SET_BY_DOWNLOADER")) {   /* back from the downloader */
+        _putenv_s("RECOMP_USB_PLUG", "");
+        _putenv_s("H2_USB_PLUG_SET_BY_DOWNLOADER", "");
+    }
+#endif
     /* fix3: 8 x 512-sample device buffers (pacing 2048..4096 queued, 43-85 ms)
      * instead of 4. The sequencer hold (apu_core.c, APU_SEQ_HOLD_US) renders
      * nothing for 5-10 ms at each SSL interrupt; with the default 1024-sample
@@ -570,6 +653,16 @@ int main(void)
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
     xbox_OhciInit();
+    /* The MCPX Ethernet controller: System Link, and Xbox Live through
+     * Insignia with the player's own console identity (RECOMP_NET=1). */
+    xbox_NvnetInit();
+#ifndef H2_DOWNLOADER
+    {
+        const char *live60 = getenv("RECOMP_HALO2_LIVE_60");
+        if (g_halo2_single_vblank && getenv("RECOMP_NET") && !(live60 && *live60 == '1'))
+            CloseHandle(CreateThread(NULL, 0, halo2_live_fps_watch, NULL, 0, NULL));
+    }
+#endif
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;

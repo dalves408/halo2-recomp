@@ -10,7 +10,10 @@
  */
 
 #include "kernel.h"
+#include "nvnet.h"
+#include "console_id.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -36,7 +39,7 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
 XBOX_KRNL_VERSION xbox_KrnlVersion = {
     .Major = 1,
     .Minor = 0,
-    .Build = 5849,
+    .Build = 5838,
     .Qfe   = 1
 };
 
@@ -222,6 +225,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
+    if (getenv("RECOMP_XC_TRACE") && getenv("RECOMP_XC_TRACE")[0] == '1')
+        fprintf(stderr, "  [XC] ExQueryNonVolatileSetting 0x%X len %lu\n", (unsigned)ValueIndex, (unsigned long)ValueLength);
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
@@ -339,6 +344,69 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
             memset((uint8_t *)Value + sizeof blk, 0, ValueLength - sizeof blk);
         break;
     }
+
+    case 0x101:     /* XC_FACTORY_ETHERNET_ADDR: the NIC model's (nvnet.c) */
+        if (ValueLength >= 6) {
+            xbox_ConsoleMac((uint8_t *)Value);
+            if (Type) *Type = 3;
+            if (ResultLength) *ResultLength = 6;
+        }
+        break;
+
+    /* The factory section and the block reads, from the player's own EEPROM
+     * (console_id.c): Xbox Live identifies a console by them. XNet reads the
+     * whole EEPROM (XC_MAX_ALL) at start-up for its identity. Without an
+     * EEPROM these fall to the default below as before. */
+    case 0x100:     /* XC_FACTORY_SERIAL_NUMBER */
+    case 0x102:     /* XC_FACTORY_ONLINE_KEY */
+    case 0x103:     /* XC_FACTORY_AV_REGION */
+    case 0x104:     /* XC_FACTORY_GAME_REGION */
+    case 0x1FF:     /* XC_MAX_FACTORY */
+    case 0xFFFE:    /* XC_ENCRYPTED_SECTION */
+    case 0xFFFF:    /* XC_MAX_ALL */
+        if (xbox_ConsoleHasEeprom()) {
+            const uint8_t *ee = xbox_ConsoleEeprom();
+            uint8_t all[256];
+            const uint8_t *src = NULL;
+            ULONG need = 0, type = 3;
+            uint32_t region;
+            switch (ValueIndex) {
+            case 0x100: src = ee + 0x34; need = 12; break;
+            case 0x102: src = ee + 0x48; need = 16; break;
+            case 0x103: src = ee + 0x58; need = 4; type = 4; break;
+            case 0x104:
+                region = xbox_ConsoleGameRegion();
+                if (!region) region = 1;                 /* North America, the disc's */
+                memcpy(all, &region, 4); src = all; need = 4; type = 4;
+                break;
+            case 0x1FF: src = ee + 0x30; need = 0x30; break;
+            case 0xFFFE: src = ee; need = 0x30; break;
+            default: {
+                /* the EEPROM with this runtime's user settings over 0x60..0xBF */
+                ULONG rl = 0;
+                memcpy(all, ee, 256);
+                if (xbox_ExQueryNonVolatileSetting(XC_MAX_OS, NULL, all + 0x60, 0x60, &rl) == STATUS_SUCCESS) {
+                    uint32_t c = xbox_EepromChecksum(all + 0x64, 0x5C);
+                    memcpy(all + 0x60, &c, 4);
+                }
+                src = all; need = 256;
+                break;
+            }
+            }
+            if (Type) *Type = type;
+            if (ResultLength) *ResultLength = need;
+            if (ValueLength < need)
+                return 0xC0000023L;                      /* STATUS_BUFFER_TOO_SMALL */
+            memcpy(Value, src, need);
+            break;
+        }
+        /* no EEPROM: as before */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
+            "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
+        memset(Value, 0, ValueLength);
+        if (Type) *Type = 4;
+        if (ResultLength) *ResultLength = ValueLength;
+        break;
 
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,

@@ -440,6 +440,19 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 /* Pads plugged in so far, in port order. */
 static int s_plugged_pads;
 
+/* RECOMP_USB_PLUG=boot: present the first pad from power-on (see ohci_reset). */
+static int s_plug_boot;
+
+/* The root port the first pad appears on: port 3 (index 2), controller port 1,
+ * when there are four; RECOMP_USB_PORT (0..3) picks another. */
+static unsigned plug_port(void)
+{
+    const char *pspec = getenv("RECOMP_USB_PORT");
+    unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
+    if (port >= s_ndp) port = s_ndp - 1u;
+    return port;
+}
+
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
  * is the plugged pad that has not been given one yet. Pads are plugged one
@@ -528,7 +541,7 @@ static int s_stack_is_ram = 1;
  * MmGetPhysicalAddress passes those addresses through unchanged, so a buffer
  * number inside it is the stack.
  *
- * Halo 2 shows why this matters (a laptop crash, 2026-11-16). XAPI reads a
+ * Halo 2 shows why this matters (HP Victus crash, 2026-11-16). XAPI reads a
  * 6-byte control-transfer answer into a buffer on the main thread's stack
  * (0x00F7FDB7; the stack runs 0x00780000-0x00F80000). Halo has pinned 22 MB of
  * contiguous memory at 0x3A6000 by then, so the high-water test below sent
@@ -536,7 +549,7 @@ static int s_stack_is_ram = 1;
  * permanent block that Halo has made PAGE_READONLY with XPhysicalProtect. The
  * OHCI thread then faulted in memcpy. Whether it happened depended on whether
  * the movie block was protected before the pad's enumeration, so it crashed
- * on every launch on one test machine and on some launches on another.
+ * on every launch on one test PC and on some launches on another.
  *
  * Heap pages the title named as RAM (map value 1) are RAM for the same
  * reason. Window names keep the old order, so Burnout 3's converted
@@ -546,6 +559,20 @@ static uint32_t bus_resolve(uint32_t addr)
 {
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
+    /* What the driver's own MmGetPhysicalAddress call named, when it named
+     * anything: that is the storage it wrote, whatever range the number falls
+     * in. Halo 2's disc downloader shows why this has to come before the
+     * stack rule below: its contiguous descriptors are at physical 0x00A65000,
+     * which lies inside the main thread's stack range (0x780000-0xF80000), so
+     * the stack rule read every ED as zeroes, no transfer ever ran and the
+     * downloader asked for its controller forever. */
+    if (s_stack_is_ram && addr && addr < (64u << 20)) {
+        uint8_t named = xbox_PhysLastTranslationMap()[addr >> 12];
+        if (named == 2)
+            return OHCI_CONTIG_BASE + addr;
+        if (named == 1)
+            return addr;
+    }
     if (s_stack_is_ram && addr >= g_xbox_region_base && addr < XBOX_HEAP_BASE)
         return addr;
     if (s_stack_is_ram && addr && addr < (64u << 20)
@@ -819,6 +846,12 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
             uint32_t cc = ohci_do_td(hc, ed0, td);
 
+            if (s_trace) {
+                static unsigned nr;
+                if (nr++ < 60)
+                    fprintf(stderr, "  [OHCI%d] retire TD %08X ctl=%08X next=%08X cc=%u ed %08X head=%08X tail=%08X "
+                                    "done-before=%08X\n", hc->index, td, rd32(td), next, cc, ed, head, tail, *done_head);
+            }
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
             wr32(td, (rd32(td) & 0x0FFFFFFFu) | (cc << 28));
@@ -1112,6 +1145,14 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
             hc->reg[(HcRhPortStatus1 + p * 4) / 4] =
                 (p < s_ndp) ? PORT_PPS : 0u;
     }
+    /* RECOMP_USB_PLUG=boot: the pad is there from power-on instead, as on a
+     * console. The older XAPI in Halo 2's disc downloader takes its list of
+     * controllers from the bring-up scan and, finding port 1 empty there,
+     * shows "Please reconnect the controller to port 1" and never leaves it
+     * for a pad that arrives afterwards; xemu, with the pad present at boot,
+     * goes straight on to Xbox Live sign-in. */
+    if (s_plug_boot && hc->index == s_device_hc)
+        hc->reg[(HcRhPortStatus1 + plug_port() * 4) / 4] |= PORT_CCS | PORT_CSC;
 }
 
 /* The controller, running on its own thread.
@@ -1193,15 +1234,20 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * change during its own bring-up scan, and a reset clears interrupt
          * status, so a device that was always there is one that never
          * arrives. */
+        if (!plugged && s_plug_boot) {
+            /* Present since power-on (ohci_reset): already arrived. */
+            plugged = 1;
+            s_plugged_pads = 1;
+            first_port = plug_port();
+            fprintf(stderr, "  [OHCI0] operational after %u ms; device present "
+                            "since power-on on port %u\n", waited * 20, first_port + 1);
+            fflush(stderr);
+        }
         if (!plugged && (enable & INTR_RHSC)) {
             /* Which port the device appears on decides which controller slot
              * XAPI assigns it, and a title that reads "player 1" without
-             * asking which port pressed Start looks at slot 0. The default is
-             * root port 3 (index 2), controller port 1, when there are four;
-             * RECOMP_USB_PORT (0..3) picks another. */
-            const char *pspec = getenv("RECOMP_USB_PORT");
-            unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
-            if (port >= s_ndp) port = s_ndp - 1u;
+             * asking which port pressed Start looks at slot 0. */
+            unsigned port = plug_port();
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
@@ -1431,6 +1477,10 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    {
+        const char *pl = getenv("RECOMP_USB_PLUG");
+        s_plug_boot = pl && (strcmp(pl, "boot") == 0 || strcmp(pl, "BOOT") == 0);
+    }
     {
         const char *sr = getenv("RECOMP_USB_STACK_RAM");
         s_stack_is_ram = !(sr && sr[0] == '0');

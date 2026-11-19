@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
+#include "console_id.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 #include "recomp_icall_feedback.h"
@@ -213,13 +214,17 @@ static void kernel_data_init(void)
     /* XboxKrnlVersion (ordinal 324) - XBOX_KRNL_VERSION
      *   +0: USHORT Major (1)
      *   +2: USHORT Minor (0)
-     *   +4: USHORT Build (5849 = XDK version)
-     *   +6: USHORT Qfe (0)
+     *   +4: USHORT Build
+     *   +6: USHORT Qfe
+     * 1.0.5838.1, the retail kernel most consoles run (and the one Xbox Live
+     * services see from them); 5849 was an SDK build no retail console had.
+     * RECOMP_XBOX_KERNEL_BUILD overrides the build number.
      */
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
+    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) =
+        (uint16_t)(getenv("RECOMP_XBOX_KERNEL_BUILD") ? atoi(getenv("RECOMP_XBOX_KERNEL_BUILD")) : 5838);
+    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 1;
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
@@ -240,8 +245,27 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *handed = getenv("RECOMP_LAUNCH_DATA_FILE");
+        FILE *lf = (handed && *handed) ? fopen(handed, "rb") : NULL;
 
-        if (cmdline && *cmdline) {
+        if (lf) {
+            /* Handed over by another title's XLaunchNewImage (see
+             * bridge_HalReturnToFirmware): the whole page as that title left
+             * it, so XGetLaunchInfo here sees exactly what it wrote. Read
+             * once: the file goes, so a later plain start gets no stale page. */
+            uint8_t buf[0x1000];
+            size_t got = fread(buf, 1, sizeof buf, lf);
+            uint32_t page = got == sizeof buf ? xbox_HeapAlloc(0x1000, 4096) : 0;
+            size_t i;
+
+            fclose(lf);
+            remove(handed);
+            for (i = 0; page && i < sizeof buf; i++)
+                BRIDGE_MEM8(page + (uint32_t)i) = buf[i];
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+            fprintf(stderr, "  Launch data: handed over, type %u, title 0x%08X\n",
+                    page ? BRIDGE_MEM32(page) : 0, page ? BRIDGE_MEM32(page + 4) : 0);
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -316,17 +340,63 @@ static void kernel_data_init(void)
     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
 
-    /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
+    /* XboxHDKey (ordinal 323) - the player's console's key when one is given
+     * (console_id.c), else 16 bytes of zeros. It signs the Xbox Live accounts
+     * and downloaded content on the drive. */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
+    xbox_ConsoleHdKey((uint8_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset));
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
+    /* XboxLANKey (ordinals 326, 355). A real kernel makes it when the title
+     * starts: HMAC-SHA1 of the certificate's LAN key, keyed with the BIOS's
+     * CERT key, first 16 bytes. XNet keys system link with it, so real
+     * consoles and xemu only hear a recompiled title that has the same key.
+     * Default 16 zeros (every recompiled copy agrees with every other);
+     * RECOMP_XBOX_LAN_KEY=<file> loads the real one, which a title's setup
+     * tool derives from the player's own BIOS -- the CERT key is
+     * Microsoft's and not built in. */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
+    {
+        const char *lk = getenv("RECOMP_XBOX_LAN_KEY");
+        FILE *f = lk ? fopen(lk, "rb") : NULL;
+        if (f) {
+            uint8_t k[16];
+            if (fread(k, 1, 16, f) == 16) {
+                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), k, 16);
+                fprintf(stderr, "  [KERNEL] XboxLANKey from file\n");
+            }
+            fclose(f);
+        }
+    }
 
     /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
+
+    /* The per-title keys a real kernel derives when the title starts (HMAC-SHA1
+     * of the certificate's keys with the BIOS's CERT key, first 16 bytes each).
+     * Xbox Live checks the title with the signature keys; zeros made Insignia's
+     * KDC refuse Halo 2's sign-in (KDC_ERR_POLICY). RECOMP_XBOX_TITLE_KEYS=<file>
+     * loads them from the player's own BIOS-derived file (installer/
+     * derive_title_keys.py): LAN key (16) + signature key (16) + 16 alternate
+     * keys (256). Nothing secret is logged. */
+    {
+        const char *tk = getenv("RECOMP_XBOX_TITLE_KEYS");
+        FILE *f = tk ? fopen(tk, "rb") : NULL;
+        if (f) {
+            uint8_t k[16 + 16 + 256];
+            if (fread(k, 1, sizeof k, f) == sizeof k) {
+                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), k, 16);
+                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), k + 16, 16);
+                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), k + 32, 256);
+                fprintf(stderr, "  [KERNEL] title keys (LAN, signature, alternate) from file\n");
+            } else
+                fprintf(stderr, "  [KERNEL] RECOMP_XBOX_TITLE_KEYS: file is not 288 bytes; keys left at zero\n");
+            SecureZeroMemory(k, sizeof k);
+            fclose(f);
+        }
+    }
 
     /* XePublicKeyData (ordinal 357) - 284 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY) + g_xbox_mem_offset), 0, 284);
@@ -1000,6 +1070,7 @@ static void bridge_NtClose(void)
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
  * PVOID MmAllocateContiguousMemory(ULONG NumberOfBytes)
  */
+void xbox_PhysNoteContiguousRange(uint32_t window_va, uint32_t size); /* kernel_memory.c */
 static void bridge_MmAllocateContiguousMemory(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -1010,6 +1081,7 @@ static void bridge_MmAllocateContiguousMemory(void)
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
 
+    if (xbox_va) xbox_PhysNoteContiguousRange(xbox_va, size);
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
                 size, xbox_va);
@@ -1096,6 +1168,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
         /* Keep the arena from handing the same pages to someone else. */
         xbox_ContiguousClaim(xbox_va, size);
+        xbox_PhysNoteContiguousRange(xbox_va, size);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -1115,6 +1188,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
         return;
     }
     xbox_va = xbox_ContiguousAllocEx(size, align, low, high);
+    if (xbox_va) xbox_PhysNoteContiguousRange(xbox_va, size);
 
     /* A refusal is the title's problem only if it says who asked: the guest
      * return address and the stack above it (the XDK wrapper's callers). */
@@ -1750,6 +1824,80 @@ static void bridge_ExQueryNonVolatileSetting(void)
     g_eax = (uint32_t)st;
 }
 
+/* XLaunchNewImage between recompiled titles.
+ *
+ * On Xbox a title starts another image by filling the launch data page and
+ * quick-rebooting (HalReturnToFirmware 2); the page carries "<device>;<file>"
+ * at +8 and the data the next image reads with XGetLaunchInfo. Halo 2 starts
+ * its disc's Downloader.xbe this way for content downloads, and the
+ * downloader comes back the same way. RECOMP_LAUNCH_MAP names the native
+ * program for each image ("downloader.xbe=build\\dl.exe;default.xbe=game.exe",
+ * matched on the file name, any case). A mapped image is started with the
+ * same environment, working directory and console, the page saved to
+ * RECOMP_LAUNCH_DIR\LaunchData.bin (default SaveData, the install's own
+ * folder) and named by RECOMP_LAUNCH_DATA_FILE; this process then exits. */
+static void launch_handoff(const char *xbe_path, uint32_t page)
+{
+#ifdef _WIN32
+    const char *map = getenv("RECOMP_LAUNCH_MAP"), *dir = getenv("RECOMP_LAUNCH_DIR");
+    const char *file = strrchr(xbe_path, ';'), *p;
+    char exe[MAX_PATH] = "", data[MAX_PATH], cmd[MAX_PATH + 2];
+    size_t flen;
+    FILE *f;
+    uint8_t buf[0x1000];
+    uint32_t i;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+
+    if (!map || !*map) return;
+    file = file ? file + 1 : xbe_path;
+    if ((p = strrchr(file, '\\')) != NULL) file = p + 1;
+    flen = strlen(file);
+    for (p = map; *p; ) {                                   /* "name=exe;name=exe" */
+        const char *eq = strchr(p, '='), *end = strchr(p, ';');
+        if (!end) end = p + strlen(p);
+        if (eq && eq < end && (size_t)(eq - p) == flen && !_strnicmp(p, file, flen)) {
+            size_t n = (size_t)(end - eq - 1);
+            if (n >= sizeof exe) n = sizeof exe - 1;
+            memcpy(exe, eq + 1, n);
+            exe[n] = 0;
+            break;
+        }
+        p = *end ? end + 1 : end;
+    }
+    if (!exe[0]) {
+        fprintf(stderr, "  [KERNEL] launch of '%s': no program mapped (RECOMP_LAUNCH_MAP)\n", file);
+        return;
+    }
+    snprintf(data, sizeof data, "%s\\LaunchData.bin", (dir && *dir) ? dir : "SaveData");
+    for (i = 0; i < sizeof buf; i++) buf[i] = BRIDGE_MEM8(page + i);
+    if (!(f = fopen(data, "wb")) || fwrite(buf, 1, sizeof buf, f) != sizeof buf) {
+        if (f) fclose(f);
+        fprintf(stderr, "  [KERNEL] launch of '%s': cannot write %s\n", file, data);
+        return;
+    }
+    fclose(f);
+    SetEnvironmentVariableA("RECOMP_LAUNCH_DATA_FILE", data);
+    snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    fprintf(stderr, "  [KERNEL] launching '%s' as %s\n", file, exe);
+    fflush(stderr);
+    if (!CreateProcessA(exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "  [KERNEL] launch of '%s' failed: error %lu\n", file, GetLastError());
+        remove(data);
+        SetEnvironmentVariableA("RECOMP_LAUNCH_DATA_FILE", NULL);
+        return;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    fflush(NULL);
+    ExitProcess(0);
+#else
+    (void)xbe_path; (void)page;
+#endif
+}
+
 /* HalReturnToFirmware(Routine) - the title asking to reboot or quit.
  *
  * It never returns on hardware. Returning here would let the game run on past
@@ -1785,6 +1933,8 @@ static void bridge_HalReturnToFirmware(void)
             for (i = 0; i < 8; i++)
                 fprintf(stderr, " %08X", BRIDGE_MEM32(page + 1024 + i * 4));
             fprintf(stderr, "\n");
+            if (routine == 2)
+                launch_handoff(path, page);     /* returns only if not handed over */
         } else {
             fprintf(stderr, "  [KERNEL] no launch data page set\n");
         }
@@ -2563,6 +2713,28 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
+
+    {   /* RECOMP_DPC_STATS=1: each DPC routine at its 1st, 10th, 100th ... run */
+        static int on = -1;
+        static uint32_t seen[32];
+        static volatile LONG hits[32];
+        int k;
+        if (on < 0) on = getenv("RECOMP_DPC_STATS") != NULL;
+        if (on) {
+            for (k = 0; k < 32 && seen[k] && seen[k] != routine; k++) ;
+            if (k < 32) {
+                LONG n;
+                if (!seen[k]) seen[k] = routine;
+                n = InterlockedIncrement(&hits[k]);
+                if (routine >= 0x003D7000u && routine < 0x003EA000u && n % 250 == 0)
+                    n = 1;                       /* XNet's: a steady pulse, to see it stop */
+                while (n >= 10 && n % 10 == 0) n /= 10;
+                if (n == 1)
+                    fprintf(stderr, "  [DPC] routine 0x%08X ran %ld time(s) (dpc %08X context %08X)\n",
+                            routine, (long)hits[k], dpc_va, context);
+            }
+        }
+    }
 
     {
         CallbackRegs saved;
@@ -3614,6 +3786,8 @@ static void bridge_KeInitializeDpc(void)
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
     BRIDGE_MEM32(dpc_va + 12) = routine; /* DeferredRoutine */
     BRIDGE_MEM32(dpc_va + 16) = context; /* DeferredContext */
+    if (getenv("RECOMP_DPC_STATS"))
+        fprintf(stderr, "  [DPC] KeInitializeDpc %08X routine %08X context %08X\n", dpc_va, routine, context);
     g_eax = 0;
 }
 
@@ -4212,7 +4386,16 @@ static void bridge_RtlNtStatusToDosError(void)
      * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
     case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
 
-    default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
+    default:
+        /* A Win32 error wrapped as a status (facility 7, 0x8007xxxx /
+         * 0xC007xxxx): its low word, as NT does. XNet reports "would block"
+         * as 0x800703E5, and XOnline waits on 997 (ERROR_IO_PENDING) for an
+         * Xbox Live reply; with 317 it gave up before the reply came. */
+        if (((status >> 16) & 0x0FFFu) == 7u)
+            g_eax = status & 0xFFFFu;
+        else
+            g_eax = 317;                         /* ERROR_MR_MID_NOT_FOUND (generic) */
+        break;
     }
 }
 
@@ -4533,6 +4716,8 @@ static NTSTATUS bridge_create_file_impl(
                         _e == 32u ? " ERROR_SHARING_VIOLATION"
                       : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
                       : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
+            if (getenv("RECOMP_FILE_HOSTPATH"))   /* debug: where it went */
+                fprintf(stderr, "  [FILE]   host path: %ls\n", xbox_LastHostPath());
             if (name.Buffer)
                 xbox_missing_note(gpath, status, (uint32_t)access,
                                   (uint32_t)disposition, (uint32_t)options, 0);
@@ -5632,9 +5817,41 @@ static void bridge_ObReferenceObjectByHandle(void)
         g_eax = 0;
         return;
     }
-    /* Other objects still have no guest body. */
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
-    g_eax = 0;  /* STATUS_SUCCESS */
+    /* An event (or anything else backed by a host handle): a small guest
+     * body registered as that handle's shadow, so KeSetEvent on it -- the
+     * way a kernel-mode caller signals what it was given -- sets the host
+     * event the title waits on. XNet's DNS lookup takes its caller's event
+     * like this, and with no object it dropped every lookup before sending
+     * one: Xbox Live sign-in failed without a packet. One body per handle,
+     * reused; a closed handle's token coming back with a new host event
+     * re-points it. */
+    {
+        static struct { uint32_t token, body; HANDLE host; } objs[128];
+        HANDLE host = handle ? bridge_resolve_handle(handle) : NULL;
+        uint32_t body = 0;
+        int i, free_i = -1;
+        if (host) {
+            for (i = 0; i < 128; i++) {
+                if (objs[i].body && objs[i].token == handle) { body = objs[i].body; break; }
+                if (!objs[i].body && free_i < 0) free_i = i;
+            }
+            if (!body && free_i >= 0 && (body = xbox_HeapAlloc(16, 16)) != 0) {
+                BRIDGE_MEM32(body + 0) = 0x00040000u;      /* Type 0 (event), Size 4 dwords */
+                BRIDGE_MEM32(body + 4) = 0;                /* SignalState */
+                BRIDGE_MEM32(body + 8) = body + 8;         /* empty wait list */
+                BRIDGE_MEM32(body + 12) = body + 8;
+                objs[free_i].token = handle;
+                objs[free_i].body = body;
+                i = free_i;
+            }
+            if (body && objs[i].host != host) {
+                objs[i].host = host;
+                ke_shadow_insert(body, host);
+            }
+        }
+        if (object_ptr) BRIDGE_MEM32(object_ptr) = body;
+        g_eax = 0;      /* STATUS_SUCCESS; an unresolvable handle keeps the old NULL answer */
+    }
 }
 
 /* ── RtlRaiseException (ordinal 302) ─────────────────────

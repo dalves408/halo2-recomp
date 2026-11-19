@@ -39,6 +39,10 @@ set(KERNEL_SOURCES
     nv2a_census.c
     nv2a_gpu_audit.c
     recomp_perf.c
+    nvnet.c
+    nvnet_link.c
+    console_id.c
+    nvnet_nat.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -59,7 +63,7 @@ endif()
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt ws2_32 iphlpapi)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

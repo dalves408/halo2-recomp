@@ -63,6 +63,7 @@
 #include "video/gpu_present.h"
 #ifdef RECOMP_DEBUG_TOOLS
 #include "screenshot.h"
+#include "tex_pack.h"
 #endif
 #include "d3d11_backend.h"
 #include "d3d11_device_status.h"
@@ -353,7 +354,7 @@ static struct {
     unsigned draws, xdraws, tris, uploads, rtt, clears, readbacks, ps_compiles, flips;
     unsigned overlap_rtt;       /* a texture inside a surface but not at its start */
     unsigned vdraws, vraw, vfall, kup, kskip;  /* draw_vsh: drawn, raw streams, CPU, constants */
-    unsigned tex_gpu, tex_cpu, tex_bc, tex_direct, tex_pitch;
+    unsigned tex_gpu, tex_cpu, tex_bc, tex_direct, tex_pitch, tex_hires;
     unsigned tex_unsupported, tex_unsupported_hits;
     unsigned tex_stale_fallback, tex_soft, tex_stale_surface;
     unsigned depth_seeds, depth_samples, depth_snapshots, depth_rejected;
@@ -525,7 +526,7 @@ static void stats_flip(void)
                         " %u visibility reads waiting %.1f ms, %u reports written"
                         " asynchronously (%u polls found one pending),"
                         " textures GPU %u CPU %u BC %u direct %u, %u stale pitches,"
-                        " unsupported %u (%u cached),"
+                        " %u hi-res replacements, unsupported %u (%u cached),"
                         " depth seeds %u samples %u snapshots %u rejected %u,"
                         " stencil aliases %u conversions %u,"
                         " guest uploads %u conflicts %u,"
@@ -538,7 +539,7 @@ static void stats_flip(void)
                 s_st.flips ? s_st.readback_ms / s_st.flips : 0.0,
                 s_q_reads, s_q_wait_ms, s_rep_written, s_rep_flushes,
                 s_st.tex_gpu, s_st.tex_cpu, s_st.tex_bc, s_st.tex_direct, s_st.tex_pitch,
-                s_st.tex_unsupported, s_st.tex_unsupported_hits,
+                s_st.tex_hires, s_st.tex_unsupported, s_st.tex_unsupported_hits,
                 s_st.depth_seeds, s_st.depth_samples, s_st.depth_snapshots, s_st.depth_rejected,
                 s_st.stencil_samples, s_st.stencil_conversions,
                 s_st.guest_uploads, s_st.guest_conflicts,
@@ -1032,6 +1033,8 @@ typedef struct {
     ID3D11DepthStencilView *msaa_dsv;
     UINT msaa_count;
     int msaa_dirty;
+    uint64_t zserial;               /* s_wserial at the last draw with this depth bound */
+    uint32_t bound_gen;             /* s_gen of that draw */
 } Depth;
 
 static Surf s_surf[MAX_SURF];
@@ -3508,6 +3511,31 @@ static int rtlog_on(void)
            (s_probe_armed && s_gen >= s_probe_armed && s_gen < s_probe_armed + 2);
 }
 
+/* The bound depth surface took part in the draw just counted in s_wserial. */
+static void note_depth_use(void)
+{
+    if (s_cur_depth) {
+        s_cur_depth->zserial = s_wserial;
+        s_cur_depth->bound_gen = s_gen;
+    }
+}
+
+/* A colour texture over depth surface d samples the depth word only while
+ * the memory is still the depth buffer: d was drawn with this frame or the
+ * last, and no colour target at the same address was written after that.
+ * Halo 2's loading screen reuses the zeta memory (834A0000) as colour; read
+ * as packed depth it lost its blue channel (yellow scanner bar). */
+static int depth_still_current(const Depth *d)
+{
+    int i;
+    if (!d->bound_gen || d->bound_gen + 1 < s_gen)
+        return 0;
+    for (i = 0; i < s_nsurf; i++)
+        if (s_surf[i].tex && s_surf[i].va == d->va && s_surf[i].wserial > d->zserial)
+            return 0;
+    return 1;
+}
+
 static void bind_targets(Surf *s, Depth *d)
 {
     if (rtlog_on() && s != s_cur)
@@ -3795,6 +3823,8 @@ typedef struct {
     int index_next;
     int index_bucket;          /* bucket used at insert, or -1 */
     uint8_t cube, unsupported, indexed;
+    uint8_t hires, lod_extra;       /* view is a texture-pack replacement (tex_pack.c) */
+    uint32_t view_levels;           /* mip levels of that view */
     uint8_t *snapshot;
     size_t snapshot_bytes;
     ID3D11Texture2D *tex;
@@ -4150,6 +4180,46 @@ static uint64_t tex_hash(const uint8_t *p, uint32_t color, size_t n)
     return hash_bytes(p, n) ^ ((uint64_t)color << 56);
 }
 
+/* RECOMP_TEX_HASH_LOG=<file>: append one line per distinct texture uploaded,
+ * "hash width height color cube offset", where hash is hash_bytes() over the
+ * face-0 level-0 guest bytes. This is the key the hi-res texture pack names
+ * carry (analysis/textures/README.md). Off unless the variable is set. */
+static void tex_hash_log(const Nv2aTexture *t, int cube, const GpuTextureLayout *layout,
+                         const uint8_t *snapshot)
+{
+    static int state = -1;
+    static FILE *f;
+    static uint64_t seen[1u << 16];
+    const GpuTextureSubresource *s0;
+    uint64_t key;
+    unsigned i;
+
+    if (state < 0) {
+        const char *path = getenv("RECOMP_TEX_HASH_LOG");
+        f = path && *path ? fopen(path, "a") : NULL;
+        state = f != NULL;
+    }
+    if (!state)
+        return;
+    s0 = &layout->subresource[0][0];
+    if (!s0->size)
+        return;
+    key = hash_bytes(snapshot + s0->offset, s0->size);
+    for (i = (unsigned)(key ^ (key >> 32) ^ t->width ^ (t->height << 13)) & 0xFFFFu;;
+         i = (i + 1) & 0xFFFFu) {
+        uint64_t tag = key ^ ((uint64_t)t->width << 40) ^ ((uint64_t)t->height << 20) ^ 1;
+        if (seen[i] == tag)
+            return;
+        if (!seen[i]) {
+            seen[i] = tag;
+            break;
+        }
+    }
+    fprintf(f, "%016llx %u %u %02x %d %08x%s", (unsigned long long)key, t->width, t->height,
+            t->color, cube, t->offset, "\n");
+    fflush(f);
+}
+
 /* 128 eight-byte samples spread over the texture. */
 static uint64_t tex_sparse(const uint8_t *p, size_t n)
 {
@@ -4175,6 +4245,35 @@ static void release_tex_snapshot(Tex *e)
         e->snapshot = NULL;
         e->snapshot_bytes = 0;
     }
+}
+
+/* Levels of a cache entry's view, and the LOD shift its sampler needs: a
+ * hi-res replacement has `lod_extra` more levels above the game's level 0,
+ * so the game's max-LOD clamp moves down the chain by as many levels. Read by
+ * the draw that called get_texture(), right after it returns. */
+static unsigned s_tex_lod_extra;
+
+static unsigned tex_levels_out(const Tex *e)
+{
+    if (e->hires) {
+        s_tex_lod_extra = e->lod_extra;
+        return e->view_levels;
+    }
+    return e->uploaded_levels ? e->uploaded_levels : 1;
+}
+
+/* control0 (NV097 texture control 0) with its min/max LOD clamps (4.8 fixed
+ * point, bits 18-29 and 6-17) moved down `extra` levels for a hi-res view.
+ * A min clamp of 0 stays 0, so the replacement's top level is reachable. */
+static uint32_t tex_lod_control(uint32_t control0, unsigned extra)
+{
+    uint32_t min_lod = (control0 >> 18) & 0xFFFu, max_lod = (control0 >> 6) & 0xFFFu;
+    if (!extra)
+        return control0;
+    if (min_lod)
+        min_lod = min_lod + extra * 256 > 0xFFF ? 0xFFF : min_lod + extra * 256;
+    max_lod = max_lod + extra * 256 > 0xFFF ? 0xFFF : max_lod + extra * 256;
+    return (control0 & ~((0xFFFu << 18) | (0xFFFu << 6))) | min_lod << 18 | max_lod << 6;
 }
 
 static void release_tex(Tex *e)
@@ -4544,7 +4643,11 @@ static int surface_exact_color_alias(const Surf *s, const Nv2aTexture *t, int cu
            t->offset == s->va && t->width == s->w && t->height == s->h &&
            (t->pitch == s->pitch ||
             (t->color == 0x06 && !t->pitch && s->pitch == s->w * 4)) &&
-           ((s->bpp == 4 && (t->color == 0x12 || t->color == 0x06 ||
+           /* 0x1E: linear X8R8G8B8, the same bytes with alpha ignored.
+            * XDK D3D samples a supersampled back buffer that way when its
+            * Present filters it into the front buffer (Halo 2's disc
+            * downloader); rejected, the front buffer stayed black. */
+           ((s->bpp == 4 && (t->color == 0x12 || t->color == 0x06 || t->color == 0x1E ||
                              (t->color == 0x2E && !s_depth_texture))) ||
             (s->bpp == 2 && t->color == 0x11));
 }
@@ -4563,6 +4666,26 @@ static void retire_stale_non_rt_overlap(Surf *s)
         s->guest_check_gen = 0;
         s_st.tex_stale_surface++;
     }
+}
+
+static int d3d_readback(uint32_t color_va);
+
+/* A texture that lies wholly inside a small GPU-newer color target that is
+ * not its exact alias: the target's row is padded wider than the texture
+ * (same address and pitch, 106 of 112 pixels used). Halo 2's disc downloader
+ * renders its button hints and the selection bar into such targets (106x32
+ * in 112x32, 71x32 in 80x32, 280x22 in 288x22) and draws them as textures;
+ * rejected, the A/B hints and the highlight never appeared. Put the target's
+ * pixels back in guest memory and let the texture load from there, at its
+ * own size. Bounded to small targets, where a readback costs nothing. */
+static int pull_small_overlap(Surf *s, uint64_t start, uint64_t end)
+{
+    uint64_t lo = s->va, hi = (uint64_t)s->va + (uint64_t)s->pitch * s->h;
+    if (s == s_cur || !s->gpu_dirty || s->pitch * s->h > (1u << 20))
+        return 0;
+    if (start < lo || end > hi)
+        return 0;
+    return d3d_readback(s->va);
 }
 
 static int color_texture_alias(const Nv2aTexture *t, int cube,
@@ -4635,6 +4758,8 @@ static int color_texture_alias(const Nv2aTexture *t, int cube,
                  * frame (alias:sync_failed, stage read as 0). */
                 if (s->wserial > newest_sync) { newest_sync = s->wserial; sync_bad = i; }
                 continue;
+            } else if (exact != s && pull_small_overlap(s, start, end)) {
+                continue;
             } else {
                 why = 2; bad = s_nsurf > i ? i : -1; goto reject;
             }
@@ -4645,6 +4770,8 @@ static int color_texture_alias(const Nv2aTexture *t, int cube,
             retire_stale_non_rt_overlap(s);
             continue;
         }
+        if (exact != s && s->gpu_dirty && pull_small_overlap(s, start, end))
+            continue;
         if (s->gpu_dirty)
             ++dirty_overlap;
         if (exact != s && s->gpu_dirty) {
@@ -4774,7 +4901,7 @@ static ID3D11ShaderResourceView *tex_stale_view(const Nv2aTexture *t, int cube,
         return NULL;
     best->last_use = s_gen;
     if (mip_levels)
-        *mip_levels = best->uploaded_levels ? best->uploaded_levels : 1;
+        *mip_levels = tex_levels_out(best);
     s_st.tex_stale_fallback++;
     return best->srv;
 }
@@ -4808,6 +4935,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
     s_texture_hard_reject = 0;
     s_texture_soft_reject = 0;
     s_tex_fail = NULL;
+    s_tex_lod_extra = 0;
     *mip_levels = 1;
     if (!t || !t->width || !t->height || t->width > 4096 || t->height > 4096) {
         s_texture_soft_reject = 1;
@@ -4850,7 +4978,16 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
         Depth *overlap = overlapping_depth(t, cube, &ambiguous);
         for (i = 0; overlap && i < s_ndepth; i++)
             if (s_depth[i].tex && s_depth[i].va == t->offset) {
-                ID3D11ShaderResourceView *v = get_packed_depth_texture(t, 0, 1, 1);
+                ID3D11ShaderResourceView *v;
+                if (!depth_still_current(&s_depth[i])) {
+                    static int noted_stale;
+                    if (!noted_stale++)
+                        fprintf(stderr, "[GPU-D3D11] colour texture over depth %08X: memory"
+                                        " reused as colour, guest texture sampled\n",
+                                t->offset);
+                    break;
+                }
+                v = get_packed_depth_texture(t, 0, 1, 1);
                 static int noted;
                 if (v) {
                     if (!noted++)
@@ -4940,7 +5077,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
                                          &cached->source_identity) &&
               tex_mark_verified(cached, epoch)))) {
             cached->last_use = s_gen;
-            *mip_levels = cached->uploaded_levels;
+            *mip_levels = tex_levels_out(cached);
             s_st.texture_physical_hits++;
             return cached->srv;
         }
@@ -4980,7 +5117,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
             guest_identity_still_valid(t->offset, layout.span, GUEST_BOUNDS_IGNORE,
                                        &cached->source_identity)) {
             cached->last_use = s_gen;
-            *mip_levels = cached->uploaded_levels;
+            *mip_levels = tex_levels_out(cached);
             s_st.texture_physical_hits++;
             return cached->srv;
         }
@@ -5146,14 +5283,14 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
                     bruteforce_perf_clock() - perf_start);
             if (source_equal && palette_equal) {
                 e->last_use = s_gen;
-                *mip_levels = e->uploaded_levels;
+                *mip_levels = tex_levels_out(e);
                 return e->srv;
             }
         }
     } else {
         if (same_lifetime && e->gen == s_gen && e->palette_hash == palette_hash) {
             e->last_use = s_gen;
-            *mip_levels = e->uploaded_levels;
+            *mip_levels = tex_levels_out(e);
             return e->srv;
         }
         if (same_lifetime && e->palette_hash == palette_hash && e->stable >= 30
@@ -5161,7 +5298,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
                 && tex_sparse(s_tex_probe, source_bytes) == e->sparse) {
             e->gen = s_gen;
             e->last_use = s_gen;
-            *mip_levels = e->uploaded_levels;
+            *mip_levels = tex_levels_out(e);
             return e->srv;
         }
         h = tex_hash(s_tex_probe, t->color, source_bytes);
@@ -5172,7 +5309,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
                 e->sparse = tex_sparse(s_tex_probe, source_bytes);
             e->gen = s_gen;
             e->last_use = s_gen;
-            *mip_levels = e->uploaded_levels;
+            *mip_levels = tex_levels_out(e);
             return e->srv;
         }
     }
@@ -5185,6 +5322,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
     if (perf)
         perf_start = bruteforce_perf_clock();
     memcpy(snapshot, s_tex_probe, snapshot_bytes);
+    tex_hash_log(t, cube, &layout, snapshot);
     if (perf)
         bruteforce_perf_record_texture_snapshot(snapshot_bytes,
                                                 bruteforce_perf_clock() - perf_start);
@@ -5240,6 +5378,23 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
     }
     e->palette_hash = palette_hash;
     e->hash = h; e->gen = s_gen;
+    if (texpack_enabled() && layout.subresource[0][0].size) {
+        const GpuTextureSubresource *s0 = &layout.subresource[0][0];
+        ID3D11Texture2D *ptex;
+        ID3D11ShaderResourceView *psrv;
+        unsigned plevels, pextra;
+        if (texpack_lookup(s_dev, hash_bytes(snapshot + s0->offset, s0->size), t->width,
+                           t->height, cube, &ptex, &psrv, &plevels, &pextra)) {
+            if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+            if (e->tex) ID3D11Texture2D_Release(e->tex);
+            e->tex = ptex;
+            e->srv = psrv;
+            e->hires = 1;
+            e->lod_extra = (uint8_t)pextra;
+            e->view_levels = plevels;
+            s_st.tex_hires++;
+        }
+    }
     if (approximate)
         free(snapshot);
     else
@@ -5249,7 +5404,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
                         " faces=%d levels=%u uploaded=%u palette=0x%08X\n",
                 rewritten ? "changed" : "new", path, t->offset, t->color, t->width,
                 t->height, t->pitch, faces, t->levels, layout.levels, t->palette);
-    *mip_levels = layout.levels;
+    *mip_levels = e->hires ? tex_levels_out(e) : layout.levels;
     return e->srv;
 }
 
@@ -5849,14 +6004,14 @@ static void d3d_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t 
     if (color_flags) {
         if (color_flags == 0xF0 && full_color) {
             s_cur->alias_uncertain = 0;
-            s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen;
+            s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen; note_depth_use();
             if (!mirror_full_color_clear(s_cur, argb)) {
-                s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen;
+                s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen; note_depth_use();
                 s_cur->guest_exact = 0;
                 s_cur->alias_uncertain = 1;
             }
         } else {
-            s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen;
+            s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen; note_depth_use();
             s_cur->guest_exact = 0;
         }
     }
@@ -5990,7 +6145,8 @@ static void d3d_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             return;
         if (srv)
             ss = get_required_sampler(b->texture->addr_u, b->texture->addr_v,
-                                      b->texture->filter, nv2a_backend_reg(0x1B0C),
+                                      b->texture->filter,
+                                      tex_lod_control(nv2a_backend_reg(0x1B0C), s_tex_lod_extra),
                                       mip_levels, b->texture->border_src,
                                       b->texture->border);
     }
@@ -6032,7 +6188,7 @@ static void d3d_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11DeviceContext_OMSetBlendState(s_ctx, get_required_blend(rs), bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, rs->stencil_ref & 0xFF);
     ID3D11DeviceContext_Draw(s_ctx, b->count, 0);
-    s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen;
+    s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen; note_depth_use();
     s_cur->guest_exact = 0;
     if (s_cur_depth && depth_state_can_write(rs))
         depth_written(s_cur_depth);
@@ -6296,7 +6452,8 @@ static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
         }
         ss[st] = get_required_sampler(b->tex[st].addr_u, b->tex[st].addr_v,
                                       b->tex[st].filter,
-                                      nv2a_backend_reg(0x1B0C + st * 0x40), mip_levels,
+                                      tex_lod_control(nv2a_backend_reg(0x1B0C + st * 0x40),
+                                                      s_tex_lod_extra), mip_levels,
                                       b->tex[st].border_src, b->tex[st].border);
         c.texinfo[st][0] = 1.0f / tw;
         c.texinfo[st][1] = 1.0f / th;
@@ -6370,7 +6527,7 @@ static void d3d_xdraw_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_xcb);
     ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
     ID3D11DeviceContext_Draw(s_ctx, b->count, 0);
-    s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen;
+    s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen; note_depth_use();
     s_cur->guest_exact = 0;
     if (s_cur_depth && depth_state_can_write(b->state))
         depth_written(s_cur_depth);
@@ -7088,7 +7245,7 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         }
     } else
     ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
-    s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen;
+    s_cur->gpu_dirty = 1; s_cur->wserial = ++s_wserial; s_cur->write_gen = s_gen; note_depth_use();
     s_cur->guest_exact = 0;
     if (s_cur_depth && depth_state_can_write(b->xb.state))
         depth_written(s_cur_depth);

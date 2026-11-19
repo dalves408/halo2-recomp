@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
+#include "h2_account.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -129,6 +130,10 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     if (xbox_va == 0x0037D370u) return crt_x87_sinh; /* TU 1.5 (1.0: 0x003732D0) */
     if (xbox_va == 0x0037D3C2u) return crt_x87_cosh; /* TU 1.5 (1.0: 0x00373322) */
     if (xbox_va == 0x0037D389u) return crt_x87_tanh; /* TU 1.5 (1.0: 0x003732E9) */
+    if (xbox_va >= 0xFE000000u) {   /* account recovery (H2_ACCT): thread routine, step tick */
+        recomp_func_t f = h2_account_kernel_override(xbox_va);
+        if (f) return f;
+    }
     /*
      * TODO: Add your overrides here. Examples:
      *
@@ -209,9 +214,21 @@ void recomp_icall_not_code_log(uint32_t va)
             return;
     }
     fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped %llu time(s) "
-                    "(null or wild function pointer, at call #%llu)\n",
+                    "(null or wild function pointer, at call #%llu, return 0x%08X)\n",
             va, (unsigned long long)hits[i],
-            (unsigned long long)g_icall_count);
+            (unsigned long long)g_icall_count,
+            *(volatile uint32_t *)((uintptr_t)g_esp + g_xbox_mem_offset));
+    if (hits[i] == 1) {
+        uint32_t k, idx = g_icall_trace_idx;
+        fprintf(stderr, "[ICALL]   recent targets:");
+        for (k = 16; k > 0; k--) fprintf(stderr, " %08X", g_icall_trace[(idx - k) & 15]);
+        fprintf(stderr, "\n[ICALL]   stack:");
+        for (k = 0; k < 48; k++) {
+            uint32_t v = *(volatile uint32_t *)((uintptr_t)(g_esp + 4 * k) + g_xbox_mem_offset);
+            if (v >= 0x00012000u && v < 0x00580000u) fprintf(stderr, " +%X:%08X", 4 * k, v);
+        }
+        fprintf(stderr, "\n");
+    }
     fflush(stderr);
 }
 

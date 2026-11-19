@@ -179,6 +179,143 @@ static int vd_read_file(const WCHAR *path, uint64_t off, uint8_t *buf, uint32_t 
  * FATX layout the previous Partition5.img files carried (0x17000 bytes:
  * header, one reserved FAT entry, a zero gap, then 0xFF free entries).
  * Host files (fonts, preferences, cache maps) still live under SaveData. */
+/* Remove everything under dir (files and subfolders), keeping dir itself.
+ * Returns the number of files removed. */
+static int vd_clear_dir(const WCHAR *dir)
+{
+    WIN32_FIND_DATAW fd;
+    WCHAR pat[MAX_PATH], sub[MAX_PATH];
+    HANDLE f;
+    int n = 0;
+    swprintf_s(pat, MAX_PATH, L"%s\\*", dir);
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        swprintf_s(sub, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            n += vd_clear_dir(sub);
+            RemoveDirectoryW(sub);
+        } else {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+                SetFileAttributesW(sub, FILE_ATTRIBUTE_NORMAL);
+            if (DeleteFileW(sub))
+                n++;
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return n;
+}
+
+/* A title formatting a cache partition (3-5) writes a new FATX header at its
+ * start, then dismounts it: on a console the volume comes back empty. The
+ * partition's files live in <save>\Cache here, which the in-memory header
+ * does not touch, so a title that reformats (Halo 2 after its title cache
+ * says the volume is stale) then fails to create files that "already
+ * exist" (fonts\font_table.txt) and shows the disc-error screen. Empty the
+ * folder when the header is written, as the format does on a console.
+ * RECOMP_CACHE_FORMAT_CLEARS=0 keeps the old behaviour. */
+static void vd_cache_formatted(int part)
+{
+    static int on = -1;
+    WCHAR dir[MAX_PATH];
+    int n;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CACHE_FORMAT_CLEARS");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !s_save_dir[0])
+        return;
+    /* Partitions 3-5 share <save>\Cache (kernel_path.c rules), so only the
+     * Z: volume's format (Partition5: fonts, preferences) empties it; Halo 2
+     * reformats its second utility drive (Partition4) on every boot. */
+    if (part != 5) {
+        fprintf(stderr, "  [DISK] Partition%d formatted by the title (shared cache folder kept)\n", part);
+        return;
+    }
+    swprintf_s(dir, MAX_PATH, L"%s\\Cache", s_save_dir);
+    n = vd_clear_dir(dir);
+    CreateDirectoryW(dir, NULL);
+    fprintf(stderr, "  [DISK] Partition%d formatted by the title: emptied its cache folder"
+                    " (%d file(s) removed)\n", part, n);
+}
+
+/* The FATX header and FAT of a cache partition (the span vd_seed_cache_fatx
+ * writes) persist in <save>\CacheHeaderN.bin, as the config sectors do in
+ * DiskConfig.bin. A title records its cache volume (Halo 2 in its title
+ * cache); re-seeding a generic header every launch made that record stale,
+ * so the title reformatted its cache on every boot. */
+#define VD_CACHE_HDR 0x17000u
+
+/* Sector 4 (0x800) starts as the partition table, and XAPI's utility-drive
+ * mount writes its cache record there (which title owns which cache partition
+ * and when it was formatted). Rebuilt every launch, the record was lost, so
+ * XAPI found no record and reformatted its cache on every boot. Once a title
+ * writes the sector it is kept in <save>\CacheDB.bin and loaded at start-up. */
+#define VD_CACHEDB_OFFSET 0x800u
+#define VD_CACHEDB_SIZE   0x200u
+
+static void vd_cachedb_path(WCHAR *out)
+{
+    swprintf_s(out, MAX_PATH, L"%s\\CacheDB.bin", s_save_dir);
+}
+
+static void vd_save_cachedb(void)
+{
+    WCHAR path[MAX_PATH];
+    uint8_t b[VD_CACHEDB_SIZE];
+    HANDLE f;
+    DWORD w = 0;
+    if (!s_save_dir[0]) return;
+    vd_copy_out(0, VD_CACHEDB_OFFSET, b, VD_CACHEDB_SIZE);
+    vd_cachedb_path(path);
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        WriteFile(f, b, VD_CACHEDB_SIZE, &w, NULL);
+        CloseHandle(f);
+    }
+}
+
+static void vd_cache_hdr_path(int part, WCHAR *out)
+{
+    swprintf_s(out, MAX_PATH, L"%s\\CacheHeader%d.bin", s_save_dir, part);
+}
+
+static void vd_save_cache_hdr(int part)
+{
+    WCHAR path[MAX_PATH];
+    uint8_t *b = (uint8_t *)malloc(VD_CACHE_HDR);
+    HANDLE f;
+    DWORD w = 0;
+    if (!b || !s_save_dir[0]) { free(b); return; }
+    vd_copy_out(part, 0, b, VD_CACHE_HDR);
+    vd_cache_hdr_path(part, path);
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        WriteFile(f, b, VD_CACHE_HDR, &w, NULL);
+        CloseHandle(f);
+    }
+    free(b);
+}
+
+/* 1 when a saved header was loaded into the partition. */
+static int vd_load_cache_hdr(int part)
+{
+    WCHAR path[MAX_PATH];
+    uint8_t *b = (uint8_t *)malloc(VD_CACHE_HDR);
+    int ok = 0;
+    if (!b) return 0;
+    vd_cache_hdr_path(part, path);
+    if (vd_read_file(path, 0, b, VD_CACHE_HDR) == (int)VD_CACHE_HDR && !memcmp(b, "FATX", 4)) {
+        vd_copy_in(part, 0, b, VD_CACHE_HDR);
+        ok = 1;
+    }
+    free(b);
+    return ok;
+}
+
 static void vd_seed_cache_fatx(int part)
 {
     const uint32_t n = 0x17000u;
@@ -212,6 +349,23 @@ void xbox_vdisk_init(const WCHAR *save_dir)
         swprintf_s(s_cfg_path, MAX_PATH, L"%s\\DiskConfig.bin", save_dir);
 
     xbox_build_partition_table(table);
+    {   /* the cache partitions' own folders (kernel_path.c rules) */
+        static const WCHAR *const dirs[] = { L"Cache" };
+        WCHAR d[MAX_PATH];
+        for (p = 0; p < 1; p++) {
+            swprintf_s(d, MAX_PATH, L"%s\\%s", save_dir, dirs[p]);
+            CreateDirectoryW(d, NULL);
+        }
+    }
+    {
+        WCHAR dbp[MAX_PATH];
+        uint8_t db[VD_CACHEDB_SIZE];
+        vd_cachedb_path(dbp);
+        if (vd_read_file(dbp, 0, db, VD_CACHEDB_SIZE) == (int)VD_CACHEDB_SIZE) {
+            memcpy(table, db, sizeof table);
+            fprintf(stderr, "  [DISK] kept the saved cache record (sector 4)\n");
+        }
+    }
     vd_copy_in(0, 0x800, table, sizeof table);
 
     have = vd_read_file(s_cfg_path, 0, cfg, VD_CFG_SIZE) >= 0;
@@ -242,9 +396,20 @@ void xbox_vdisk_init(const WCHAR *save_dir)
     }
     vd_copy_in(0, VD_CFG_OFFSET, cfg, VD_CFG_SIZE);
     memcpy(s_cfg_saved, cfg, VD_CFG_SIZE);
-    vd_seed_cache_fatx(4);
-    vd_seed_cache_fatx(5);
-    fprintf(stderr, "  [DISK] seeded an empty FATX on cache partitions 4 and 5\n");
+    {
+        int kept = 0;
+        for (p = 3; p <= 5; p++) {
+            if (vd_load_cache_hdr(p))
+                kept |= 1 << p;
+            else if (p >= 4)
+                vd_seed_cache_fatx(p);
+        }
+        if (kept)
+            fprintf(stderr, "  [DISK] cache partitions: kept the saved FATX header of%s%s%s\n",
+                    kept & 8 ? " 3" : "", kept & 16 ? " 4" : "", kept & 32 ? " 5" : "");
+        if ((kept & 48) != 48)
+            fprintf(stderr, "  [DISK] seeded an empty FATX on the other cache partitions (4/5)\n");
+    }
     vd_unlock();
 }
 
@@ -317,10 +482,24 @@ NTSTATUS xbox_vdisk_io(HANDLE h, int write, void *buf, uint32_t len, const LARGE
     size = xbox_vdisk_size(v->part);
     if (at >= size) { vd_unlock(); return len ? STATUS_END_OF_FILE : STATUS_SUCCESS; }
     n = (uint64_t)len > size - at ? (uint32_t)(size - at) : len;
+    {   /* debug: RECOMP_VDISK_TRACE=1 logs each raw access (partition, offset, size) */
+        static int trace = -1;
+        if (trace < 0) { const char *e = getenv("RECOMP_VDISK_TRACE"); trace = e && e[0] == '1'; }
+        if (trace)
+            fprintf(stderr, "  [VDISK] %s Partition%d off 0x%llX len 0x%X\n", write ? "write" : "read ",
+                    v->part, (unsigned long long)at, n);
+    }
     if (write) {
+        if (v->part >= 3 && v->part <= 5 && at == 0 && n >= 4 &&
+            !memcmp(buf, "FATX", 4))
+            vd_cache_formatted(v->part);
         vd_copy_in(v->part, at, (const uint8_t *)buf, n);
+        if (v->part >= 3 && v->part <= 5 && at < VD_CACHE_HDR)
+            vd_save_cache_hdr(v->part);
         if (v->part == 0 && at < VD_CFG_OFFSET + VD_CFG_SIZE && at + n > VD_CFG_OFFSET)
             vd_save_config();
+        if (v->part == 0 && at < VD_CACHEDB_OFFSET + VD_CACHEDB_SIZE && at + n > VD_CACHEDB_OFFSET)
+            vd_save_cachedb();
     } else
         vd_copy_out(v->part, at, (uint8_t *)buf, n);
     v->pos = at + n;

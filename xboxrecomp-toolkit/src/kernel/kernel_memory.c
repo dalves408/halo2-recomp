@@ -33,6 +33,23 @@ static void note_physical_translation(uint32_t physical, uint8_t storage)
         g_phys_last_translation[physical >> 12] = storage;
 }
 
+/* Every page of a contiguous allocation names the window, from the moment it
+ * is handed out. Drivers convert the block's base once with
+ * MmGetPhysicalAddress and derive the rest by arithmetic (Halo 2's disc
+ * downloader: base minus physical, kept in a global), so recording only the
+ * page a call named left the descriptors on the next page read as RAM. A
+ * later MmGetPhysicalAddress of a RAM address with the same number still
+ * overrides a page, which is what the stack-buffer case needs. */
+void xbox_PhysNoteContiguousRange(uint32_t window_va, uint32_t size)
+{
+    uint32_t p, end;
+    if (window_va < XBOX_CONTIG_BASE || !size) return;
+    p = window_va - XBOX_CONTIG_BASE;
+    end = p + size;
+    for (p &= ~0xFFFu; p < end && p < (64u << 20); p += 0x1000u)
+        g_phys_last_translation[p >> 12] = 2;
+}
+
 /* ============================================================================
  * Helper: Xbox protect flags → Win32 protect flags
  * ============================================================================ */

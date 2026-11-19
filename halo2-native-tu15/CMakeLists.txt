@@ -57,12 +57,15 @@ option(RECOMP_DEBUG_TOOLS "Compile in diagnostic helpers such as the DEL screens
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/h2_account.c
+    src/h2_frame.c
     src/gpu/d3d11_backend.c
     src/gpu/rc_hlsl.c
     src/gpu/render_scale.c
     src/gpu/shader_cache.c
     src/gpu/texture_decode.c
     src/gpu/texture_sampler.c
+    src/gpu/tex_pack.c
     src/gpu/fxaa.c
     src/gpu/vsh_hlsl.c
     src/settings.c
@@ -216,3 +219,37 @@ add_custom_command(TARGET halo2_config POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:halo2_config>"
         "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
+
+# ── The disc's content downloader (Downloader.xbe) ──────────────
+# Halo 2 starts it with XLaunchNewImage for "download content"; it is its own
+# program here (same toolkit, GPU back end and settings), started by the
+# game's hand-over and handing back to it (RECOMP_LAUNCH_MAP, kernel_bridge.c).
+# Generated code: analysis-downloader/run-pipeline.ps1 -> src/downloader/gen.
+file(GLOB DOWNLOADER_GEN_SOURCES CONFIGURE_DEPENDS "src/downloader/gen/*.c")
+set(DOWNLOADER_SOURCES ${GAME_SOURCES})
+list(REMOVE_ITEM DOWNLOADER_SOURCES src/recomp_manual.c src/h2_account.c)
+list(APPEND DOWNLOADER_SOURCES src/downloader/manual.c)
+add_executable(halo2_downloader ${DOWNLOADER_SOURCES} ${DOWNLOADER_GEN_SOURCES})
+target_compile_definitions(halo2_downloader PRIVATE H2_DOWNLOADER=1 RECOMP_ABI_CHECK=1)
+if(HALO2_SDL3)
+    target_compile_definitions(halo2_downloader PRIVATE HALO2_SDL3=1)
+endif()
+if(RECOMP_DEBUG_TOOLS)
+    target_compile_definitions(halo2_downloader PRIVATE RECOMP_DEBUG_TOOLS=1)
+    target_link_libraries(halo2_downloader PRIVATE windowscodecs ole32)
+endif()
+target_include_directories(halo2_downloader PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/downloader
+    ${XBOXRECOMP_DIR}/include
+    ${XBOXRECOMP_DIR}/src
+)
+target_link_libraries(halo2_downloader PRIVATE xboxrecomp d3d11 d3dcompiler bcrypt dxgi dxguid
+    $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput> winmm shell32 dbghelp)
+if(MSVC)
+    target_link_options(halo2_downloader PRIVATE /LARGEADDRESSAWARE)
+    target_compile_options(halo2_downloader PRIVATE /bigobj /MP8)
+    if(HALO2_PERF_LTO)
+        target_link_options(halo2_downloader PRIVATE /LTCG /INCREMENTAL:NO)
+    endif()
+endif()

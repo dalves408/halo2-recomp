@@ -17,6 +17,7 @@
  *   Drawn as TRIANGLE_STRIP (mode 6)
  *
  * This module is designed to be reusable across Xbox recompilation projects.
+ * See: https://github.com/sp00nznet/xboxrecomp
  */
 
 #ifndef NV2A_PGRAPH_D3D11_H

@@ -49,14 +49,7 @@ Thumbs.db
 .DS_Store
 
 # Local XBE analysis and run logs
-analysis/*
-!analysis/*.py
-!analysis/*.ps1
+analysis/
 build-ninja/
 SaveData/
 xbox_kernel.log
-
-# Vendored SDL3 (zlib) ships its import library and DLL
-!third_party/**/*.dll
-!third_party/**/*.lib
-!third_party/**/x64/

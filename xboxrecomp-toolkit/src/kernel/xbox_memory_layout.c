@@ -860,6 +860,7 @@ static void ac97_arm_write_trap(void)
 #include "apu/apu.h"
 #include "apu/apu_wav.h"
 #include "usb/ohci.h"
+#include "nvnet.h"
 
 #define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
 #define MMIO_APU_END  0xFE880000u
@@ -903,6 +904,8 @@ int xbox_VehMmioFault(void *exception_pointers)
         return g_apu_state
             && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
                    ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
+    if (xbox_NvnetOwnsAddress(va))
+        return xbox_NvnetHandleMmio(ep->ContextRecord, va);
     if (xbox_OhciOwnsAddress(va))
         return xbox_OhciHandleMmio(ep->ContextRecord, va);
     return 0;

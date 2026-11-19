@@ -398,8 +398,24 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
 /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
  * gpu_present.c; both presenters letterbox to any size.) */
+/* RECOMP_FB_PARENT=<window handle, decimal>: the window is a child filling
+ * that window's client area instead of a top-level window (CounterStrikeXB's
+ * toolkit patch 0022, ported). For a title that hands over to another process
+ * (a quick reboot into another XBE modelled as a host process): the host's
+ * frame window stays on screen and each process draws into it, so the player
+ * keeps one window. The parent owns the frame: fullscreen requests are posted
+ * to it (WM_APP + 0x46) and the fullscreen state is read from its style;
+ * RECOMP_FULLSCREEN is the parent's business. It keeps the child sized. */
+#define WM_FB_PARENT_TOGGLE_FULLSCREEN (WM_APP + 0x46)
+static HWND s_fb_parent;
+
 static void fb_toggle_fullscreen(HWND h)
 {
+    if (s_fb_parent) {
+        (void)h;
+        PostMessageA(s_fb_parent, WM_FB_PARENT_TOGGLE_FULLSCREEN, 0, 0);
+        return;
+    }
     if (!s_fb_fullscreen) {
         MONITORINFO mi;
         mi.cbSize = sizeof mi;
@@ -420,9 +436,16 @@ static void fb_toggle_fullscreen(HWND h)
     }
 }
 
+static int fb_is_fullscreen(void)
+{
+    if (s_fb_parent)
+        return IsWindow(s_fb_parent) && !(GetWindowLongPtrA(s_fb_parent, GWL_STYLE) & WS_CAPTION);
+    return s_fb_fullscreen;
+}
+
 static void fb_apply_fullscreen(HWND h, int on)
 {
-    if ((on != 0) != (s_fb_fullscreen != 0))
+    if ((on != 0) != (fb_is_fullscreen() != 0))
         fb_toggle_fullscreen(h);
 }
 
@@ -433,7 +456,7 @@ HWND xbox_FramebufferWindowHandle(void)
 
 int xbox_FramebufferWindowIsFullscreen(void)
 {
-    return s_fb_fullscreen;
+    return fb_is_fullscreen();
 }
 
 void xbox_FramebufferWindowSetFullscreen(int on)
@@ -549,6 +572,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
             if (vk)
                 xbox_InputKeySet(vk, down);
+            if (down && s_fb_parent && GetFocus() != h)
+                SetFocus(h);            /* a child is not focused by being clicked */
             if (down)
                 SetCapture(h);
             else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
@@ -833,6 +858,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                                && r.bottom - r.top <= work.bottom - work.top))
                 break;
         }
+        {
+            const char *pe = getenv("RECOMP_FB_PARENT");
+            HWND parent = pe && *pe ? (HWND)(uintptr_t)_strtoui64(pe, NULL, 10) : NULL;
+            if (parent && IsWindow(parent))
+                s_fb_parent = parent;
+            else if (parent)
+                fprintf(stderr, "  [FBWIN] RECOMP_FB_PARENT=%s is not a window: top-level window\n", pe);
+        }
+        if (s_fb_parent) {
+            RECT pc;
+            GetClientRect(s_fb_parent, &pc);
+            hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+                                   WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
+                                   pc.right - pc.left, pc.bottom - pc.top,
+                                   s_fb_parent, NULL, GetModuleHandleA(NULL), NULL);
+            if (hwnd && GetForegroundWindow() == s_fb_parent)
+                SetFocus(hwnd);
+        } else
         hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
@@ -851,7 +894,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         const char *fs = getenv("RECOMP_FULLSCREEN");
         s_fb_hwnd = hwnd;
         s_fb_tid = GetCurrentThreadId();
-        if (fs && *fs && *fs != '0')
+        if (fs && *fs && *fs != '0' && !s_fb_parent)
             fb_toggle_fullscreen(hwnd);
     }
 

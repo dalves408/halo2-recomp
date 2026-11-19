@@ -351,7 +351,7 @@ static int s_dpc_on;            /* RECOMP_DPC_ON_RAISE, under the gate */
 static XBOX_THREAD_LOCAL int t_guest_thread;
 static XBOX_THREAD_LOCAL int t_in_dpc;
 static uint64_t s_irq_wait_ns;
-static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci", "pgraph" };
+static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci", "pgraph", "nic" };
 
 static struct {
     volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],
