@@ -454,6 +454,20 @@ HWND xbox_FramebufferWindowHandle(void)
     return s_fb_hwnd;
 }
 
+/* No pointer over the picture while the mouse aims (mkb_input.c captures
+ * it). ShowCursor would only count for the thread that calls it, and the
+ * capture runs on the pad's thread, so the window's own WM_SETCURSOR hides
+ * it; the posted WM_SETCURSOR applies it at once, since a pinned pointer
+ * sends no moves that would. */
+static volatile LONG s_fb_hide_cursor;
+
+void xbox_FramebufferHideCursor(int hide)
+{
+    hide = hide != 0;
+    if (InterlockedExchange(&s_fb_hide_cursor, hide) != hide && s_fb_hwnd)
+        PostMessageA(s_fb_hwnd, WM_SETCURSOR, (WPARAM)s_fb_hwnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+}
+
 int xbox_FramebufferWindowIsFullscreen(void)
 {
     return fb_is_fullscreen();
@@ -485,6 +499,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
         return 0;                       /* auto-repeat of Alt+Enter */
+    if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT) {
+        SetCursor(s_fb_hide_cursor ? NULL : LoadCursorA(NULL, IDC_ARROW));
+        return TRUE;
+    }
     switch (m) {
     case WM_ACTIVATE:
     case WM_ACTIVATEAPP:

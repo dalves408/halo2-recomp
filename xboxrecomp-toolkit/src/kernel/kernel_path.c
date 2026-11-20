@@ -456,6 +456,18 @@ static int is_utility_cache_map_name(const char *name)
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
 static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
+
+/* Nonzero when a host path lies in the shared cache folder (<save>\Cache, behind
+ * the utility drives Z: and the Partition3-5 devices; kernel_vdisk.c). Only the
+ * title's own scratch copies live there. */
+int xbox_PathInCacheFolder(const WCHAR *host)
+{
+    size_t n = wcslen(s_save_dir);
+    if (!n || !host || _wcsnicmp(host, s_save_dir, n) != 0)
+        return 0;
+    return _wcsnicmp(host + n, L"\\Cache\\", 7) == 0;
+}
+
 static BOOL  s_initialized = FALSE;
 static WCHAR s_ephemeral_map_dir[MAX_PATH];
 static int   s_ephemeral_map_atexit;

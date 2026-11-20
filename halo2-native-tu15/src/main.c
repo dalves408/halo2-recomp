@@ -50,6 +50,7 @@
 #include "perf_sampler.h"
 #include "kernel/recomp_perf.h"
 #include "h2_frame.h"
+#include "h2_mouse.h"
 
 /* Hybrid laptops: ask the NVIDIA (Optimus) and AMD (PowerXpress) drivers to run
  * this process on the discrete GPU. The D3D11 backend also asks DXGI for the
@@ -564,6 +565,18 @@ int main(void)
     if (!getenv("RECOMP_CONTIG_AVOID_IMAGE")) _putenv_s("RECOMP_CONTIG_AVOID_IMAGE", "1");
 
     halo2_settings_boot();
+    {   /* The player's keys: SaveData\keymap.ini, else the install's keymap.ini. */
+        char root[MAX_PATH], km[MAX_PATH];
+        halo2_install_root(root, sizeof root);
+        snprintf(km, sizeof km, "%s\\SaveData\\keymap.ini", root);
+        if (GetFileAttributesA(km) == INVALID_FILE_ATTRIBUTES)
+            snprintf(km, sizeof km, "%s\\keymap.ini", root);
+        if (!getenv("RECOMP_KEYMAP") && GetFileAttributesA(km) != INVALID_FILE_ATTRIBUTES)
+            _putenv_s("RECOMP_KEYMAP", km);
+    }
+#ifndef H2_DOWNLOADER
+    h2_mouse_init();          /* mouse aim, off on Xbox Live (src/h2_mouse.c) */
+#endif
     halo2_overlay_start();
 
     const char *renderer = getenv("RECOMP_GPU");

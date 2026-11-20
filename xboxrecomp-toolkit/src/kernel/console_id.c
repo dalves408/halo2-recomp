@@ -22,7 +22,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #endif
 
-static int s_done, s_have_eeprom, s_have_hdkey;
+static int s_done, s_have_eeprom, s_have_hdkey, s_verified;
 static uint8_t s_eeprom[256], s_hdkey[16];
 static uint32_t s_game_region;
 
@@ -83,8 +83,10 @@ static void rc4(const uint8_t *key, unsigned klen, uint8_t *d, unsigned n)
     }
 }
 
-/* The encrypted section, with the BIOS's EEPROM key the player supplied. */
-static int decrypt_section(const uint8_t key[16])
+/* The encrypted section, with the BIOS's EEPROM key the player supplied:
+ * 1 and the hard-drive key in hd when it decrypts and its HMAC checks, which
+ * only an EEPROM written by a real console's BIOS does. */
+static int decrypt_section(const uint8_t key[16], uint8_t hd[16])
 {
     uint8_t rkey[20], sec[28], check[20];
     if (!hmac_sha1(key, 16, s_eeprom, 20, rkey))
@@ -93,13 +95,36 @@ static int decrypt_section(const uint8_t key[16])
     rc4(rkey, 20, sec, sizeof sec);
     if (!hmac_sha1(key, 16, sec, sizeof sec, check) || memcmp(check, s_eeprom, 20))
         return 0;
-    memcpy(s_hdkey, sec + 8, 16);
+    memcpy(hd, sec + 8, 16);
     s_game_region = rd32(sec + 24);
+    memset(sec, 0, sizeof sec);
+    memset(rkey, 0, sizeof rkey);
     return 1;
 }
 #else
-static int decrypt_section(const uint8_t key[16]) { (void)key; return 0; }
+static int decrypt_section(const uint8_t key[16], uint8_t hd[16]) { (void)key; (void)hd; return 0; }
 #endif
+
+/* The EEPROM key: RECOMP_XBOX_EEPROM_KEY (hex) or RECOMP_XBOX_EEPROM_KEY_FILE
+ * (16 bytes, written by the title's Insignia Setup from the player's BIOS). */
+static int eeprom_key(uint8_t k[16])
+{
+    const char *v = getenv("RECOMP_XBOX_EEPROM_KEY");
+    FILE *f;
+    if (v && *v) {
+        if (hex16(v, k)) return 1;
+        fprintf(stderr, "  [CONSOLE] RECOMP_XBOX_EEPROM_KEY is not 32 hex digits: not used\n");
+        return 0;
+    }
+    v = getenv("RECOMP_XBOX_EEPROM_KEY_FILE");
+    if (v && *v && (f = fopen(v, "rb")) != NULL) {
+        size_t n = fread(k, 1, 16, f);
+        fclose(f);
+        if (n == 16) return 1;
+        fprintf(stderr, "  [CONSOLE] the EEPROM key file is not 16 bytes: not used\n");
+    }
+    return 0;
+}
 
 void xbox_ConsoleIdInit(void)
 {
@@ -127,20 +152,32 @@ void xbox_ConsoleIdInit(void)
         if (hex16(v, s_hdkey)) s_have_hdkey = 1;
         else fprintf(stderr, "  [CONSOLE] RECOMP_XBOX_HDKEY is not 32 hex digits: not used\n");
     }
-    if (!s_have_hdkey && s_have_eeprom && (v = getenv("RECOMP_XBOX_EEPROM_KEY")) != NULL && *v) {
-        uint8_t k[16];
-        if (!hex16(v, k))
-            fprintf(stderr, "  [CONSOLE] RECOMP_XBOX_EEPROM_KEY is not 32 hex digits: not used\n");
-        else if (decrypt_section(k))
-            s_have_hdkey = 1;
-        else
-            fprintf(stderr, "  [CONSOLE] the EEPROM key does not decrypt this EEPROM\n");
+    /* Verified: the BIOS's EEPROM key opens the EEPROM's sealed section (a
+     * real console wrote it) and the hard-drive key given is the one sealed
+     * inside. Only a verified identity may reach Xbox Live. */
+    if (s_have_eeprom) {
+        uint8_t k[16], hd[16];
+        if (eeprom_key(k)) {
+            if (!decrypt_section(k, hd))
+                fprintf(stderr, "  [CONSOLE] the EEPROM key does not unlock this EEPROM: identity not verified\n");
+            else if (!s_have_hdkey) {
+                memcpy(s_hdkey, hd, 16);
+                s_have_hdkey = s_verified = 1;
+            } else if (memcmp(hd, s_hdkey, 16) == 0)
+                s_verified = 1;
+            else
+                fprintf(stderr, "  [CONSOLE] the hard-drive key given is not this EEPROM's: identity not verified\n");
+        }
         memset(k, 0, sizeof k);
+        memset(hd, 0, sizeof hd);
     }
-    fprintf(stderr, "  [CONSOLE] identity: %s, hard-drive key %s\n",
+    fprintf(stderr, "  [CONSOLE] identity: %s, hard-drive key %s, %s\n",
             s_have_eeprom ? "the player's EEPROM" : "none (no EEPROM)",
-            s_have_hdkey ? (getenv("RECOMP_XBOX_HDKEY") ? "given" : "decrypted from the EEPROM") : "none");
+            s_have_hdkey ? (getenv("RECOMP_XBOX_HDKEY") ? "given" : "decrypted from the EEPROM") : "none",
+            s_verified ? "verified against the console's BIOS" : "not verified");
 }
+
+int xbox_ConsoleIdentityVerified(void) { xbox_ConsoleIdInit(); return s_have_eeprom && s_have_hdkey && s_verified; }
 
 int xbox_ConsoleHasEeprom(void) { xbox_ConsoleIdInit(); return s_have_eeprom; }
 const uint8_t *xbox_ConsoleEeprom(void) { xbox_ConsoleIdInit(); return s_eeprom; }

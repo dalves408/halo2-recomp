@@ -1,7 +1,10 @@
 #include "overlay.h"
 #include "settings.h"
+#include "mouse_binds.h"
+#include "h2_mouse.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <xinput.h>
@@ -15,13 +18,19 @@ extern volatile int g_audio_muted;
 extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
-enum { IT_SCALE, IT_FS, IT_VSYNC, IT_ANISO, IT_FXAA, IT_MSAA, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FS, IT_VSYNC, IT_ANISO, IT_FXAA, IT_MSAA, IT_MOUSE, IT_MSENS, IT_MINV,
+       IT_MB0, IT_MB_LAST = IT_MB0 + MB_COUNT - 1,
+       IT_CLOSE, IT_QUIT, IT_COUNT };
 enum { MODE_NONE, MODE_QUIT, MODE_SET };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
     "Render Scale", "Fullscreen", "VSync", "Anisotropic filter",
-    "FXAA", "MSAA", "Close menu", "Quit game"
+    "FXAA", "MSAA", "Mouse aim (no Xbox Live while on)", "Mouse sensitivity", "Invert mouse",
+    "In play: left click", "In play: right click", "In play: middle click",
+    "In play: mouse button 4", "In play: mouse button 5", "In play: wheel up", "In play: wheel down",
+    "Close menu", "Quit game"
 };
+static int s_mb[MB_COUNT];      /* mouse bindings being edited (mouse_binds.c) */
 
 static HWND s_game, s_hwnd;
 static WNDPROC s_oldproc;
@@ -92,6 +101,11 @@ static void open_settings(void)
         pause_on();
     InterlockedExchange(&s_mode, MODE_SET);
     halo2_settings_copy(&s_edit);
+    {
+        char root[MAX_PATH];
+        halo2_install_root(root, sizeof root);
+        mb_load(root, s_mb);
+    }
     s_sel = 0;
     s_set_armed = 0;
     layout_overlay(s_game);
@@ -115,6 +129,16 @@ static const int MSAA_VAL[4] = { 1, 2, 4, 8 };
 static const char *const ANISO_TXT[5] = { "Off", "2x", "4x", "8x", "16x" };
 static const char *const MSAA_TXT[4] = { "Off", "2x", "4x", "8x" };
 static const char *const OFFON[2] = { "Off", "On" };
+static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500 };
+#define SENS_N ((int)(sizeof SENS_VAL / sizeof SENS_VAL[0]))
+
+static int sens_ix(int v)
+{
+    int i, best = 0;
+    for (i = 1; i < SENS_N; i++)
+        if (abs(SENS_VAL[i] - v) < abs(SENS_VAL[best] - v)) best = i;
+    return best;
+}
 
 static void item_text(int item, char *out, size_t n)
 {
@@ -125,7 +149,15 @@ static void item_text(int item, char *out, size_t n)
     case IT_ANISO: snprintf(out, n, "%s", ANISO_TXT[aniso_ix(s_edit.anisotropy)]); break;
     case IT_FXAA: snprintf(out, n, "%s", OFFON[s_edit.fxaa ? 1 : 0]); break;
     case IT_MSAA: snprintf(out, n, "%s", MSAA_TXT[msaa_ix(s_edit.msaa)]); break;
-    default: out[0] = 0; break;
+    case IT_MOUSE: snprintf(out, n, "%s", OFFON[s_edit.mouse_aim ? 1 : 0]); break;
+    case IT_MSENS: snprintf(out, n, "%d%%", SENS_VAL[sens_ix(s_edit.mouse_sens)]); break;
+    case IT_MINV: snprintf(out, n, "%s", OFFON[s_edit.mouse_invert ? 1 : 0]); break;
+    default:
+        if (item >= IT_MB0 && item <= IT_MB_LAST)
+            snprintf(out, n, "%s", mb_target_label[s_mb[item - IT_MB0]]);
+        else
+            out[0] = 0;
+        break;
     }
 }
 
@@ -149,7 +181,20 @@ static void nudge(int item, int dir)
         v = msaa_ix(s_edit.msaa) + dir;
         s_edit.msaa = MSAA_VAL[clamp_to(v, 0, 3)];
         break;
-    default: return;
+    case IT_MOUSE: s_edit.mouse_aim = !s_edit.mouse_aim; break;
+    case IT_MSENS: s_edit.mouse_sens = SENS_VAL[clamp_to(sens_ix(s_edit.mouse_sens) + dir, 0, SENS_N - 1)]; break;
+    case IT_MINV: s_edit.mouse_invert = !s_edit.mouse_invert; break;
+    default:
+        if (item >= IT_MB0 && item <= IT_MB_LAST) {
+            char root[MAX_PATH];
+            int *t = &s_mb[item - IT_MB0];
+            *t = (*t + dir + mb_target_count) % mb_target_count;
+            halo2_install_root(root, sizeof root);
+            if (mb_save(root, s_mb))
+                h2_mouse_binds_changed();
+            return;
+        }
+        return;
     }
     halo2_settings_apply(&s_edit, 1);
 }
@@ -202,17 +247,24 @@ static void draw_quit(HDC hdc, int w, int h)
 static void draw_settings(HDC hdc, int w, int h)
 {
     RECT r;
-    int bw = 460, bh = 420, x = (w - bw) / 2, y = (h - bh) / 2, i;
+    int bw = 560, rh = (h - 150) / IT_COUNT, bh, x = (w - bw) / 2, y, i;
     HBRUSH bg = CreateSolidBrush(RGB(8, 10, 14));
     HBRUSH panel = CreateSolidBrush(RGB(22, 26, 34));
     HBRUSH lit = CreateSolidBrush(RGB(36, 80, 140));
     HFONT title = CreateFontA(22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                               0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    HFONT body = CreateFontA(18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                             0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    HFONT note = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                             0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    HFONT body, note = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                   0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     HGDIOBJ old;
+
+    /* Rows shrink to fit the window: 36 px at most, 18 at least. */
+    if (rh > 36) rh = 36;
+    if (rh < 18) rh = 18;
+    bh = 56 + IT_COUNT * rh + 60;
+    y = (h - bh) / 2;
+    if (y < 0) y = 0;
+    body = CreateFontA(rh >= 30 ? 18 : (rh >= 24 ? 16 : 14), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                       DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
 
     SetRect(&r, 0, 0, w, h);
     FillRect(hdc, &r, bg);
@@ -226,8 +278,8 @@ static void draw_settings(HDC hdc, int w, int h)
     SelectObject(hdc, body);
     for (i = 0; i < IT_COUNT; i++) {
         RECT row;
-        char val[32];
-        SetRect(&row, x + 16, y + 56 + i * 36, x + bw - 16, y + 88 + i * 36);
+        char val[40];
+        SetRect(&row, x + 16, y + 56 + i * rh, x + bw - 16, y + 56 + (i + 1) * rh - 2);
         if (i == s_sel)
             FillRect(hdc, &row, lit);
         SetTextColor(hdc, RGB(235, 235, 235));

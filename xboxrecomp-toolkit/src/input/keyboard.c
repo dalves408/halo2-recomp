@@ -18,6 +18,7 @@
  */
 #include "keyboard.h"
 #include "input_map.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +26,16 @@
  * thread and read only by the game's poll, one byte at a time, and a press
  * seen a poll late is indistinguishable from one made a poll later. */
 static volatile unsigned char s_key_down[256];
+static volatile int s_mouse_keys;       /* xbox_InputSetMouseKeys */
+
+void xbox_InputSetMouseKeys(int on) { s_mouse_keys = on != 0; }
+
+static int is_mouse_vk(int vk)
+{
+    return vk == XBOX_VK_LBUTTON || vk == XBOX_VK_RBUTTON || vk == XBOX_VK_MBUTTON ||
+           vk == XBOX_VK_XBUTTON1 || vk == XBOX_VK_XBUTTON2 ||
+           vk == XBOX_VK_MWHEELUP || vk == XBOX_VK_MWHEELDOWN;
+}
 
 void xbox_InputKeySet(int vk, int down)
 {
@@ -113,6 +124,13 @@ const xbox_key_row xbox_key_map[] = {
     { "K",               { 'K' },            XBOX_KEY_AXIS,   XBOX_KEY_RY,             -1, "Right stick down" },
     { "J",               { 'J' },            XBOX_KEY_AXIS,   XBOX_KEY_RX,             -1, "Right stick left" },
     { "L",               { 'L' },            XBOX_KEY_AXIS,   XBOX_KEY_RX,             +1, "Right stick right" },
+    /* The mouse, as each control's alternate. Counted only while a title's
+     * mouse aim is on (xbox_InputSetMouseKeys). */
+    { "Left click",      { XBOX_VK_LBUTTON },  XBOX_KEY_ANALOG, XBOX_BUTTON_RTRIGGER, 0, "Right trigger" },
+    { "Right click",     { XBOX_VK_RBUTTON },  XBOX_KEY_ANALOG, XBOX_BUTTON_LTRIGGER, 0, "Left trigger" },
+    { "Wheel up",        { XBOX_VK_MWHEELUP }, XBOX_KEY_ANALOG, XBOX_BUTTON_Y,        0, "Y" },
+    { "Mouse button 4",  { XBOX_VK_XBUTTON1 }, XBOX_KEY_ANALOG, XBOX_BUTTON_WHITE,    0, "White" },
+    { "Mouse button 5",  { XBOX_VK_XBUTTON2 }, XBOX_KEY_ANALOG, XBOX_BUTTON_BLACK,    0, "Black" },
 };
 const size_t xbox_key_map_count = sizeof xbox_key_map / sizeof xbox_key_map[0];
 
@@ -147,7 +165,7 @@ static int row_control(const xbox_key_row *r)
     return -1;
 }
 
-void xbox_InputKeyboardBindings(InputBindings *b)
+static void default_bindings(InputBindings *b)
 {
     memset(b, 0, sizeof *b);
     /* Full deflection on a diagonal, as this map has always given. */
@@ -161,6 +179,79 @@ void xbox_InputKeyboardBindings(InputBindings *b)
     }
 }
 
+/* RECOMP_KEYMAP=<file>: a player's own keys, read once.
+ *
+ * An INI [keys] section, one line per control under its input_map name
+ * ("a = Z, Space", "left_stick_up = W, Up"); a control the file does not name
+ * keeps the default keys above, "none" leaves it unbound. Plain text rather
+ * than a Windows profile API so every host reads it the same way. */
+static volatile int s_keymap_state;     /* 0 not read, 1 none, 2 loaded */
+static InputBindings s_keymap;
+
+/* Read RECOMP_KEYMAP again on the next poll (a title's settings changed it). */
+void xbox_InputKeymapReload(void) { s_keymap_state = 0; }
+
+static void keymap_load(void)
+{
+    const char *path = getenv("RECOMP_KEYMAP");
+    FILE *f;
+    char line[512];
+    int in_keys = 0, lines = 0, bad = 0;
+
+    s_keymap_state = 1;
+    default_bindings(&s_keymap);
+    if (!path || !*path || !(f = fopen(path, "r")))
+        return;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *eq, *e;
+        int c;
+        while (*p == ' ' || *p == '\t') p++;
+        for (e = p + strlen(p); e > p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'); e--) ;
+        *e = 0;
+        if (!*p || *p == ';' || *p == '#')
+            continue;
+        if (*p == '[') {
+            in_keys = !strncmp(p, "[keys]", 6);
+            continue;
+        }
+        if (!in_keys || !(eq = strchr(p, '=')))
+            continue;
+        for (e = eq; e > p && (e[-1] == ' ' || e[-1] == '\t'); e--) ;
+        *e = 0;
+        c = xbox_InputMap_ControlFromName(p);
+        if (c < 0) { bad++; continue; }
+        for (p = eq + 1; *p == ' ' || *p == '\t'; p++) ;
+        bad += xbox_InputMap_BindingsParse(&s_keymap, c, p) > 0;
+        lines++;
+    }
+    fclose(f);
+    s_keymap_state = 2;
+    fprintf(stderr, "  [KEYS] key map %s: %d control(s) set%s\n", path, lines,
+            bad ? ", some names not understood (kept the rest)" : "");
+}
+
+void xbox_InputKeyboardBindings(InputBindings *b)
+{
+    if (!s_keymap_state)
+        keymap_load();
+    *b = s_keymap;
+}
+
+/* The face button (XBOX_BUTTON_A..Y, 0..3) a key is bound to in the player's
+ * key map, or -1: lets a host menu read the keys the player presses for A and
+ * B as confirm and back. */
+int xbox_InputKeyFaceButton(int vk)
+{
+    InputBindings b;
+    int c, k;
+    xbox_InputKeyboardBindings(&b);
+    for (c = INPUT_A; c <= INPUT_Y; c++)
+        for (k = 0; k < b.count[c]; k++)
+            if (b.key[c][k] == vk)
+                return c - INPUT_A;
+    return -1;
+}
+
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
 {
     static DWORD packet;
@@ -169,7 +260,7 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
 
     /* One snapshot of the table, so a poll sees one set of keys. */
     for (int vk = 0; vk < INPUT_KEY_COUNT; vk++)
-        down[vk] = s_key_down[vk];
+        down[vk] = (s_mouse_keys || !is_mouse_vk(vk)) ? s_key_down[vk] : 0;
     xbox_InputKeyboardBindings(&b);
 
     memset(out, 0, sizeof *out);

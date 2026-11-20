@@ -11,7 +11,15 @@ typedef struct Halo2Settings {
     int anisotropy;       /* 1=off, or 2/4/8/16 */
     int fxaa;             /* 0/1 */
     int msaa;             /* 1=off, or 2/4/8 */
+    int mouse_aim;        /* 0/1: mouse turns the view (h2_mouse.c); Xbox Live is off while on */
+    int mouse_sens;       /* percent, 10..500 */
+    int mouse_invert;     /* 0/1: mouse up looks down */
 } Halo2Settings;
+
+/* Settings live in the install folder: <install>\SaveData\settings.ini
+ * (the folder that holds build-ninja\). An older %LOCALAPPDATA% copy is
+ * moved there the first time. */
+void halo2_install_root(char *buf, size_t n);
 
 void halo2_settings_defaults(Halo2Settings *s);
 void halo2_settings_ini_path(char *buf, size_t n);

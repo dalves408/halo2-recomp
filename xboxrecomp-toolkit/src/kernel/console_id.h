@@ -33,6 +33,12 @@ const uint8_t *xbox_ConsoleEeprom(void);
 /* The hard-drive key: 1 and out filled when one is known. */
 int xbox_ConsoleHdKey(uint8_t out[16]);
 
+/* 1 when the EEPROM and hard-drive key are verified: the BIOS's EEPROM key
+ * (RECOMP_XBOX_EEPROM_KEY, or RECOMP_XBOX_EEPROM_KEY_FILE holding the 16
+ * bytes) opens the EEPROM's sealed section and the key sealed there is the
+ * one given. Only a verified identity may reach Xbox Live. */
+int xbox_ConsoleIdentityVerified(void);
+
 /* The game region from the encrypted section (0 when not decrypted). */
 uint32_t xbox_ConsoleGameRegion(void);
 

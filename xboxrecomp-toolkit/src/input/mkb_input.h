@@ -35,8 +35,26 @@
 extern "C" {
 #endif
 
-/* True when the layer is enabled (RECOMP_MKB not "0"). Cheap; cached. */
+/* True when the layer is enabled (RECOMP_MKB not "0", or mkb_set_enabled). Cheap. */
 int mkb_enabled(void);
+
+/* For a title's own settings, at any time:
+ *   mkb_set_enabled   turn the layer on or off (starts its input thread once);
+ *   mkb_set_mouse_only  1: only the mouse (aim, buttons, wheel); the keyboard is
+ *                     left to the key map (keyboard.c) instead of this layer's
+ *                     fixed layout;
+ *   mkb_set_aim       sensitivity multiplier and vertical inversion. */
+void mkb_set_enabled(int on);
+void mkb_set_mouse_only(int on);
+void mkb_set_aim(double sens, int invert_y);
+
+/* Mouse aim through the title's own view angles instead of the stick:
+ *   mkb_set_mouse_stick(0)  the mouse no longer deflects the aim stick;
+ *   mkb_take_mouse          the raw counts since the last call (x right, y
+ *                           down), 0 when there are none or the layer is off,
+ *                           released (F9) or the game is not in front. */
+void mkb_set_mouse_stick(int on);
+int  mkb_take_mouse(long *dx, long *dy);
 
 /*
  * Merge the mouse+keyboard virtual pad on top of *pState, in place.

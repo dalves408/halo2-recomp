@@ -68,10 +68,11 @@ typedef struct KeyName { const char *name; int vk; } KeyName;
 
 /* The first name listed for a code is the one written back. Letters, digits,
  * function keys and the numeric pad's digits are generated rather than listed.
- * The mouse wheel has no virtual-key code, so it has no name here. */
+ * The wheel has no virtual-key code; it gets two unassigned ones (keyboard.h). */
 static const KeyName k_keys[] = {
     { "mouse1", XBOX_VK_LBUTTON }, { "mouse2", XBOX_VK_RBUTTON }, { "mouse3", XBOX_VK_MBUTTON },
     { "mouse4", XBOX_VK_XBUTTON1 }, { "mouse5", XBOX_VK_XBUTTON2 },
+    { "mwheelup", XBOX_VK_MWHEELUP }, { "mwheeldown", XBOX_VK_MWHEELDOWN },
     { "backspace", XBOX_VK_BACK }, { "tab", XBOX_VK_TAB }, { "enter", XBOX_VK_RETURN }, { "return", XBOX_VK_RETURN },
     { "shift", XBOX_VK_SHIFT }, { "ctrl", XBOX_VK_CONTROL }, { "control", XBOX_VK_CONTROL }, { "alt", XBOX_VK_MENU },
     { "pause", XBOX_VK_PAUSE }, { "capslock", XBOX_VK_CAPITAL },

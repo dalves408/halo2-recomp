@@ -42,7 +42,7 @@ Requirements: Visual Studio 2022 with the C++ x64 tools, CMake, Ninja and Python
    This writes `halo2-native-tu15\src\downloader\gen\`.
 4. **Build.** Run `halo2-native-tu15\build.cmd` (or
    `cmake -S halo2-native-tu15 -B halo2-native-tu15\build-ninja -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DXBOXRECOMP_BUILD_TESTS=OFF`
-   then `cmake --build halo2-native-tu15\build-ninja --target halo2_recomp halo2_downloader halo2_config`).
+   then `cmake --build halo2-native-tu15\build-ninja --target halo2_recomp halo2_downloader halo2_config halo2_insignia_setup`).
 5. **Run** one of the launchers in `halo2-native-tu15\`. F1 in game (or
    `build-ninja\Config.exe`) opens the settings.
 
@@ -53,30 +53,60 @@ Requirements: Visual Studio 2022 with the C++ x64 tools, CMake, Ninja and Python
 | `Launch-Halo2-Insignia.cmd` | Xbox Live through [Insignia](https://insignia.live), with your own console identity (below) |
 
 The game runs in one window from start to exit, including the hand-over to the content
-downloader and back. All saves and settings stay in the install folder (`SaveData\`).
+downloader and back. All saves and settings stay in the install folder: `SaveData\`,
+with the settings in `SaveData\settings.ini`. Every launcher loads the console identity
+when one has been set up, so the game's disk cache matches whichever launcher is used.
+The offline launcher has no network; the System Link launcher's internet router is off.
+
+## Mouse and keyboard
+
+Turn on **Mouse aim** in the F1 menu, or in `build-ninja\Config.exe`.
+
+- **Aim:** the mouse turns the player directly, with no stick acceleration. The mouse is
+  added to the arguments of the game's own turn function, so the pitch and vehicle-seat
+  limits still apply.
+  - Sensitivity and invert are in the same menus. F9 frees the pointer, which is hidden
+    while you aim.
+  - Relative and absolute mouse input both work (absolute: remote desktop, KVMs,
+    tablets).
+- **Menus:** outside play (intros, menus, cutscenes, pause), left click is Start and
+  right click is B.
+- **In play:** the mouse buttons and the wheel are bindings in the key map. Rebind them
+  in F1 (applied at once) or in Config.exe.
+- **Keys:** `keymap.ini` has an FPS layout. The player's copy, with any changes, is
+  `SaveData\keymap.ini`.
+- **Xbox Live is off while Mouse aim is on:** the router refuses every internet packet,
+  so Insignia matches stay controller-only. Campaign, split screen and System Link keep
+  the mouse.
 
 ## Xbox Live (Insignia)
 
-Xbox Live needs the identity of a console you own. Put these in
-`halo2-native-tu15\SaveData\Identity\`:
+Xbox Live needs the identity of a console you own. Run
+`halo2-native-tu15\build-ninja\Insignia Setup.exe` (built from `src/insignia_setup.c`).
 
-- `eeprom.bin`, your console's EEPROM.
-- `hddinfo.txt`, holding a line with your console's `XboxHDKey`.
-- `titlekeys.bin`, Halo 2's per-title keys derived from your own BIOS, MCPX ROM and
-  EEPROM:
-  `python halo2-native-tu15\installer\derive_title_keys.py --bios ... --mcpx ... --eeprom ... --xbe halo2-native-tu15\game\default.xbe --out halo2-native-tu15\SaveData\Identity\titlekeys.bin`
+1. Choose your console's EEPROM.
+2. Choose your console's BIOS image and its MCPX boot ROM. This proves the EEPROM is a
+   real console's: only that console's BIOS opens its sealed section. It also makes
+   Halo 2's per-title keys.
+3. Give the hard-drive key, typed or from `hddinfo.txt`, or let the BIOS fill it in. It
+   must be the key sealed in that EEPROM.
+4. Save, then recover your account from Insignia (gamertag plus the 16-digit number from
+   insignia.live), or load the accounts from a dump of your console's drive (raw image or
+   xemu `.qcow2`).
 
-Nothing is built in, and no key is ever logged. Only one copy of a console identity may
-be online at a time: keep the console, xemu and other copies off.
+Setup writes `eeprom.bin`, `hddinfo.txt`, `eepromkey.bin` and `titlekeys.bin` to
+`SaveData\Identity\`. Save and Recover stay locked until steps 1–3 are verified, and
+Setup itself has no network code. Nothing is built in, and no key is ever logged. Only
+one copy of a console identity may be online at a time: keep the console, xemu and other
+copies off.
 
-- **Existing account:** `Recover-Insignia-Account.ps1` recovers it into the install,
-  through the game's own Xbox Live library, with the recovery number from insignia.live.
-  The number goes to the game over a pipe and is never written anywhere.
+- **Verified identity only:** the game checks the identity again at start against the
+  BIOS key that Setup saved. Without a verified identity its router lets nothing reach
+  the internet: no DNS lookups and no packets to Insignia. System Link still works.
+- **Account recovery:** it runs through the game's own Xbox Live library. The recovery
+  number goes to the game over a pipe and is never written anywhere.
 - **Downloadable content:** the in-game content downloader installs the map packs from
   Insignia.
-- **No EEPROM, no contact:** without a console identity the game never contacts
-  Insignia. That means no DNS lookups and no packets to the internet. System Link still
-  works.
 - **30 fps in matches only:** Xbox Live matches run at 30 fps, one frame per simulation
   tick, because 60 fps jitters against the 30 Hz network game. The game is back at 60 fps
   10 seconds after a match ends. Being signed in alone, System Link and the campaign stay

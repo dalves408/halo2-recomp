@@ -30,6 +30,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "mkb_input.h"
+#include "keyboard.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -135,10 +136,16 @@ static void mkb_load_config(void)
  * with InterlockedAdd, the poll takes everything with Exchange(0). */
 static volatile LONG s_dx, s_dy;
 static volatile LONG s_wheel;        /* wheel steps since last poll   */
-static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2    */
+static volatile LONG s_wheel_part;   /* part of a step: touchpads and fine wheels send less than one */
+static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
+static volatile LONG s_mouse_tap;    /* pressed since the last poll: a click
+                                        between two polls still counts */
 static volatile unsigned char s_vk_down[256];
 
 static volatile LONG s_active = 1;   /* F9 toggles this               */
+static volatile LONG s_on = -1;      /* -1: RECOMP_MKB decides; else mkb_set_enabled */
+static volatile LONG s_mouse_only;   /* mkb_set_mouse_only             */
+static volatile LONG s_mouse_stick = 1;  /* mkb_set_mouse_stick         */
 static volatile LONG s_thread_up;
 
 /* F9 is read on the input thread, so the toggle works even while the
@@ -161,30 +168,54 @@ static void mkb_handle_raw(HRAWINPUT h)
         if (!(m->usFlags & MOUSE_MOVE_ABSOLUTE)) {
             if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
             if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
+        } else {
+            /* Some input arrives as absolute positions, 0..65535 across the
+             * screen (or the whole virtual desktop): remote desktop and
+             * streaming tools, virtual machines, some tablet and touchpad
+             * drivers. The movement is the change between two positions,
+             * in screen pixels. The first position, and a jump of more than
+             * half the screen (the pointer re-entering), only set the start. */
+            static LONG have, last_x, last_y;
+            int virt = (m->usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+            LONG w = GetSystemMetrics(virt ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+            LONG hgt = GetSystemMetrics(virt ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+            LONG x = (LONG)((LONGLONG)m->lLastX * w / 65535);
+            LONG y = (LONG)((LONGLONG)m->lLastY * hgt / 65535);
+            if (have && labs(x - last_x) < w / 2 && labs(y - last_y) < hgt / 2) {
+                if (x != last_x) InterlockedAdd(&s_dx, x - last_x);
+                if (y != last_y) InterlockedAdd(&s_dy, y - last_y);
+            }
+            have = 1;
+            last_x = x;
+            last_y = y;
         }
         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
-            InterlockedOr(&s_mouse_btn, 1);
+            { InterlockedOr(&s_mouse_btn, 1); InterlockedOr(&s_mouse_tap, 1); }
         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
             InterlockedAnd(&s_mouse_btn, ~1);
         if (m->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
-            InterlockedOr(&s_mouse_btn, 2);
+            { InterlockedOr(&s_mouse_btn, 2); InterlockedOr(&s_mouse_tap, 2); }
         if (m->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
             InterlockedAnd(&s_mouse_btn, ~2);
         if (m->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)
-            InterlockedOr(&s_mouse_btn, 4);
+            { InterlockedOr(&s_mouse_btn, 4); InterlockedOr(&s_mouse_tap, 4); }
         if (m->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)
             InterlockedAnd(&s_mouse_btn, ~4);
         if (m->usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)
-            InterlockedOr(&s_mouse_btn, 8);
+            { InterlockedOr(&s_mouse_btn, 8); InterlockedOr(&s_mouse_tap, 8); }
         if (m->usButtonFlags & RI_MOUSE_BUTTON_4_UP)
             InterlockedAnd(&s_mouse_btn, ~8);
         if (m->usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)
-            InterlockedOr(&s_mouse_btn, 16);
+            { InterlockedOr(&s_mouse_btn, 16); InterlockedOr(&s_mouse_tap, 16); }
         if (m->usButtonFlags & RI_MOUSE_BUTTON_5_UP)
             InterlockedAnd(&s_mouse_btn, ~16);
         if (m->usButtonFlags & RI_MOUSE_WHEEL) {
             SHORT d = (SHORT)m->usButtonData;
-            InterlockedAdd(&s_wheel, d / WHEEL_DELTA);
+            LONG t = InterlockedAdd(&s_wheel_part, d);
+            if (t >= WHEEL_DELTA || t <= -WHEEL_DELTA) {
+                InterlockedAdd(&s_wheel_part, -(t / WHEEL_DELTA) * WHEEL_DELTA);
+                InterlockedAdd(&s_wheel, t / WHEEL_DELTA);
+            }
         }
     } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
         const RAWKEYBOARD *k = &ri->data.keyboard;
@@ -271,45 +302,83 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
 
 /* ---- poll side --------------------------------------------------------- */
 
+static void mkb_start(void)
+{
+    static LONG started = 0;
+    if (InterlockedCompareExchange(&started, 1, 0) == 0) {
+        mkb_load_config();
+        CloseHandle(CreateThread(NULL, 0, mkb_thread, NULL, 0, NULL));
+    }
+}
+
 int mkb_enabled(void)
 {
-    static int on = -1;
+    LONG on = InterlockedCompareExchange(&s_on, 0, 0);
     if (on < 0) {
         /* Opt-in, like RECOMP_KEYBOARD: a keyboard silently acting as
          * player 1 is surprising when a real pad is what you meant to use.
-         * RECOMP_MKB=1 turns the layer on. */
+         * RECOMP_MKB=1 turns the layer on; a title can instead decide with
+         * mkb_set_enabled. */
         const char *v = getenv("RECOMP_MKB");
         on = v && *v && *v != '0';
-        if (on) {
-            mkb_load_config();
-            if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
-                static LONG started = 0;
-                if (InterlockedCompareExchange(&started, 1, 0) == 0)
-                    CloseHandle(CreateThread(NULL, 0, mkb_thread,
-                                             NULL, 0, NULL));
-            }
-        }
+        InterlockedCompareExchange(&s_on, on, -1);
+        on = InterlockedCompareExchange(&s_on, 0, 0);
+        if (on) mkb_start();
     }
-    return on;
+    return on > 0;
+}
+
+void mkb_set_enabled(int on)
+{
+    InterlockedExchange(&s_on, on ? 1 : 0);
+    if (on) mkb_start();
+}
+
+void mkb_set_mouse_only(int on) { InterlockedExchange(&s_mouse_only, on ? 1 : 0); }
+void mkb_set_mouse_stick(int on) { InterlockedExchange(&s_mouse_stick, on ? 1 : 0); }
+
+void mkb_set_aim(double sens, int invert_y)
+{
+    if (sens > 0.0 && sens < 100.0) s_cfg.sens = sens;
+    s_cfg.invert_y = invert_y != 0;
 }
 
 /* The recompiled game's process is the foreground one. Raw input with
  * INPUTSINK keeps arriving while the user is in another app, and the
  * mouse must go on behaving normally there. */
+static BOOL CALLBACK mkb_child_is_ours(HWND h, LPARAM found)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId())
+        return TRUE;
+    *(int *)found = 1;
+    return FALSE;
+}
+
+/* The game's window may be a child of another process's top-level window
+ * (RECOMP_FB_PARENT: a title's frame that outlives each relaunch), so the
+ * foreground window counts when one of its children is ours. */
 static int game_is_foreground(void)
 {
     DWORD pid = 0;
+    int found = 0;
     HWND fg = GetForegroundWindow();
     if (!fg)
         return 0;
     GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
+    if (pid == GetCurrentProcessId())
+        return 1;
+    EnumChildWindows(fg, mkb_child_is_ours, (LPARAM)&found);
+    return found;
 }
 
 /* Hide and confine the pointer while captured. Aiming with raw deltas
  * does not move the pointer by itself, but Windows still moves it from
  * the same physical movement, so it would wander across the screen and
  * end up clicking other apps' title bars. */
+void xbox_FramebufferHideCursor(int hide);   /* video/fb_present.c */
+
 static void mkb_manage_cursor(int capture)
 {
     static int hidden;          /* how many ShowCursor(FALSE) we owe  */
@@ -321,14 +390,25 @@ static void mkb_manage_cursor(int capture)
     last = now;
 
     if (capture) {
+        /* Pinned to one point in the middle of the picture, as shooters do:
+         * aim comes from raw deltas, so the pointer need not move, and one
+         * that may roam reaches the title bar (Close) or a border, where it
+         * turns into a resize arrow. */
         RECT r;
+        POINT o = { 0, 0 };
         HWND fg = GetForegroundWindow();
-        if (fg && GetWindowRect(fg, &r))
-            ClipCursor(&r);
+        if (fg && GetClientRect(fg, &r) && ClientToScreen(fg, &o) && r.right > 0 && r.bottom > 0) {
+            RECT pin;
+            pin.left = o.x + r.right / 2; pin.top = o.y + r.bottom / 2;
+            pin.right = pin.left + 1; pin.bottom = pin.top + 1;
+            ClipCursor(&pin);
+        }
         if (hidden < 5) { ShowCursor(FALSE); hidden++; }
+        xbox_FramebufferHideCursor(1);   /* video/fb_present.c: the window hides it */
     } else {
         if (hidden > 0) { ShowCursor(TRUE); hidden--; }
         ClipCursor(NULL);
+        xbox_FramebufferHideCursor(0);
     }
 }
 
@@ -354,6 +434,19 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
     *out_y = (SHORT)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 }
 
+int mkb_take_mouse(long *dx, long *dy)
+{
+    *dx = *dy = 0;
+    if (!mkb_enabled() || !s_thread_up || !s_active || !game_is_foreground()) {
+        InterlockedExchange(&s_dx, 0);
+        InterlockedExchange(&s_dy, 0);
+        return 0;
+    }
+    *dx = InterlockedExchange(&s_dx, 0);
+    *dy = InterlockedExchange(&s_dy, 0);
+    return *dx || *dy;
+}
+
 #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
 
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
@@ -365,8 +458,26 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     int any = 0, i;
     static DWORD packet;
 
-    if (!pState || dwPort != 0 || !mkb_enabled())
+    if (!pState || dwPort != 0)
         return 0;
+    {   /* the wheel's key taps (mouse-only mode) end on time, on every path */
+        static DWORD up_until, down_until;
+        DWORD now = GetTickCount();
+        if (s_mouse_only && mkb_enabled() && s_thread_up && s_active) {
+            LONG w = InterlockedExchange(&s_wheel, 0);
+            if (w > 0) { xbox_InputKeySet(XBOX_VK_MWHEELUP, 1); up_until = now + 70; }
+            if (w < 0) { xbox_InputKeySet(XBOX_VK_MWHEELDOWN, 1); down_until = now + 70; }
+        }
+        if (up_until && (LONG)(now - up_until) >= 0) { xbox_InputKeySet(XBOX_VK_MWHEELUP, 0); up_until = 0; }
+        if (down_until && (LONG)(now - down_until) >= 0) { xbox_InputKeySet(XBOX_VK_MWHEELDOWN, 0); down_until = 0; }
+    }
+    if (!mkb_enabled()) {
+        if (s_thread_up)                 /* turned off: give the pointer back */
+            mkb_manage_cursor(0);
+        InterlockedExchange(&s_dx, 0);
+        InterlockedExchange(&s_dy, 0);
+        return 0;
+    }
     if (!s_thread_up)
         return 0;
 
@@ -385,20 +496,25 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
     mkb_manage_cursor(1);
 
-    dx    = InterlockedExchange(&s_dx, 0);
-    dy    = InterlockedExchange(&s_dy, 0);
+    if (s_mouse_stick) {             /* else mkb_take_mouse has them */
+        dx = InterlockedExchange(&s_dx, 0);
+        dy = InterlockedExchange(&s_dy, 0);
+    } else
+        dx = dy = 0;
     wheel = InterlockedExchange(&s_wheel, 0);
-    btn   = InterlockedExchange(&s_mouse_btn, 0);
+    btn   = InterlockedCompareExchange(&s_mouse_btn, 0, 0) | InterlockedExchange(&s_mouse_tap, 0);
 
     memset(analog, 0, sizeof analog);
 
-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
+    /* ---- mouse buttons, as the Xbox pad sees them (in mouse-only mode they
+     *      are keys in the key map instead: mouse1..mouse5, mwheelup/down) ---- */
+    if (s_mouse_only) btn = 0, wheel = 0;
     if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
     if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
     if (btn & 0x04) b |= 0;                              /* M: below  */
 
-    /* ---- keyboard: WASD movement ---- */
-    {
+    /* ---- keyboard: WASD movement (not in mouse-only mode: the key map has it) ---- */
+    if (!s_mouse_only) {
         int mx = 0, my = 0;
         if (MK_VK('W')) my += 1;
         if (MK_VK('S')) my -= 1;
@@ -416,14 +532,13 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         mkb_aim_vector(ax, ay, &aim_x, &aim_y);
     }
 
-    /* ---- keyboard: buttons (Black's layout) ---- */
+    /* ---- keyboard: buttons (Black's layout; not in mouse-only mode) ---- */
+    if (!s_mouse_only) {
     if (MK_VK(VK_SPACE))  analog[XBOX_BUTTON_A]     = 255; /* use/jump */
     if (MK_VK('R'))       analog[XBOX_BUTTON_X]     = 255; /* reload    */
     if (MK_VK('E'))       analog[XBOX_BUTTON_B]     = 255; /* alt use   */
     if (MK_VK('Q'))       analog[XBOX_BUTTON_WHITE] = 255; /* grenade   */
     if (MK_VK('F'))       analog[XBOX_BUTTON_BLACK] = 255; /* alt gren. */
-    if (btn & 0x08)       analog[XBOX_BUTTON_WHITE] = 255; /* X1        */
-    if (btn & 0x10)       analog[XBOX_BUTTON_BLACK] = 255; /* X2        */
     if (MK_VK(VK_RETURN) || MK_VK(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
     if (MK_VK(VK_TAB))                         b |= XBOX_GAMEPAD_BACK;
     if (MK_VK(VK_LSHIFT))                      b |= XBOX_GAMEPAD_LEFT_THUMB;
@@ -432,6 +547,9 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (MK_VK(VK_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
     if (MK_VK(VK_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
     if (MK_VK(VK_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    }
+    if (btn & 0x08)       analog[XBOX_BUTTON_WHITE] = 255; /* X1        */
+    if (btn & 0x10)       analog[XBOX_BUTTON_BLACK] = 255; /* X2        */
 
     /* ---- wheel / middle button: cycle weapon ---- */
     if (wheel || (btn & 0x04))

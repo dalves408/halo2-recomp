@@ -63,3 +63,13 @@ patch(p, "    if (CMP_EQ(_fa, _fb)) { g_seh_ebp = ebp; sub_003DE2FF(); return; }
       "    /* fall through to 0x003DE2BB (hand fix, see sub_003DE2BA) */\n"
       "    g_seh_ebp = ebp; sub_003DE2BA(); return;\n}",
       "fall through to 0x003DE2BB (hand fix")
+
+# 4. Mouse aim (src/h2_mouse.c): an entry hook at the top of sub_0018A300, the function that
+#    turns a local player by the look stick's yaw/pitch deltas. The hook adds the mouse's
+#    turn to those two stack arguments when the per-player control update calls it.
+p = find("void sub_0018A300(void)\n{")
+patch(p, "void sub_0018A300(void)\n{\n",
+      "void sub_0018A300(void)\n{\n"
+      "    extern void sub_0018A300_enter(void);\n"
+      "    sub_0018A300_enter();   /* mouse aim (hand hook, src/h2_mouse.c) */\n",
+      "sub_0018A300_enter();")

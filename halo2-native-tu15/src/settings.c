@@ -12,6 +12,7 @@
 #include "video/gpu_present.h"
 
 extern void xbox_FramebufferWindowSetFullscreen(int on);
+extern void h2_mouse_apply(void);       /* h2_mouse.c */
 
 static Halo2Settings s_cur;
 static int s_loaded;
@@ -63,23 +64,57 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->anisotropy = 1;
     s->fxaa = 0;
     s->msaa = 1;
+    s->mouse_aim = 0;
+    s->mouse_sens = 100;
+    s->mouse_invert = 0;
+}
+
+static int clamp_sens(int v) { return v < 10 ? 10 : (v > 500 ? 500 : v); }
+
+/* The install folder: the exe's folder, or its parent when that is build-ninja. */
+void halo2_install_root(char *buf, size_t n)
+{
+    char *sl;
+    if (!buf || !n)
+        return;
+    buf[0] = 0;
+    if (!GetModuleFileNameA(NULL, buf, (DWORD)n))
+        return;
+    if ((sl = strrchr(buf, '\\')) != NULL) *sl = 0;
+    if ((sl = strrchr(buf, '\\')) != NULL && _stricmp(sl + 1, "build-ninja") == 0) *sl = 0;
 }
 
 void halo2_settings_ini_path(char *buf, size_t n)
 {
-    char base[MAX_PATH];
+    char root[MAX_PATH], old[MAX_PATH], dir[MAX_PATH];
 
     if (!buf || !n)
         return;
     buf[0] = 0;
-    if (FAILED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+    halo2_install_root(root, sizeof root);
+    if (!root[0])
         return;
-    snprintf(buf, n, "%s\\Halo2Native\\settings.ini", base);
+    snprintf(dir, sizeof dir, "%s\\SaveData", root);
+    snprintf(buf, n, "%s\\settings.ini", dir);
+    /* Portable install: an older build kept the file in %LOCALAPPDATA%. */
+    if (GetFileAttributesA(buf) == INVALID_FILE_ATTRIBUTES &&
+        SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, old))) {
+        strncat(old, "\\Halo2Native\\settings.ini", sizeof old - strlen(old) - 1);
+        if (GetFileAttributesA(old) != INVALID_FILE_ATTRIBUTES) {
+            CreateDirectoryA(dir, NULL);
+            CopyFileA(old, buf, TRUE);
+        }
+    }
 }
 
 static int cfg_get(const char *key, int def, const char *path)
 {
     return (int)GetPrivateProfileIntA("display", key, def, path);
+}
+
+static int cfg_get_input(const char *key, int def, const char *path)
+{
+    return (int)GetPrivateProfileIntA("input", key, def, path);
 }
 
 int halo2_settings_load(Halo2Settings *s)
@@ -96,15 +131,20 @@ int halo2_settings_load(Halo2Settings *s)
     s->anisotropy = clamp_aniso(cfg_get("anisotropy", 1, path));
     s->fxaa = cfg_get("fxaa", cfg_get("aa_mode", 0, path) == 1, path) != 0;
     s->msaa = clamp_msaa(cfg_get("msaa", 1, path));
+    s->mouse_aim = cfg_get_input("mouse_aim", 0, path) != 0;
+    s->mouse_sens = clamp_sens(cfg_get_input("mouse_sens", 100, path));
+    s->mouse_invert = cfg_get_input("mouse_invert", 0, path) != 0;
     return 1;
 }
 
-static void cfg_put(const char *key, int v, const char *path)
+static void cfg_put_in(const char *section, const char *key, int v, const char *path)
 {
     char buf[16];
     snprintf(buf, sizeof buf, "%d", v);
-    WritePrivateProfileStringA("display", key, buf, path);
+    WritePrivateProfileStringA(section, key, buf, path);
 }
+
+static void cfg_put(const char *key, int v, const char *path) { cfg_put_in("display", key, v, path); }
 
 int halo2_settings_save(const Halo2Settings *s)
 {
@@ -127,6 +167,9 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("anisotropy", clamp_aniso(s->anisotropy), path);
     cfg_put("fxaa", s->fxaa ? 1 : 0, path);
     cfg_put("msaa", clamp_msaa(s->msaa), path);
+    cfg_put_in("input", "mouse_aim", s->mouse_aim ? 1 : 0, path);
+    cfg_put_in("input", "mouse_sens", clamp_sens(s->mouse_sens), path);
+    cfg_put_in("input", "mouse_invert", s->mouse_invert ? 1 : 0, path);
     return 1;
 }
 
@@ -163,9 +206,11 @@ void halo2_settings_boot(void)
     boot_env(&s_cur);
     s_loaded = 1;
     fprintf(stderr,
-            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d\n",
+            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d;"
+            " mouse aim=%d sens=%d%% invert=%d\n",
             s_cur.resolution_scale, s_cur.fullscreen, s_cur.vsync,
-            s_cur.anisotropy, s_cur.fxaa, s_cur.msaa);
+            s_cur.anisotropy, s_cur.fxaa, s_cur.msaa,
+            s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert);
 }
 
 const Halo2Settings *halo2_settings_get(void)
@@ -231,6 +276,9 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     t.anisotropy = clamp_aniso(t.anisotropy);
     t.fxaa = t.fxaa ? 1 : 0;
     t.msaa = clamp_msaa(t.msaa);
+    t.mouse_aim = t.mouse_aim ? 1 : 0;
+    t.mouse_sens = clamp_sens(t.mouse_sens);
+    t.mouse_invert = t.mouse_invert ? 1 : 0;
     pending_init();
     EnterCriticalSection(&s_pending_lock);
     s_cur = t;
@@ -238,6 +286,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     s_loaded = 1;
     InterlockedExchange(&s_pending_live, 1);
     LeaveCriticalSection(&s_pending_lock);
+    h2_mouse_apply();                    /* mouse settings take effect at once */
     if (save)
         return halo2_settings_save(&s_cur);
     return 1;

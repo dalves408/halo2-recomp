@@ -74,7 +74,7 @@ static int s_ndns;
 static uint16_t s_ip_id = 1;
 static unsigned s_log_dns, s_log_hosts, s_log_tcp;
 static unsigned long s_out, s_in;
-static int s_identity;                  /* 1: the player's EEPROM and hard-drive key are loaded */
+static int s_identity;                  /* 1: the player's EEPROM and hard-drive key, verified */
 static int (*volatile s_gate)(void);     /* nat_set_internet_gate */
 static unsigned s_log_blocked;
 /* Xbox Live traffic (UDP 3074, either way). Signed in, the console trades a
@@ -615,8 +615,9 @@ static void ip_out(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *p, 
             return;
         if (!s_identity) {
             if (!s_log_blocked++)
-                fprintf(stderr, "  [NAT] no console identity (EEPROM and hard-drive key): internet traffic "
-                                "blocked, Xbox Live is off. Run Insignia Setup to add yours.\n");
+                fprintf(stderr, "  [NAT] no verified console identity (EEPROM and hard-drive key checked "
+                                "against your BIOS): internet traffic blocked, Xbox Live is off. Run "
+                                "Insignia Setup to add yours.\n");
             return;
         }
         if (dp == 53) log_dns(p + 8, n - 8);
@@ -877,9 +878,9 @@ void nat_init(void (*inject)(const uint8_t *frame, int len))
         if (inet_pton(AF_INET, tok, &a) == 1) s_dns[s_ndns++] = a.s_addr;
     }
     {
-        uint8_t k[16];
-        s_identity = xbox_ConsoleHasEeprom() && xbox_ConsoleHdKey(k);
-        memset(k, 0, sizeof k);
+        /* Only a console identity verified against the player's own BIOS
+         * (console_id.c) reaches the internet. */
+        s_identity = xbox_ConsoleIdentityVerified();
     }
     s_inject = inject;
     s_on = 1;
@@ -889,7 +890,7 @@ void nat_init(void (*inject)(const uint8_t *frame, int len))
     }
     tcp_init();
     fprintf(stderr, "  [NAT] router at 10.0.0.1, %d DNS server(s)%s\n", s_ndns,
-            s_identity ? "" : "; internet blocked: no console identity");
+            s_identity ? "" : "; internet blocked: no verified console identity");
 }
 
 #else

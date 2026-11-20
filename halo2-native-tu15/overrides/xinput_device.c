@@ -15,6 +15,10 @@
 #include "xinput_xbox.h"
 #include "keyboard.h"
 #include "mkb_input.h"
+
+/* src/h2_mouse.c (the game and the downloader both link it) */
+void h2_mouse_pad_begin(void);
+void h2_mouse_pad_end(unsigned short *buttons, unsigned char *analog);
 extern int halo2_overlay_active(void);
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,6 +224,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     ensure_init();
+    if (dwPort == 0)
+        h2_mouse_pad_begin();      /* src/h2_mouse.c: mouse buttons in play or in menus */
     if (dwPort == 0) {
         EnterCriticalSection(&g_lock);
         sdlpad_rescan(0);
@@ -236,6 +242,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             kb = xbox_InputKeyboardPoll(pState);
             if (mkb_merge(dwPort, pState))
                 g_controller_connected[dwPort] = TRUE;
+            h2_mouse_pad_end(&pState->Gamepad.wButtons, pState->Gamepad.bAnalogButtons);
             if (kb || mkb_enabled()) {
                 if (halo2_overlay_active())
                     memset(pState, 0, sizeof *pState);
@@ -252,8 +259,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
      * aim stick while it is moving, WASD owns movement while held. */
-    if (dwPort == 0)
+    if (dwPort == 0) {
         mkb_merge(dwPort, pState);
+        h2_mouse_pad_end(&pState->Gamepad.wButtons, pState->Gamepad.bAnalogButtons);
+    }
 
     if (halo2_overlay_active() && dwPort == 0)
         memset(pState, 0, sizeof *pState);

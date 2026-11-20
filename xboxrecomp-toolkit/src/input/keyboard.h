@@ -33,6 +33,8 @@ extern "C" {
 #define XBOX_VK_MBUTTON   0x04
 #define XBOX_VK_XBUTTON1  0x05
 #define XBOX_VK_XBUTTON2  0x06
+#define XBOX_VK_MWHEELUP  0x0E      /* the wheel: codes Windows leaves unassigned, */
+#define XBOX_VK_MWHEELDOWN 0x0F     /* one short press per notch (mkb_input.c) */
 #define XBOX_VK_BACK      0x08
 #define XBOX_VK_TAB       0x09
 #define XBOX_VK_RETURN    0x0D
@@ -102,6 +104,13 @@ int  xbox_InputWin32SideVk(int vk, uint32_t lparam);
  * set, or 0 for any other message. wparam is the message's wParam, whose
  * high word says which X button. */
 int  xbox_InputWin32MouseVk(unsigned msg, uint32_t wparam, int *down);
+
+/* Mouse buttons and the wheel count as keys only while this is on (a title's
+ * mouse aim setting): otherwise the click that brings the window to the
+ * front would also be a shot. Off by default. */
+void xbox_InputSetMouseKeys(int on);
+/* Read the key map file (RECOMP_KEYMAP) again on the next poll. */
+void xbox_InputKeymapReload(void);
 /* Non-zero while that virtual key is held in the game's window. Always zero
  * when there is no window, which is the right answer: with nothing to focus
  * there is nothing to type into. Kept under its old name for usb_gamepad.c's
@@ -116,6 +125,8 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out);
  * resolves, and what xbox_InputMap_BindingsFormat writes as text. */
 struct InputBindings;
 void xbox_InputKeyboardBindings(struct InputBindings *b);
+/* The face button (0 A, 1 B, 2 X, 3 Y) a key is bound to in the key map, or -1. */
+int xbox_InputKeyFaceButton(int vk);
 /* 0 when RECOMP_KEYBOARD is off, else 1 with *out filled by
  * xbox_InputKeyboardState(). */
 int  xbox_InputKeyboardPoll(XBOX_INPUT_STATE *out);

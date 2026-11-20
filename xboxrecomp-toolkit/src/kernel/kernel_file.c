@@ -315,6 +315,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    int created_over_leftover = 0;     /* a cache file made again over a copy left behind */
+    extern int xbox_PathInCacheFolder(const WCHAR *host);   /* kernel_path.c */
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -412,6 +414,22 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         DWORD access = xbox_access_to_win32(DesiredAccess);
         WIN32_FILE_ATTRIBUTE_DATA fad;
+        /* A create of a file that is already in the cache folder overwrites
+         * it. The cache is the title's scratch copy of disc files (Halo 2's
+         * fonts on Z:): a first run stopped half way leaves some behind, the
+         * title -- whose own record says they were never made -- creates
+         * them again, and a FILE_CREATE failing with "exists" is its "disc is
+         * dirty or damaged" screen on every later start. */
+        if (CreateDisposition == XBOX_FILE_CREATE && xbox_PathInCacheFolder(win_path) &&
+            GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad) &&
+            !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            static int noted;
+            if (!noted++)
+                fprintf(stderr, "  [FILE] cache file created again over a leftover copy (an earlier run "
+                                "stopped while filling the cache)\n");
+            CreateDisposition = XBOX_FILE_OVERWRITE_IF;
+            created_over_leftover = 1;
+        }
         /* An overwrite of an existing non-empty file is deferred (see
          * s_overwrite_pending). It needs write access to settle later. */
         int defer = disposition_overwrites(CreateDisposition)
@@ -475,7 +493,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     *FileHandle = h;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
+        IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE || created_over_leftover) ? 2 : 1;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
     return STATUS_SUCCESS;

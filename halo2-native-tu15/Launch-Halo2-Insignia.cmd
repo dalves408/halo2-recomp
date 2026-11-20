@@ -8,8 +8,12 @@ setlocal
 pushd "%~dp0" || exit /b 1
 
 set "ID=SaveData\Identity"
-if not exist "%ID%\eeprom.bin" (echo No %ID%\eeprom.bin & popd & exit /b 1)
-if not exist "%ID%\hddinfo.txt" (echo No %ID%\hddinfo.txt & popd & exit /b 1)
+if not exist "%ID%\eeprom.bin" (echo No console identity: run build-ninja\"Insignia Setup.exe" first. & popd & exit /b 1)
+if not exist "%ID%\hddinfo.txt" (echo No %ID%\hddinfo.txt: run build-ninja\"Insignia Setup.exe" first. & popd & exit /b 1)
+rem Insignia Setup verified the EEPROM and hard-drive key against the console's own
+rem BIOS; the game checks them again with this key before anything reaches the internet.
+if not exist "%ID%\eepromkey.bin" (echo Your console identity is not verified yet: run build-ninja\"Insignia Setup.exe" first. & popd & exit /b 1)
+set "RECOMP_XBOX_EEPROM_KEY_FILE=%CD%\%ID%\eepromkey.bin"
 set "RECOMP_XBOX_EEPROM=%CD%\%ID%\eeprom.bin"
 rem The hard-drive key: the XboxHDKey line of hddinfo.txt, 32 hex digits. Not echoed.
 for /f "usebackq delims=" %%k in (`powershell -NoProfile -Command "$l = Select-String -Path '%ID%\hddinfo.txt' -Pattern 'XboxHDKey' | Select-Object -First 1; if ($l) { (($l.Line -replace '.*XboxHDKey','') -replace '[^0-9A-Fa-f]','').Substring(0,32) }"`) do set "RECOMP_XBOX_HDKEY=%%k"

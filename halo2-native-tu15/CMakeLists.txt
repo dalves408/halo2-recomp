@@ -59,6 +59,8 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/h2_account.c
     src/h2_frame.c
+    src/h2_mouse.c
+    src/mouse_binds.c
     src/gpu/d3d11_backend.c
     src/gpu/rc_hlsl.c
     src/gpu/render_scale.c
@@ -212,13 +214,20 @@ if(MSVC AND HALO2_PERF_LTO)
 endif()
 
 # Halo 2 Native 1.5 settings editor (Video tab). Same ini as the F1 overlay.
-add_executable(halo2_config WIN32 native/config/config.c)
+add_executable(halo2_config WIN32 native/config/config.c src/mouse_binds.c)
+target_include_directories(halo2_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set_target_properties(halo2_config PROPERTIES OUTPUT_NAME "Config")
 target_link_libraries(halo2_config PRIVATE user32 gdi32 comctl32 shell32)
 add_custom_command(TARGET halo2_config POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:halo2_config>"
         "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
+
+# "Insignia Setup.exe": the player's console identity (verified against their
+# own BIOS) and Xbox Live account, into SaveData\Identity. No network of its own.
+add_executable(halo2_insignia_setup WIN32 src/insignia_setup.c)
+set_target_properties(halo2_insignia_setup PROPERTIES OUTPUT_NAME "Insignia Setup")
+target_link_libraries(halo2_insignia_setup PRIVATE user32 gdi32 comctl32 comdlg32 bcrypt)
 
 # ── The disc's content downloader (Downloader.xbe) ──────────────
 # Halo 2 starts it with XLaunchNewImage for "download content"; it is its own
