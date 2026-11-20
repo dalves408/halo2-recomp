@@ -258,17 +258,30 @@ int gpu_present_shared_ready(uint32_t width, uint32_t height)
            width && height && width <= 16384 && height <= 16384 && !getenv("RECOMP_FB_VA");
 }
 
+/* The picture's shape: 4:3 unless a title renders wider (widescreen) and
+ * says so with gpu_present_set_picture_aspect. */
+static volatile float s_picture_aspect = 4.0f / 3.0f;
+
+void gpu_present_set_picture_aspect(float aspect)
+{
+    if (aspect >= 1.0f && aspect <= 4.0f)
+        s_picture_aspect = aspect;
+}
+
+float gpu_present_picture_aspect(void) { return s_picture_aspect; }
+
 static int picture_size(uint32_t client_width, uint32_t client_height,
                         uint32_t *width, uint32_t *height)
 {
+    float aspect = s_picture_aspect;
     if (!client_width || !client_height || !width || !height)
         return 0;
-    if ((uint64_t)client_width * 3 <= (uint64_t)client_height * 4) {
+    if ((double)client_width <= (double)client_height * aspect) {
         *width = client_width;
-        *height = client_width * 3 / 4;
+        *height = (uint32_t)((double)client_width / aspect + 0.5);
     } else {
         *height = client_height;
-        *width = client_height * 4 / 3;
+        *width = (uint32_t)((double)client_height * aspect + 0.5);
     }
     return *width && *height;
 }
@@ -482,11 +495,17 @@ static int gpu_present_frame_impl(const uint32_t *pixels, int allow_shared,
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
-    /* The largest rectangle of the frame's shape that fits, centred. */
-    sx = (float)s_bw / (float)frame_width;
-    sy = (float)s_bh / (float)frame_height;
-    vp.Width = (float)frame_width * (sx < sy ? sx : sy);
-    vp.Height = (float)frame_height * (sx < sy ? sx : sy);
+    /* The largest rectangle of the picture's shape that fits, centred: 4:3,
+     * or the widescreen shape (gpu_present_set_picture_aspect) whatever the
+     * frame's own pixel size (a widescreen frame from the CPU path is still
+     * 640x480, squeezed across, as the Xbox sent it to a widescreen TV). */
+    {
+        uint32_t pw, ph;
+        (void)sx; (void)sy;
+        if (!picture_size(s_bw, s_bh, &pw, &ph)) { pw = s_bw; ph = s_bh; }
+        vp.Width = (float)pw;
+        vp.Height = (float)ph;
+    }
     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
     vp.MinDepth = 0; vp.MaxDepth = 1;

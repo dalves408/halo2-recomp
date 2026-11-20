@@ -83,6 +83,21 @@ Turn on **Mouse aim** in the F1 menu, or in `build-ninja\Config.exe`.
   - An Xbox Live match's traffic also turns the mouse off, for games joined from an
     invite.
 
+## Widescreen
+
+True widescreen, 16:9 by default. Change it in F1 or Config.exe: Off (4:3), Auto (the
+monitor's shape), 16:9 or 16:10. It takes effect at the next start.
+
+- **3D view:** wider (Hor+), with more at the sides and the same vertical view. The
+  projection's aspect is multiplied in the game's own camera code (a hand patch on the
+  generated C), and the game itself stays in its 4:3 mode, so nothing is stretched.
+- **HUD, menus and text:** kept at 4:3 in the middle of the screen. A geometry shader
+  squeezes flat 2D triangles drawn into the 640x480 screen with depth testing off;
+  full-width ones (fades, full-screen effects) are left alone.
+- Halo 2's own Xbox widescreen mode is not used: it is anamorphic and stretches the HUD.
+- It works everywhere, Xbox Live included, as the original game also offered widescreen.
+  `RECOMP_VIDEO_WIDESCREEN=0` forces 4:3.
+
 ## Xbox Live (Insignia)
 
 Xbox Live needs the identity of a console you own. Run

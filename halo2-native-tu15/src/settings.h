@@ -11,7 +11,8 @@ typedef struct Halo2Settings {
     int anisotropy;       /* 1=off, or 2/4/8/16 */
     int fxaa;             /* 0/1 */
     int msaa;             /* 1=off, or 2/4/8 */
-    int mouse_aim;        /* 0/1: mouse turns the view (h2_mouse.c); Xbox Live is off while on */
+    int widescreen;       /* 0 off (4:3), 1 auto (the monitor's shape), 2 16:9 (default), 3 16:10; at start */
+    int mouse_aim;        /* 0/1: mouse turns the view (h2_mouse.c); off in Xbox Live */
     int mouse_sens;       /* percent, 10..500 */
     int mouse_invert;     /* 0/1: mouse up looks down */
 } Halo2Settings;
@@ -20,6 +21,13 @@ typedef struct Halo2Settings {
  * (the folder that holds build-ninja\). An older %LOCALAPPDATA% copy is
  * moved there the first time. */
 void halo2_install_root(char *buf, size_t n);
+
+/* The picture's shape this run (width / height): 4/3, or the widescreen
+ * shape chosen at start. Widescreen is fixed for the run (the game reads its
+ * TV type once, at boot). */
+float halo2_picture_aspect(void);
+/* The shape a widescreen setting (0-3) gives on this monitor: 4/3, 1.6 or 16/9. */
+float halo2_widescreen_aspect(int mode);
 
 void halo2_settings_defaults(Halo2Settings *s);
 void halo2_settings_ini_path(char *buf, size_t n);

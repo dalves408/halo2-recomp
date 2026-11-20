@@ -18,14 +18,14 @@ extern volatile int g_audio_muted;
 extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
-enum { IT_SCALE, IT_FS, IT_VSYNC, IT_ANISO, IT_FXAA, IT_MSAA, IT_MOUSE, IT_MSENS, IT_MINV,
+enum { IT_SCALE, IT_FS, IT_VSYNC, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_MOUSE, IT_MSENS, IT_MINV,
        IT_MB0, IT_MB_LAST = IT_MB0 + MB_COUNT - 1,
        IT_CLOSE, IT_QUIT, IT_COUNT };
 enum { MODE_NONE, MODE_QUIT, MODE_SET };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
     "Render Scale", "Fullscreen", "VSync", "Anisotropic filter",
-    "FXAA", "MSAA", "Mouse aim (off in Xbox Live)", "Mouse sensitivity", "Invert mouse",
+    "FXAA", "MSAA", "Widescreen (at next start)", "Mouse aim (off in Xbox Live)", "Mouse sensitivity", "Invert mouse",
     "In play: left click", "In play: right click", "In play: middle click",
     "In play: mouse button 4", "In play: mouse button 5", "In play: wheel up", "In play: wheel down",
     "Close menu", "Quit game"
@@ -129,6 +129,7 @@ static const int MSAA_VAL[4] = { 1, 2, 4, 8 };
 static const char *const ANISO_TXT[5] = { "Off", "2x", "4x", "8x", "16x" };
 static const char *const MSAA_TXT[4] = { "Off", "2x", "4x", "8x" };
 static const char *const OFFON[2] = { "Off", "On" };
+static const char *const WIDE_TXT[4] = { "Off (4:3)", "Auto (monitor)", "16:9", "16:10" };
 static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500 };
 #define SENS_N ((int)(sizeof SENS_VAL / sizeof SENS_VAL[0]))
 
@@ -149,6 +150,7 @@ static void item_text(int item, char *out, size_t n)
     case IT_ANISO: snprintf(out, n, "%s", ANISO_TXT[aniso_ix(s_edit.anisotropy)]); break;
     case IT_FXAA: snprintf(out, n, "%s", OFFON[s_edit.fxaa ? 1 : 0]); break;
     case IT_MSAA: snprintf(out, n, "%s", MSAA_TXT[msaa_ix(s_edit.msaa)]); break;
+    case IT_WIDE: snprintf(out, n, "%s", WIDE_TXT[clamp_to(s_edit.widescreen, 0, 3)]); break;
     case IT_MOUSE: snprintf(out, n, "%s", OFFON[s_edit.mouse_aim ? 1 : 0]); break;
     case IT_MSENS: snprintf(out, n, "%d%%", SENS_VAL[sens_ix(s_edit.mouse_sens)]); break;
     case IT_MINV: snprintf(out, n, "%s", OFFON[s_edit.mouse_invert ? 1 : 0]); break;
@@ -181,6 +183,7 @@ static void nudge(int item, int dir)
         v = msaa_ix(s_edit.msaa) + dir;
         s_edit.msaa = MSAA_VAL[clamp_to(v, 0, 3)];
         break;
+    case IT_WIDE: s_edit.widescreen = (clamp_to(s_edit.widescreen, 0, 3) + dir + 4) % 4; break;
     case IT_MOUSE: s_edit.mouse_aim = !s_edit.mouse_aim; break;
     case IT_MSENS: s_edit.mouse_sens = SENS_VAL[clamp_to(sens_ix(s_edit.mouse_sens) + dir, 0, SENS_N - 1)]; break;
     case IT_MINV: s_edit.mouse_invert = !s_edit.mouse_invert; break;
@@ -292,7 +295,7 @@ static void draw_settings(HDC hdc, int w, int h)
     SelectObject(hdc, note);
     SetTextColor(hdc, RGB(170, 176, 184));
     SetRect(&r, x + 16, y + bh - 52, x + bw - 16, y + bh - 8);
-    DrawTextA(hdc, "Picture stays 4:3. Changes apply now and are saved.\n"
+    DrawTextA(hdc, "Changes apply now and are saved (widescreen: at next start).\n"
                    "F1 or B closes. Arrows or the D-pad change a setting.",
               -1, &r, DT_LEFT | DT_WORDBREAK);
     SelectObject(hdc, old);

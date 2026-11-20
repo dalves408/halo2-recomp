@@ -15,6 +15,7 @@
 #define ID_ANISO  104
 #define ID_FXAA   105
 #define ID_MSAA   106
+#define ID_WIDE   120
 #define ID_MAIM   107
 #define ID_MSENS  108
 #define ID_MINV   109
@@ -32,7 +33,8 @@ static const char *MSAA_TXT[] = { "Off", "2x", "4x", "8x" };
 static const int   MSAA_VAL[] = { 1, 2, 4, 8 };
 
 static HWND s_scale, s_fs, s_vsync, s_aniso, s_fxaa, s_msaa, s_note;
-static HWND s_maim, s_msens, s_minv, s_mb[MB_COUNT];
+static HWND s_maim, s_msens, s_minv, s_mb[MB_COUNT], s_wide;
+static const char *WIDE_TXT[] = { "Off (4:3)", "Auto (monitor)", "16:9", "16:10" };
 static const char *SENS_TXT[] = { "25%", "50%", "75%", "100%", "125%", "150%", "200%", "250%", "300%", "400%", "500%" };
 static const int   SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500 };
 #define SENS_N 11
@@ -127,6 +129,7 @@ static void load_into_ui(int use_defaults)
     fill_combo(s_aniso, ANISO_TXT, 5, aniso_ix(aniso));
     fill_combo(s_fxaa, OFFON, 2, fxaa);
     fill_combo(s_msaa, MSAA_TXT, 4, msaa_ix(msaa));
+    fill_combo(s_wide, WIDE_TXT, 4, use_defaults || !path[0] ? 2 : clampi((int)GetPrivateProfileIntA("display", "widescreen", 2, path), 0, 3));
     {
         char root[MAX_PATH];
         int maim = 0, msens = 100, minv = 0, mb[MB_COUNT], i;
@@ -175,6 +178,8 @@ static int save_from_ui(HWND owner)
     WritePrivateProfileStringA("display", "fxaa", fxaa ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", msaa);
     WritePrivateProfileStringA("display", "msaa", buf, path);
+    snprintf(buf, sizeof buf, "%d", clampi((int)SendMessageA(s_wide, CB_GETCURSEL, 0, 0), 0, 3));
+    WritePrivateProfileStringA("display", "widescreen", buf, path);
     WritePrivateProfileStringA("input", "mouse_aim", SendMessageA(s_maim, CB_GETCURSEL, 0, 0) > 0 ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", SENS_VAL[clampi((int)SendMessageA(s_msens, CB_GETCURSEL, 0, 0), 0, SENS_N - 1)]);
     WritePrivateProfileStringA("input", "mouse_sens", buf, path);
@@ -236,6 +241,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         s_aniso = labeled_combo(h, font, "Anisotropic filter", 156, ID_ANISO);
         s_fxaa = labeled_combo(h, font, "FXAA", 192, ID_FXAA);
         s_msaa = labeled_combo(h, font, "MSAA", 228, ID_MSAA);
+        s_wide = labeled_combo(h, font, "Widescreen (at next start)", 264, ID_WIDE);
         {
             HWND mt = CreateWindowExA(0, "STATIC", "Mouse (also in the F1 menu in the game)",
                                       WS_CHILD | WS_VISIBLE, 460, 16, 380, 22, h, NULL, NULL, NULL);
@@ -252,14 +258,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 s_mb[i] = labeled_combo_at(h, font, mb_key_label[i], 460, 190 + i * 34, ID_MB0 + i);
         }
         note = CreateWindowExA(0, "STATIC",
-                               "The picture stays 4:3, letterboxed in the window.\n"
+                               "Widescreen widens the 3D view; HUD and menus keep their shape.\n"
                                "Mouse settings are on the right (also F1 in the game).\n"
                                "Settings are stored in SaveData\\settings.ini.\n"
                                "If the game is already running, open F1 in-game or restart it\n"
                                "to pick up changes made here. Render scale and MSAA rebuild\n"
                                "surfaces and may flicker once.",
                                WS_CHILD | WS_VISIBLE,
-                               24, 272, 400, 110, h, (HMENU)ID_NOTE, NULL, NULL);
+                               24, 304, 400, 110, h, (HMENU)ID_NOTE, NULL, NULL);
         SendMessageA(note, WM_SETFONT, (WPARAM)font, TRUE);
         s_note = note;
         reset = CreateWindowExA(0, "BUTTON", "Reset",

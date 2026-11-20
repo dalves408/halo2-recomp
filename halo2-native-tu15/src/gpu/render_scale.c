@@ -25,15 +25,27 @@ static unsigned s_epoch;
 static uint64_t s_revision;
 static uint32_t s_output_width, s_output_height;
 
+/* Widescreen (settings.c): the game draws a wider view into its 640x480
+ * surfaces (the Xbox's anamorphic 16:9), so every surface gets this many
+ * more pixels across -- aspect / (4/3) -- and the picture is shown at the
+ * wider shape (gpu_present_set_picture_aspect). 1 for 4:3. */
+static float s_wide_x = 1.0f;
+
+void gpu_scale_set_widescreen(float picture_aspect)
+{
+    s_wide_x = picture_aspect > 1.34f ? picture_aspect * 0.75f : 1.0f;
+}
+
 static int picture_size(uint32_t width, uint32_t height, uint32_t *pw, uint32_t *ph)
 {
+    double aspect = 4.0 / 3.0 * s_wide_x;
     if (!width || !height || width > 16384 || height > 16384)
         return 0;
-    if ((uint64_t)width * 3 <= (uint64_t)height * 4) {
+    if ((double)width <= (double)height * aspect) {
         *pw = width;
-        *ph = (uint32_t)((uint64_t)width * 3 / 4);
+        *ph = (uint32_t)((double)width / aspect + 0.5);
     } else {
-        *pw = (uint32_t)((uint64_t)height * 4 / 3);
+        *pw = (uint32_t)((double)height * aspect + 0.5);
         *ph = height;
     }
     return *pw && *ph;
@@ -175,7 +187,8 @@ int gpu_scale_commit_config(const GpuScaleConfig *config)
 
 int gpu_scale_requested(void)
 {
-    return s_requested;
+    /* Widescreen scales every surface across even at 1x. */
+    return s_requested || s_wide_x != 1.0f;
 }
 
 int gpu_scale_native(void)
@@ -307,6 +320,7 @@ int gpu_scale_surface_size_for(float scale, uint32_t width, uint32_t height,
         if (aa_sy > 1)
             sy /= aa_sy;
     }
+    sx *= s_wide_x;             /* widescreen: more pixels across (see above) */
     pw = floor(width * sx + 0.5);
     ph = floor(height * sy + 0.5);
     if (pw < 1.0 || ph < 1.0 || pw > 16384.0 || ph > 16384.0) {

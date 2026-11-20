@@ -38,6 +38,10 @@ int  gpu_present_frame_capture(const uint32_t *pixels, int allow_shared,
 int  gpu_present_shared_ready(uint32_t width, uint32_t height);
 /* Current 4:3 picture rectangle inside the framebuffer window. */
 int  gpu_present_output_size(uint32_t *width, uint32_t *height);
+/* The shape the picture is shown at (width / height): 4:3 by default; a
+ * title rendering widescreen sets 16:9 or 16:10. */
+void  gpu_present_set_picture_aspect(float aspect);
+float gpu_present_picture_aspect(void);
 uint64_t xbox_FramebufferWindowNextFrameId(void);
 int  gpu_present_submit_shared(HANDLE handle, uint32_t width, uint32_t height,
                                uint64_t frame_id);

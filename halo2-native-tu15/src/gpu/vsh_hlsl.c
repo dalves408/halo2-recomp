@@ -165,18 +165,37 @@ static void put_src(Buf *b, const char *var, const uint32_t *ins, int which,
     "  float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; float fogp : FOG1;\n" \
     "  float4 clip : SV_ClipDistance0; };\n"
 
+/* Widescreen (render_scale.c, settings.c): the game stays in its 4:3 mode
+ * and draws its 2D layer -- HUD, menus, text -- across its 640x480 screen,
+ * which is now wider. A 2D triangle (flat: the same w at all three
+ * corners, whatever w the title's HUD matrix gives; drawn with depth testing off into the screen, wideinfo.y) is squeezed
+ * across by wideinfo.x about the centre, so the HUD and menus keep their
+ * shape in the middle 4:3. A triangle that spans the whole screen across
+ * (a fade, a full-screen effect) is left as it is. */
 const char gpu_vsh_gs_hlsl[] =
+    "cbuffer V : register(b1) { float4 K[192]; float4 vsinfo; float4 foginfo; float4 zinfo;\n"
+    "  float4 wideinfo; };\n"
     GPU_VSH_OUT
     "[maxvertexcount(3)]\n"
     "void gs_main(triangle VSOut v[3], inout TriangleStream<VSOut> s) {\n"
     "  [unroll] for (int i = 0; i < 3; i++)\n"
     "    if (any(!isfinite(v[i].p)) || any(!isfinite(v[i].clip))) return;\n"
+    "  float w0 = v[0].p.w;\n"
+    "  if (wideinfo.x < 0.999 && wideinfo.y > 0.5 && w0 > 0.0 &&\n"
+    "      abs(v[1].p.w - w0) <= 1e-4 * w0 && abs(v[2].p.w - w0) <= 1e-4 * w0) {\n"
+    "    float lo = min(v[0].p.x, min(v[1].p.x, v[2].p.x)) / w0;\n"
+    "    float hi = max(v[0].p.x, max(v[1].p.x, v[2].p.x)) / w0;\n"
+    "    if (hi - lo < 1.9) {\n"
+    "      [unroll] for (int j = 0; j < 3; j++) v[j].p.x *= wideinfo.x;\n"
+    "    }\n"
+    "  }\n"
     "  s.Append(v[0]); s.Append(v[1]); s.Append(v[2]);\n"
     "}\n";
 
 static const char s_head[] =
     GPU_RC_CBUFFER
-    "cbuffer V : register(b1) { float4 K[192]; float4 vsinfo; float4 foginfo; float4 zinfo; };\n"
+    "cbuffer V : register(b1) { float4 K[192]; float4 vsinfo; float4 foginfo; float4 zinfo;\n"
+    "  float4 wideinfo; };\n"
     GPU_VSH_OUT
     "uint kix(int i) { return (i < 0 || i >= 192) ? 0u : (uint)i; }\n"
     /* run_mac's comparisons, per component, NaN behaving as in C */

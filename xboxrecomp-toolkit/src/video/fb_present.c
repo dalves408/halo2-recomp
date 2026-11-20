@@ -722,10 +722,14 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi, FbGdiTrace *trace
         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
         lw = cw; lh = ch;
     }
-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
-        w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
-    } else {
-        h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
+    {   /* the picture's shape (4:3, or widescreen: gpu_present_set_picture_aspect) */
+        extern float gpu_present_picture_aspect(void);
+        double aspect = gpu_present_picture_aspect();
+        if ((double)cw <= (double)ch * aspect) {
+            w = cw; h = (LONG)((double)cw / aspect + 0.5);
+        } else {
+            h = ch; w = (LONG)((double)ch * aspect + 0.5);
+        }
     }
     SetStretchBltMode(hdc, HALFTONE);
     SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
@@ -869,8 +873,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             work.left = work.top = 0; work.right = 1920; work.bottom = 1080;
         }
         for (;; scale--) {
+            /* The picture's shape: 4:3, or a title's widescreen
+             * (gpu_present_set_picture_aspect, set before the window opens). */
+            extern float gpu_present_picture_aspect(void);
             r.left = 0; r.top = 0;
-            r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
+            r.bottom = (LONG)s_fb_height * scale;
+            r.right = (LONG)((float)r.bottom * gpu_present_picture_aspect() + 0.5f);
             AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
             if (scale <= 1 || (r.right - r.left <= work.right - work.left
                                && r.bottom - r.top <= work.bottom - work.top))

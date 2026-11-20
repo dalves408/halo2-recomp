@@ -85,3 +85,25 @@ for va, live in ((0x0023737C, 1), (0x00237324, 0), (0x00237488, 0), (0x00237500,
           f"    extern void h2_mouse_live_menu(int live);\n"
           f"    h2_mouse_live_menu({live});   /* main menu choice {va:08X} (hand hook, src/h2_mouse.c) */\n",
           f"main menu choice {va:08X} (hand hook")
+
+# 6. Widescreen 16:10 (src/settings.c): in the camera projection, sub_0002FB50, the
+#    Xbox's widescreen mode widens the view by 4/3 (4:3 to 16:9). That factor becomes
+#    g_h2_ws_aspect_mul: 4/3 for 16:9 (unchanged), 1.2 for 16:10. The same 4/3 constant
+#    (0x46A514) is used elsewhere and is left alone.
+p = find("void sub_0002FB50(void)")
+patch(p, "    xmm5 = XMM_SCALAR(MEMF(0x46A514)); /* movss */\n    xmm3.f[0] = xmm3.f[0] * xmm5.f[0]; /* mulss */\n",
+      "    xmm5 = XMM_SCALAR(MEMF(0x46A514)); /* movss */\n"
+      "    { extern float g_h2_ws_aspect_mul;   /* widescreen 16:10 (hand fix, src/settings.c) */\n"
+      "      xmm3.f[0] = xmm3.f[0] * g_h2_ws_aspect_mul; }\n",
+      "widescreen 16:10 (hand fix, src/settings.c)")
+
+# 7. True widescreen (src/settings.c): the camera projection, sub_0002FB50, computes the
+#    view's aspect (width / height) at 0x0002FC34; it is multiplied by g_h2_wide_fov
+#    (1.333 for 16:9, 1.2 for 16:10, 1 for 4:3), so the 3D view sees more at the sides
+#    while the game stays in its 4:3 mode (HUD, menus and split screen unchanged).
+p = find("void sub_0002FB50(void)")
+patch(p, "    xmm3.f[0] = xmm3.f[0] / MEMF(eax + 0x14); /* divss */\n",
+      "    xmm3.f[0] = xmm3.f[0] / MEMF(eax + 0x14); /* divss */\n"
+      "    { extern float g_h2_wide_fov;   /* true widescreen (hand fix, src/settings.c) */\n"
+      "      xmm3.f[0] = xmm3.f[0] * g_h2_wide_fov; }\n",
+      "true widescreen (hand fix, src/settings.c)")

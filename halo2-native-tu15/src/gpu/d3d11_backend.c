@@ -1042,6 +1042,10 @@ static int s_nsurf;
 static Depth s_depth[MAX_SURF];
 static int s_ndepth;
 static Surf *s_cur;
+/* Widescreen: how much the 2D layer is squeezed across (4/3 over the picture
+ * aspect; 1 = 4:3, nothing squeezed). halo2_gpu_set_ui_squeeze. */
+static float s_ui_squeeze = 1.0f;
+void halo2_gpu_set_ui_squeeze(float squeeze) { if (squeeze > 0.3f && squeeze <= 1.0f) s_ui_squeeze = squeeze; }
 static Surf *s_last_presented; /* Last readback surface for flip-only resize preflight. */
 static Depth *s_cur_depth;
 static UINT s_msaa_want = 1;
@@ -7142,7 +7146,14 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         static GpuVshConsts k;
         static uint32_t kgen;
         static int kgen_ok;
-        float vsinfo[4], foginfo[4], zinfo[4];
+        float vsinfo[4], foginfo[4], zinfo[4], wideinfo[4];
+        /* Widescreen: a draw into the 640x480 screen with depth testing off
+         * may be the 2D layer, which the geometry shader squeezes into the
+         * middle 4:3 (gpu_vsh_gs_hlsl). */
+        wideinfo[0] = s_ui_squeeze;
+        wideinfo[1] = s_ui_squeeze < 0.999f && s_cur && s_cur->w == 640 && s_cur->h == 480 &&
+                      b->xb.state && !b->xb.state->depth_test_enable ? 1.0f : 0.0f;
+        wideinfo[2] = wideinfo[3] = 0.0f;
         vsinfo[0] = b->aa[0]; vsinfo[1] = b->aa[1];
         vsinfo[2] = b->xb.near_clip ? 1.0f : 0.0f; vsinfo[3] = b->xb.near_z;
         foginfo[0] = b->fog_enable ? 1.0f : 0.0f;
@@ -7152,13 +7163,15 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         if (s_kvalid && kgen_ok && b->consts_gen == kgen
                 && !memcmp(vsinfo, s_kshadow.vsinfo, sizeof vsinfo)
                 && !memcmp(foginfo, s_kshadow.foginfo, sizeof foginfo)
-                && !memcmp(zinfo, s_kshadow.zinfo, sizeof zinfo)) {
+                && !memcmp(zinfo, s_kshadow.zinfo, sizeof zinfo)
+                && !memcmp(wideinfo, s_kshadow.wideinfo, sizeof wideinfo)) {
             s_st.kskip++;
         } else {
             memcpy(k.k, b->consts, sizeof k.k);
             memcpy(k.vsinfo, vsinfo, sizeof vsinfo);
             memcpy(k.foginfo, foginfo, sizeof foginfo);
             memcpy(k.zinfo, zinfo, sizeof zinfo);
+            memcpy(k.wideinfo, wideinfo, sizeof wideinfo);
             if (!s_kvalid || memcmp(&k, &s_kshadow, sizeof k)) {
                 D3D11_MAPPED_SUBRESOURCE m;
                 if (gpu_call_failed(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_kcb, 0,
@@ -7221,6 +7234,7 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
     ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
     ID3D11DeviceContext_GSSetShader(s_ctx, vsh_filter_gs(), NULL, 0);
+    ID3D11DeviceContext_GSSetConstantBuffers(s_ctx, 1, 1, &cbs[1]);   /* wideinfo */
     if (zeq_enabled() && s_probe_armed && s_gen >= s_probe_armed && s_cur_depth && b->xb.state && b->xb.state->depth_test_enable &&
         b->xb.state->depth_func == 0x202)
         zeq_measure(b->xb.state, b->nindices, ioff / 4u);

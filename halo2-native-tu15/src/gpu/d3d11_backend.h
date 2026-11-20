@@ -67,4 +67,8 @@ ID3D11SamplerState *bruteforce_d3d11_test_sampler(uint32_t addr_u, uint32_t addr
                                                    unsigned levels);
 #endif
 
+/* Widescreen: squeeze the 2D layer (HUD, menus) across by this factor into the
+ * middle of the wider screen (vsh_hlsl.c). 1 = off. */
+void halo2_gpu_set_ui_squeeze(float squeeze);
+
 #endif

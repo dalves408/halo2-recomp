@@ -45,6 +45,7 @@
 #define TIMER_CLOSE 2
 
 static HWND s_frame;
+static float s_frame_aspect = 4.0f / 3.0f;   /* the picture shape the frame opens at */
 static HANDLE s_job, s_port;
 static volatile LONG s_exit_code;
 static int s_full, s_closing, s_children = -1;
@@ -292,8 +293,14 @@ int h2_frame_main(int *exit_code)
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
         work.left = work.top = 0; work.right = 1920; work.bottom = 1080;
     }
+    {   /* the picture's shape: 4:3, or the widescreen setting's (settings.c) */
+        Halo2Settings set;
+        halo2_settings_load(&set);
+        s_frame_aspect = halo2_widescreen_aspect(set.widescreen);
+    }
     for (scale = 2;; scale--) {
-        r.left = r.top = 0; r.right = 640 * scale; r.bottom = 480 * scale;
+        r.left = r.top = 0; r.bottom = 480 * scale;
+        r.right = (LONG)(480.0f * scale * s_frame_aspect + 0.5f);
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         if (scale <= 1 || (r.right - r.left <= work.right - work.left && r.bottom - r.top <= work.bottom - work.top))
             break;

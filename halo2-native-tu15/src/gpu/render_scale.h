@@ -48,6 +48,9 @@ int gpu_scale_gpu_init(ID3D11Device *device, ID3D11DeviceContext *context);
 /* Live 1x-5x integer scale for the 1.5 settings menu. Bumps the epoch so
  * surfaces rebuild. Returns 0 only if scale is out of range. */
 int gpu_scale_set_integer(int scale);
+/* Widescreen: the picture's width / height (4/3 is off). Surfaces get
+ * aspect / (4/3) more pixels across. Set once at start, before surfaces. */
+void gpu_scale_set_widescreen(float picture_aspect);
 int gpu_scale_integer(void);
 int gpu_scale_blit(ID3D11ShaderResourceView *source, UINT source_width, UINT source_height,
                    ID3D11RenderTargetView *target, UINT target_width, UINT target_height,

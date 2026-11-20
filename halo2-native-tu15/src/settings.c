@@ -64,6 +64,7 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->anisotropy = 1;
     s->fxaa = 0;
     s->msaa = 1;
+    s->widescreen = 2;     /* 16:9 by default */
     s->mouse_aim = 0;
     s->mouse_sens = 100;
     s->mouse_invert = 0;
@@ -131,6 +132,8 @@ int halo2_settings_load(Halo2Settings *s)
     s->anisotropy = clamp_aniso(cfg_get("anisotropy", 1, path));
     s->fxaa = cfg_get("fxaa", cfg_get("aa_mode", 0, path) == 1, path) != 0;
     s->msaa = clamp_msaa(cfg_get("msaa", 1, path));
+    s->widescreen = cfg_get("widescreen", 2, path);
+    if (s->widescreen < 0 || s->widescreen > 3) s->widescreen = 2;
     s->mouse_aim = cfg_get_input("mouse_aim", 0, path) != 0;
     s->mouse_sens = clamp_sens(cfg_get_input("mouse_sens", 100, path));
     s->mouse_invert = cfg_get_input("mouse_invert", 0, path) != 0;
@@ -167,6 +170,7 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("anisotropy", clamp_aniso(s->anisotropy), path);
     cfg_put("fxaa", s->fxaa ? 1 : 0, path);
     cfg_put("msaa", clamp_msaa(s->msaa), path);
+    cfg_put("widescreen", s->widescreen >= 0 && s->widescreen <= 3 ? s->widescreen : 2, path);
     cfg_put_in("input", "mouse_aim", s->mouse_aim ? 1 : 0, path);
     cfg_put_in("input", "mouse_sens", clamp_sens(s->mouse_sens), path);
     cfg_put_in("input", "mouse_invert", s->mouse_invert ? 1 : 0, path);
@@ -177,6 +181,62 @@ static void env_if_unset(const char *name, const char *value)
 {
     if (!getenv(name))
         _putenv_s(name, value);
+}
+
+/* Widescreen, with nothing stretched. Halo 2's own Xbox widescreen mode is
+ * anamorphic (the HUD and menus stretched across, split screen side by
+ * side), so it stays off: the game runs in its 4:3 mode, and
+ *   - every surface gets more pixels across (render_scale.c), the picture
+ *     is shown at the wide shape (gpu_present.c);
+ *   - the 3D camera sees wider: the projection's aspect (width / height,
+ *     sub_0002FB50; analysis/apply-gen-patches.py patch 7) is multiplied by
+ *     g_h2_wide_fov, so the vertical view stays and more shows at the sides;
+ *   - the 2D layer (HUD, menus, text) is squeezed back into the middle 4:3
+ *     at its own proportions (vsh_hlsl.c's geometry shader).
+ * Wider monitors get 16:9 with bars at the sides. */
+float g_h2_wide_fov = 1.0f;                  /* the 3D view's widening (1.333 for 16:9) */
+float g_h2_ws_aspect_mul = 4.0f / 3.0f;      /* the game's own widescreen mode (unused) */
+static float s_picture_aspect = 4.0f / 3.0f;
+
+float halo2_picture_aspect(void) { return s_picture_aspect; }
+
+static float monitor_aspect(void)
+{
+    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    return w > 0 && h > 0 ? (float)w / (float)h : 4.0f / 3.0f;
+}
+
+float halo2_widescreen_aspect(int mode)
+{
+    float aspect = 4.0f / 3.0f;
+    switch (mode) {
+    case 2: aspect = 16.0f / 9.0f; break;
+    case 3: aspect = 16.0f / 10.0f; break;
+    case 1:
+        aspect = monitor_aspect();
+        if (aspect < 1.45f) aspect = 4.0f / 3.0f;            /* 4:3, 5:4: as the game was */
+        else if (aspect < 1.70f) aspect = 16.0f / 10.0f;     /* 16:10 (and 3:2) */
+        else aspect = 16.0f / 9.0f;                          /* 16:9 and wider */
+        break;
+    }
+    return aspect;
+}
+
+static void widescreen_boot(int mode)
+{
+    float aspect = halo2_widescreen_aspect(mode);
+    if (getenv("RECOMP_VIDEO_WIDESCREEN") && getenv("RECOMP_VIDEO_WIDESCREEN")[0] == '0')
+        aspect = 4.0f / 3.0f;
+    s_picture_aspect = aspect;
+    if (aspect > 1.34f) {
+        g_h2_wide_fov = aspect * 0.75f;                      /* 1.333 for 16:9, 1.2 for 16:10 */
+        halo2_gpu_set_ui_squeeze(4.0f / 3.0f / aspect);      /* 0.75 for 16:9 */
+    }
+    gpu_scale_set_widescreen(aspect);
+    gpu_present_set_picture_aspect(aspect);
+    fprintf(stderr, "[SETTINGS] widescreen %s: picture %.3f (%s)\n",
+            mode == 0 ? "off" : mode == 1 ? "auto" : mode == 2 ? "16:9" : "16:10", aspect,
+            aspect > 1.7f ? "16:9" : aspect > 1.34f ? "16:10" : "4:3");
 }
 
 static void boot_env(const Halo2Settings *s)
@@ -204,6 +264,7 @@ void halo2_settings_boot(void)
     pending_init();
     halo2_settings_load(&s_cur);
     boot_env(&s_cur);
+    widescreen_boot(s_cur.widescreen);
     s_loaded = 1;
     fprintf(stderr,
             "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d;"
@@ -276,6 +337,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     t.anisotropy = clamp_aniso(t.anisotropy);
     t.fxaa = t.fxaa ? 1 : 0;
     t.msaa = clamp_msaa(t.msaa);
+    if (t.widescreen < 0 || t.widescreen > 3) t.widescreen = 2;
     t.mouse_aim = t.mouse_aim ? 1 : 0;
     t.mouse_sens = clamp_sens(t.mouse_sens);
     t.mouse_invert = t.mouse_invert ? 1 : 0;
