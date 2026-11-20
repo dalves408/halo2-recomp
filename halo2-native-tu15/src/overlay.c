@@ -25,7 +25,7 @@ enum { MODE_NONE, MODE_QUIT, MODE_SET };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
     "Render Scale", "Fullscreen", "VSync", "Anisotropic filter",
-    "FXAA", "MSAA", "Mouse aim (no Xbox Live while on)", "Mouse sensitivity", "Invert mouse",
+    "FXAA", "MSAA", "Mouse aim (off in Xbox Live)", "Mouse sensitivity", "Invert mouse",
     "In play: left click", "In play: right click", "In play: middle click",
     "In play: mouse button 4", "In play: mouse button 5", "In play: wheel up", "In play: wheel down",
     "Close menu", "Quit game"

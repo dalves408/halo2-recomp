@@ -75,9 +75,13 @@ Turn on **Mouse aim** in the F1 menu, or in `build-ninja\Config.exe`.
   in F1 (applied at once) or in Config.exe.
 - **Keys:** `keymap.ini` has an FPS layout. The player's copy, with any changes, is
   `SaveData\keymap.ini`.
-- **Xbox Live is off while Mouse aim is on:** the router refuses every internet packet,
-  so Insignia matches stay controller-only. Campaign, split screen and System Link keep
-  the mouse.
+- **Controller only on Xbox Live:** sign-in is never blocked. The mouse turns itself off
+  (aim, buttons, menu clicks, the captured pointer) when the player picks XBOX LIVE in the
+  main menu, and back on with Campaign, Split Screen or System Link.
+  - These are entry hooks on the four main-menu choices, matched to the retail functions
+    the Halo 2 decompilation documents.
+  - An Xbox Live match's traffic also turns the mouse off, for games joined from an
+    invite.
 
 ## Xbox Live (Insignia)
 

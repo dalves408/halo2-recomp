@@ -242,7 +242,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             HWND bt;
             int i;
             SendMessageA(mt, WM_SETFONT, (WPARAM)font, TRUE);
-            s_maim = labeled_combo_at(h, font, "Mouse aim (no Xbox Live)", 460, 48, ID_MAIM);
+            s_maim = labeled_combo_at(h, font, "Mouse aim (off in Xbox Live)", 460, 48, ID_MAIM);
             s_msens = labeled_combo_at(h, font, "Mouse sensitivity", 460, 84, ID_MSENS);
             s_minv = labeled_combo_at(h, font, "Invert mouse", 460, 120, ID_MINV);
             bt = CreateWindowExA(0, "STATIC", "Mouse buttons in play (in menus: left = Start, right = B)",

@@ -1,7 +1,7 @@
 /*
  * h2_mouse.c -- mouse aim for Halo 2, and keeping it off Xbox Live.
  *
- * Hand-written. Generated code untouched apart from one entry-hook call
+ * Hand-written. Generated code untouched apart from entry-hook calls
  * (analysis/apply-gen-patches.py), no game state written but the two
  * arguments below.
  *
@@ -24,10 +24,15 @@
  * documents; the TU 1.5 function is the same 1,323 bytes.
  *
  * Xbox Live on Insignia is shared with players on Xboxes and xemu, so mouse
- * aim does not go there: while it is on, the router refuses every packet for
- * the internet (nvnet_nat.c's title gate), so Xbox Live cannot sign in.
- * Turning it off lets the next sign-in through (checked per packet, no
- * restart). Campaign, split screen and System Link (LAN or VPN) keep it.
+ * aim does not go there. The game signs in to Xbox Live on its own at start,
+ * so signing in is left alone; instead the mouse turns off -- aim, buttons,
+ * menu clicks, the captured pointer -- once the player picks XBOX LIVE in the
+ * main menu, and back on when they pick Campaign, Split Screen or System
+ * Link. Entry hooks on those four menu choices (TU 1.5 0x0023737C, 0x00237324,
+ * 0x00237488, 0x00237500, matched by code bytes to the retail functions the
+ * decompilation documents) call h2_mouse_live_menu. As a backstop, an Xbox
+ * Live match's traffic (nat_live_match_recent: a game joined from an invite
+ * without the menu) turns it off too.
  */
 #include <windows.h>
 #include <stdint.h>
@@ -47,7 +52,7 @@ extern int  mkb_take_mouse(long *dx, long *dy);
 extern void mkb_set_aim(double sens, int invert_y);
 extern void xbox_InputSetMouseKeys(int on);
 extern int  xbox_FramebufferKeyDown(int vk);
-extern void nat_set_internet_gate(int (*blocked)(void));
+extern int  nat_live_match_recent(unsigned ms);
 
 #define TURN_FROM_CONTROL_UPDATE 0x00189BF3u    /* return address of the look-stick call */
 /* One count turns 0.066 degrees at 100% (Half-Life's 0.022 x 3, as
@@ -55,6 +60,8 @@ extern void nat_set_internet_gate(int (*blocked)(void));
 #define RAD_PER_COUNT (0.066f * 3.14159265f / 180.0f)
 
 static volatile LONG s_on, s_inited;
+static volatile LONG s_live_menu;   /* the player went into the Xbox Live menus */
+static volatile LONG s_active;      /* mouse aim working now: on, and not in Xbox Live */
 static DWORD s_last_turn;
 static volatile LONG s_play_tick;   /* GetTickCount of the last control update: in play */
 
@@ -68,15 +75,38 @@ static int in_play(void) { return GetTickCount() - (DWORD)s_play_tick < 300; }
  * aim on, in play the mouse buttons and wheel are the key map's; outside play
  * they are not, and left click is START and right click is B, to get through
  * the intros and menus. */
+static void refresh(void)
+{
+    int live = s_live_menu || nat_live_match_recent(10000);
+    int active = s_on && !live;
+    static int was_live;                         /* the mouse is off because of Xbox Live */
+    if (InterlockedExchange(&s_active, active) != active) {
+        mkb_set_enabled(active);                 /* off: the pointer is given back */
+        if (s_on && live && !was_live)
+            fprintf(stderr, "[H2-MOUSE] mouse aim off in Xbox Live (controller only there)\n");
+        else if (active && was_live)
+            fprintf(stderr, "[H2-MOUSE] mouse aim back on (left Xbox Live)\n");
+    }
+    was_live = s_on && live;
+    xbox_InputSetMouseKeys(active && in_play());
+}
+
 void h2_mouse_pad_begin(void)
 {
-    if (s_on)
-        xbox_InputSetMouseKeys(in_play());
+    if (s_inited)
+        refresh();
+}
+
+/* Main menu choices (entry hooks, analysis/apply-gen-patches.py): 1 XBOX LIVE,
+ * 0 Campaign, Split Screen or System Link. */
+void h2_mouse_live_menu(int live)
+{
+    InterlockedExchange(&s_live_menu, live != 0);
 }
 
 void h2_mouse_pad_end(unsigned short *buttons, unsigned char *analog)
 {
-    if (!s_on || in_play())
+    if (!s_active || in_play())
         return;
     if (xbox_FramebufferKeyDown(VK_LBUTTON)) *buttons |= 0x0010;      /* XBOX_GAMEPAD_START */
     if (xbox_FramebufferKeyDown(VK_RBUTTON)) analog[1] = 255;         /* XBOX_BUTTON_B */
@@ -100,7 +130,7 @@ void sub_0018A300_enter(void)
     if (MEM32(esp) != TURN_FROM_CONTROL_UPDATE)
         return;
     InterlockedExchange(&s_play_tick, (LONG)GetTickCount());   /* a player is in control */
-    if (!s_on || g_eax != 0)
+    if (!s_active || g_eax != 0)
         return;
     now = GetTickCount();
     if (!mkb_take_mouse(&dx, &dy) || halo2_overlay_active()) {
@@ -122,20 +152,6 @@ void sub_0018A300_enter(void)
     putf(esp + 8, getf(esp + 8) + (float)dy * scale * (s->mouse_invert ? 1.0f : -1.0f));
 }
 
-static int live_gate(void)
-{
-    static volatile LONG last;
-    DWORD now;
-    if (!s_on)
-        return 0;
-    now = GetTickCount();
-    if (now - (DWORD)last > 8000) {          /* once per attempt, not per packet */
-        InterlockedExchange(&last, (LONG)now);
-        fprintf(stderr, "[H2-MOUSE] mouse aim is on: Xbox Live traffic refused (turn it off in F1 to sign in)\n");
-    }
-    return 1;
-}
-
 void h2_mouse_apply(void)
 {
     const Halo2Settings *s = halo2_settings_get();
@@ -143,11 +159,10 @@ void h2_mouse_apply(void)
     if (!s_inited)               /* the downloader, or before h2_mouse_init: not ours */
         return;
     mkb_set_aim(s->mouse_sens / 100.0, s->mouse_invert);
-    mkb_set_enabled(on);
-    xbox_InputSetMouseKeys(on && in_play()); /* the buttons and wheel, bound in keymap.ini, in play */
     if (InterlockedExchange(&s_on, on) != on)
         fprintf(stderr, "[H2-MOUSE] mouse aim %s (sensitivity %d%%%s)\n", on ? "on" : "off",
                 s->mouse_sens, s->mouse_invert ? ", inverted" : "");
+    refresh();
 }
 
 /* The F1 menu saved new mouse bindings to SaveData\keymap.ini: use that file
@@ -166,7 +181,6 @@ void h2_mouse_init(void)
 {
     mkb_set_mouse_only(1);       /* the keyboard stays the key map's */
     mkb_set_mouse_stick(0);      /* the mouse turns the player, not the stick */
-    nat_set_internet_gate(live_gate);
     InterlockedExchange(&s_inited, 1);
     h2_mouse_apply();
 }

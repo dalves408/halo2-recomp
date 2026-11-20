@@ -73,3 +73,15 @@ patch(p, "void sub_0018A300(void)\n{\n",
       "    extern void sub_0018A300_enter(void);\n"
       "    sub_0018A300_enter();   /* mouse aim (hand hook, src/h2_mouse.c) */\n",
       "sub_0018A300_enter();")
+
+# 5. Mouse aim stays out of Xbox Live (src/h2_mouse.c): entry hooks on the main menu's
+#    choices (TU 1.5 addresses, matched by code bytes to the retail functions the Halo 2
+#    decompilation documents): Xbox Live turns the mouse off, campaign, split screen and
+#    System Link turn it back on.
+for va, live in ((0x0023737C, 1), (0x00237324, 0), (0x00237488, 0), (0x00237500, 0)):
+    p = find(f"void sub_{va:08X}(void)\n{{")
+    patch(p, f"void sub_{va:08X}(void)\n{{\n",
+          f"void sub_{va:08X}(void)\n{{\n"
+          f"    extern void h2_mouse_live_menu(int live);\n"
+          f"    h2_mouse_live_menu({live});   /* main menu choice {va:08X} (hand hook, src/h2_mouse.c) */\n",
+          f"main menu choice {va:08X} (hand hook")
