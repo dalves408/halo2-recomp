@@ -21,6 +21,11 @@ typedef struct Halo2Settings {
  * (the folder that holds build-ninja\). An older %LOCALAPPDATA% copy is
  * moved there the first time. */
 void halo2_install_root(char *buf, size_t n);
+void h2_release_startup(void);                 /* h2_release.c */
+int  h2_start_fullscreen(int saved);
+void h2_diag_start_log(void);                  /* h2_diag.c */
+void h2_diag_video(const char *why);
+void h2_diag_frame(void);
 
 /* The picture's shape this run (width / height): 4/3, or the widescreen
  * shape chosen at start. Widescreen is fixed for the run (the game reads its
@@ -28,6 +33,9 @@ void halo2_install_root(char *buf, size_t n);
 float halo2_picture_aspect(void);
 /* The shape a widescreen setting (0-3) gives on this monitor: 4/3, 1.6 or 16/9. */
 float halo2_widescreen_aspect(int mode);
+/* In Xbox Live: the 4:3 view stretched across (anamorphic), so a wide screen
+ * sees no more than 4:3 does; off again: the full widescreen view. */
+void halo2_widescreen_live(int live);
 
 void halo2_settings_defaults(Halo2Settings *s);
 void halo2_settings_ini_path(char *buf, size_t n);

@@ -5,6 +5,7 @@
 void h2_mouse_init(void);    /* at start, after the settings are loaded */
 void h2_mouse_apply(void);   /* after the mouse settings change (settings.c calls it) */
 void h2_mouse_binds_changed(void);   /* SaveData\keymap.ini was rewritten (F1 menu) */
+void h2_mouse_overlay_changed(void); /* the F1 menu or quit prompt opened or closed */
 
 /* The pad poll's hooks for port 0 (overrides/xinput_device.c): outside play
  * left click is START and right click is B. */

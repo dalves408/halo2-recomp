@@ -1,3 +1,4 @@
+#include "h2_layout.h"
 #include "settings.h"
 
 #include <shlobj.h>
@@ -95,7 +96,7 @@ void halo2_settings_ini_path(char *buf, size_t n)
     halo2_install_root(root, sizeof root);
     if (!root[0])
         return;
-    snprintf(dir, sizeof dir, "%s\\SaveData", root);
+    h2_data_path(root, "", dir, sizeof dir);
     snprintf(buf, n, "%s\\settings.ini", dir);
     /* Portable install: an older build kept the file in %LOCALAPPDATA%. */
     if (GetFileAttributesA(buf) == INVALID_FILE_ATTRIBUTES &&
@@ -197,6 +198,30 @@ static void env_if_unset(const char *name, const char *value)
 float g_h2_wide_fov = 1.0f;                  /* the 3D view's widening (1.333 for 16:9) */
 float g_h2_ws_aspect_mul = 4.0f / 3.0f;      /* the game's own widescreen mode (unused) */
 static float s_picture_aspect = 4.0f / 3.0f;
+static float s_wide_fov_full = 1.0f;         /* g_h2_wide_fov outside Xbox Live */
+static float s_squeeze_full = 1.0f;          /* the 2D squeeze outside Xbox Live */
+
+/* Xbox Live matches are played anamorphic: a wider view would see more than
+ * players at 4:3 do. While `live` (h2_mouse.c: from the XBOX LIVE menu choice
+ * until Campaign / Split Screen / System Link, or a Live match's own traffic,
+ * nvnet_nat.c nat_live_match_recent), the camera keeps the 4:3 view and the 2D layer is not
+ * squeezed, so the game's 4:3 picture is stretched across the same wide
+ * screen -- what Halo 2's own Xbox widescreen mode shows. Both values are
+ * read every frame, so this switches at once in either direction. */
+void halo2_widescreen_live(int live)
+{
+    static int cur = -1;
+    live = live != 0;
+    if (live == cur)
+        return;
+    cur = live;
+    if (s_wide_fov_full <= 1.0f)
+        return;                               /* playing at 4:3: nothing to change */
+    g_h2_wide_fov = live ? 1.0f : s_wide_fov_full;
+    halo2_gpu_set_ui_squeeze(live ? 1.0f : s_squeeze_full);
+    fprintf(stderr, "[SETTINGS] widescreen: %s\n",
+            live ? "Xbox Live, 4:3 view stretched across (anamorphic)" : "full widescreen view");
+}
 
 float halo2_picture_aspect(void) { return s_picture_aspect; }
 
@@ -231,6 +256,8 @@ static void widescreen_boot(int mode)
     if (aspect > 1.34f) {
         g_h2_wide_fov = aspect * 0.75f;                      /* 1.333 for 16:9, 1.2 for 16:10 */
         halo2_gpu_set_ui_squeeze(4.0f / 3.0f / aspect);      /* 0.75 for 16:9 */
+        s_wide_fov_full = g_h2_wide_fov;
+        s_squeeze_full = 4.0f / 3.0f / aspect;
     }
     gpu_scale_set_widescreen(aspect);
     gpu_present_set_picture_aspect(aspect);
@@ -349,8 +376,11 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     InterlockedExchange(&s_pending_live, 1);
     LeaveCriticalSection(&s_pending_lock);
     h2_mouse_apply();                    /* mouse settings take effect at once */
-    if (save)
-        return halo2_settings_save(&s_cur);
+    if (save) {
+        int ok = halo2_settings_save(&s_cur);
+        h2_diag_video("changed in the F1 menu");
+        return ok;
+    }
     return 1;
 }
 

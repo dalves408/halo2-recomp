@@ -43,6 +43,7 @@
 #include <kernel/nv2a_backend.h>
 #include <usb/ohci.h>
 #include <kernel/nvnet.h>
+#include "h2_layout.h"
 #include "gpu/d3d11_backend.h"
 #include "settings.h"
 #include "overlay.h"
@@ -502,6 +503,9 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    h2_release_startup();          /* an installed game started from its exe (src/h2_release.c) */
+    h2_diag_start_log();           /* data\logs\halo2-<date>-<time>.log, [BUILD] (src/h2_diag.c) */
+
 #ifndef H2_DOWNLOADER
     {   /* The process the player started is only the window (h2_frame.c): the
          * game and its downloader run inside it as their own processes. */
@@ -568,7 +572,7 @@ int main(void)
     {   /* The player's keys: SaveData\keymap.ini, else the install's keymap.ini. */
         char root[MAX_PATH], km[MAX_PATH];
         halo2_install_root(root, sizeof root);
-        snprintf(km, sizeof km, "%s\\SaveData\\keymap.ini", root);
+        h2_data_path(root, "keymap.ini", km, sizeof km);
         if (GetFileAttributesA(km) == INVALID_FILE_ATTRIBUTES)
             snprintf(km, sizeof km, "%s\\keymap.ini", root);
         if (!getenv("RECOMP_KEYMAP") && GetFileAttributesA(km) != INVALID_FILE_ATTRIBUTES)
@@ -603,9 +607,14 @@ int main(void)
     perf_sampler_start();   /* RECOMP_PROF=<report> (analysis/perf) */
     rpz_init_main_thread(); /* RECOMP_PERF_CSV=<csv> (analysis/perf) */
 
-    /* Step 1: Load XBE */
-    if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        return 1;
+    /* Step 1: Load XBE: game_files\ in an install, game\ in a development tree (h2_layout.h) */
+    {
+        char xbe_path[64];
+        const char *xbe_name = strrchr(YOUR_GAME_XBE_PATH, '/') + 1;
+        snprintf(xbe_path, sizeof xbe_path, "%s/%s", h2_game_name(), xbe_name);
+        if (!load_xbe(xbe_path, &xbe_data, &xbe_size)) {
+            return 1;
+        }
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
@@ -659,7 +668,7 @@ int main(void)
          * fonts, preferences, savegames, UDATA and TDATA persist in SaveData. */
         xbox_path_set_ephemeral_cache_maps(1);
         xbox_path_set_in_memory_partitions(1);
-        xbox_path_init(YOUR_GAME_DIR, "SaveData");
+        xbox_path_init(h2_game_name(), h2_data_name());
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */

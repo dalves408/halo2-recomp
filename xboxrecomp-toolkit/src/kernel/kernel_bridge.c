@@ -1881,6 +1881,12 @@ static void launch_handoff(const char *xbe_path, uint32_t page)
     snprintf(cmd, sizeof cmd, "\"%s\"", exe);
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
+    /* The same output (a title's log pipe): a Windows-subsystem process only
+     * passes its standard handles on when asked. */
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     fprintf(stderr, "  [KERNEL] launching '%s' as %s\n", file, exe);
     fflush(stderr);
     if (!CreateProcessA(exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {

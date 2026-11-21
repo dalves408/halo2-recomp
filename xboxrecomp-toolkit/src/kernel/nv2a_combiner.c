@@ -144,8 +144,15 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         /* One c0/c1 for every stage, or one per stage (COMBINERCOUNT). */
         memcpy(R[R_C0], unpack_cached(rc->factor0[(flags & 0x010) ? s : 0]), 16);
         memcpy(R[R_C1], unpack_cached(rc->factor1[(flags & 0x100) ? s : 0]), 16);
-        mux_cd = (flags & 1) ? R[R_R0][3] >= 0.5f
-                             : ((int)(R[R_R0][3] * 255.0f) & 1);
+        /* The mux tests one bit of spare0.alpha as the NV2A holds it: a
+         * 9-bit signed value (x * 255, two's complement). MSB is bit 7, set
+         * for 0.5 <= x and also for -0.5 <= x < 0; LSB is bit 0. (Halo 2's
+         * HUD meter mask relies on the negative case.) */
+        {
+            float x = R[R_R0][3] < -1.0f ? -1.0f : (R[R_R0][3] > 1.0f ? 1.0f : R[R_R0][3]);
+            int mv = (int)(x * 255.0f + (x >= 0.0f ? 0.5f : -0.5f));
+            mux_cd = (flags & 1) ? (mv & 0x80) != 0 : (mv & 1) != 0;
+        }
 
         /* Both portions read before either writes (psh.c emits all the
          * arithmetic, then the assignments). */

@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 
 # ============================================================================
 # YOUR_GAME_NAME - Static Recompilation
@@ -14,6 +14,22 @@ project(halo2_recomp C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Player release build, in its own folder (scripts/build_installer.py):
+#   cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DH2_RELEASE=ON
+# The C runtime linked in (no VC++ redistributable to install), a .pdb kept for every exe (never shipped:
+# scripts/symbolize_log.py reads a player's [CRASH]/[FREEZE] offsets with it), the Windows subsystem (no console
+# window), and no developer switches (src/h2_release.c drops RECOMP_* from outside).
+option(H2_RELEASE "Player release build" OFF)
+if(H2_RELEASE)
+    if(RECOMP_DEBUG_TOOLS)
+        message(FATAL_ERROR "H2_RELEASE and RECOMP_DEBUG_TOOLS are separate builds")
+    endif()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    add_compile_definitions(H2_RELEASE=1)
+    string(APPEND CMAKE_C_FLAGS_RELEASE " /Zi")
+    string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
+endif()
 
 # Common definitions
 add_compile_definitions(
@@ -57,10 +73,15 @@ option(RECOMP_DEBUG_TOOLS "Compile in diagnostic helpers such as the DEL screens
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/h2_switch_cases.c
     src/h2_account.c
     src/h2_frame.c
     src/h2_mouse.c
-    src/mouse_binds.c
+    src/keybinds.c
+    src/halo_ui.c
+    src/update_check.c
+    src/h2_release.c
+    src/h2_diag.c
     src/gpu/d3d11_backend.c
     src/gpu/rc_hlsl.c
     src/gpu/render_scale.c
@@ -91,10 +112,11 @@ endif()
 add_executable(${PROJECT_NAME}
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
+    res/halo2.rc
 )
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
-target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
+target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp winhttp)
 
 # SDL3 controllers (Windows, 1.5 only): Xbox pads stay on XInput, every other
 # pad (PlayStation, Switch, generic) comes from SDL3. The toolkit's
@@ -214,10 +236,10 @@ if(MSVC AND HALO2_PERF_LTO)
 endif()
 
 # Halo 2 Native 1.5 settings editor (Video tab). Same ini as the F1 overlay.
-add_executable(halo2_config WIN32 native/config/config.c src/mouse_binds.c)
+add_executable(halo2_config WIN32 native/config/config.c src/keybinds.c src/halo_ui.c src/update_check.c res/config.rc)
 target_include_directories(halo2_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set_target_properties(halo2_config PROPERTIES OUTPUT_NAME "Config")
-target_link_libraries(halo2_config PRIVATE user32 gdi32 comctl32 shell32)
+target_link_libraries(halo2_config PRIVATE user32 gdi32 comctl32 shell32 winhttp version advapi32)
 add_custom_command(TARGET halo2_config POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:halo2_config>"
@@ -225,9 +247,22 @@ add_custom_command(TARGET halo2_config POST_BUILD
 
 # "Insignia Setup.exe": the player's console identity (verified against their
 # own BIOS) and Xbox Live account, into SaveData\Identity. No network of its own.
-add_executable(halo2_insignia_setup WIN32 src/insignia_setup.c)
+add_executable(halo2_insignia_setup WIN32 src/insignia_setup.c src/halo_ui.c src/keybinds.c res/tools.rc)
 set_target_properties(halo2_insignia_setup PROPERTIES OUTPUT_NAME "Insignia Setup")
 target_link_libraries(halo2_insignia_setup PRIVATE user32 gdi32 comctl32 comdlg32 bcrypt)
+
+# "Halo2 Updater.exe": installs a newer GitHub release, started from the F1 menu or
+# Config.exe (src/update_check.c). It runs from a copy in SaveData\Update.
+add_executable(halo2_updater WIN32 src/updater.c src/halo_ui.c src/keybinds.c res/tools.rc)
+set_target_properties(halo2_updater PROPERTIES OUTPUT_NAME "Halo2 Updater")
+target_include_directories(halo2_updater PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(halo2_updater PRIVATE user32 gdi32 shell32 winhttp)
+
+# halo2_import.exe: Setup and RecompLauncher copy the game's files from the player's disc and title update with it,
+# checking every file's pinned size and SHA-256 (installer/manifest.h, installer/gen_manifest.py).
+add_executable(halo2_import installer/halo2_import.c res/tools.rc)
+target_compile_definitions(halo2_import PRIVATE UNICODE _UNICODE)
+target_link_libraries(halo2_import PRIVATE bcrypt shell32)
 
 # ── The disc's content downloader (Downloader.xbe) ──────────────
 # Halo 2 starts it with XLaunchNewImage for "download content"; it is its own
@@ -236,9 +271,9 @@ target_link_libraries(halo2_insignia_setup PRIVATE user32 gdi32 comctl32 comdlg3
 # Generated code: analysis-downloader/run-pipeline.ps1 -> src/downloader/gen.
 file(GLOB DOWNLOADER_GEN_SOURCES CONFIGURE_DEPENDS "src/downloader/gen/*.c")
 set(DOWNLOADER_SOURCES ${GAME_SOURCES})
-list(REMOVE_ITEM DOWNLOADER_SOURCES src/recomp_manual.c src/h2_account.c)
+list(REMOVE_ITEM DOWNLOADER_SOURCES src/recomp_manual.c src/h2_switch_cases.c src/h2_account.c)
 list(APPEND DOWNLOADER_SOURCES src/downloader/manual.c)
-add_executable(halo2_downloader ${DOWNLOADER_SOURCES} ${DOWNLOADER_GEN_SOURCES})
+add_executable(halo2_downloader ${DOWNLOADER_SOURCES} ${DOWNLOADER_GEN_SOURCES} res/halo2.rc)
 target_compile_definitions(halo2_downloader PRIVATE H2_DOWNLOADER=1 RECOMP_ABI_CHECK=1)
 if(HALO2_SDL3)
     target_compile_definitions(halo2_downloader PRIVATE HALO2_SDL3=1)
@@ -261,4 +296,14 @@ if(MSVC)
     if(HALO2_PERF_LTO)
         target_link_options(halo2_downloader PRIVATE /LTCG /INCREMENTAL:NO)
     endif()
+endif()
+
+# The player release: Windows subsystem (no console window; main() stays the entry point) and a .pdb named without
+# the build folder.
+if(MSVC AND H2_RELEASE)
+    foreach(t ${PROJECT_NAME} halo2_downloader)
+        set_target_properties(${t} PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_link_options(${t} PRIVATE /ENTRY:mainCRTStartup /PDBALTPATH:${t}.pdb)
+    endforeach()
+    target_link_options(halo2_import PRIVATE /PDBALTPATH:halo2_import.pdb)
 endif()

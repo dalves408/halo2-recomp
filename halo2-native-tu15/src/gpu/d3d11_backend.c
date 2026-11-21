@@ -492,6 +492,9 @@ static void report_detailed_perf(void)
     previous_us = report_us;
 }
 
+/* Frames the game has completed so far (debug FPS counter, overlay.c). */
+uint32_t halo2_gpu_flip_count(void) { return *(volatile uint32_t *)&s_flip_life; }
+
 static void stats_flip(void)
 {
     static double last;
@@ -7149,10 +7152,15 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         float vsinfo[4], foginfo[4], zinfo[4], wideinfo[4];
         /* Widescreen: a draw into the 640x480 screen with depth testing off
          * may be the 2D layer, which the geometry shader squeezes into the
-         * middle 4:3 (gpu_vsh_gs_hlsl). */
+         * middle 4:3 (gpu_vsh_gs_hlsl). "Off" includes a test that always
+         * passes and writes no depth: the motion tracker pastes its 64x64
+         * radar picture that way, and was left at the 4:3 spot (to the left
+         * of its frame) before. */
         wideinfo[0] = s_ui_squeeze;
         wideinfo[1] = s_ui_squeeze < 0.999f && s_cur && s_cur->w == 640 && s_cur->h == 480 &&
-                      b->xb.state && !b->xb.state->depth_test_enable ? 1.0f : 0.0f;
+                      b->xb.state && (!b->xb.state->depth_test_enable ||
+                                      (b->xb.state->depth_func == 0x207 && !b->xb.state->depth_write))
+                      ? 1.0f : 0.0f;
         wideinfo[2] = wideinfo[3] = 0.0f;
         vsinfo[0] = b->aa[0]; vsinfo[1] = b->aa[1];
         vsinfo[2] = b->xb.near_clip ? 1.0f : 0.0f; vsinfo[3] = b->xb.near_z;

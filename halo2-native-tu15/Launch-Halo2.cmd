@@ -1,6 +1,8 @@
 @echo off
 setlocal
 pushd "%~dp0" || exit /b 1
+rem The updater (F1 / Config.exe) starts this launcher again after an update.
+set "H2_LAUNCHER=%~f0"
 
 rem The console identity, when Insignia Setup saved one. Halo 2 makes its disk
 rem caches with it, so every launcher gives it, or the next launch with the other
@@ -21,9 +23,11 @@ rem The exe asks Windows/NVIDIA/AMD for the high-performance GPU on its own.
 rem Console output goes to stderr.log in this folder; the previous run is kept as stderr.prev.log.
 rem Debug/test only: enable the DEL screenshot hotkey. Do not set this in a release build.
 set "RECOMP_DEBUG_SCREENSHOT=1"
+rem Debug/test only: frame rate in the top-left corner (dev builds only).
+if not defined RECOMP_DEBUG_FPS set "RECOMP_DEBUG_FPS=1"
 echo Debug: press DEL in the game window to save a test screenshot and sidecar into build-ninja\screenshots.
-echo Settings: F1 in the game, or run build-ninja\Config.exe. ESC opens a quit prompt.
-echo Settings are saved to %LOCALAPPDATA%\Halo2Native\settings.ini
+echo Settings and controls: F1 in the game, or build-ninja\Config.exe. Esc asks to quit.
+echo Settings are saved to SaveData\settings.ini, controls to SaveData\keymap.ini.
 if exist "stderr.log" move /y "stderr.log" "stderr.prev.log" >nul
 "build-ninja\halo2_recomp.exe" 1>stdout.log 2>stderr.log
 set "halo2_exit_code=%errorlevel%"

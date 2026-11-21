@@ -4,6 +4,8 @@ rem build-ninja\screenshots; this session's console log and per-frame timing
 rem go there too, named by start time, so every DEL can be matched to them.
 setlocal
 pushd "%~dp0" || exit /b 1
+rem The updater (F1 / Config.exe) starts this launcher again after an update.
+set "H2_LAUNCHER=%~f0"
 
 rem The console identity, when Insignia Setup saved one. Halo 2 makes its disk
 rem caches with it, so every launcher gives it, or the next launch with the other

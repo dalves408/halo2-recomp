@@ -29,6 +29,8 @@
 static ID3D11Device             *s_dev;
 static ID3D11DeviceContext      *s_ctx;
 static IDXGISwapChain           *s_chain;
+/* Frames presented: a title's freeze watch reads it (Halo 2's h2_diag.c). */
+volatile LONG g_gpu_present_count;
 static ID3D11RenderTargetView   *s_rtv;
 static ID3D11Texture2D          *s_frame;      /* the guest frame, w x h */
 static ID3D11ShaderResourceView *s_srv;
@@ -520,6 +522,7 @@ static int gpu_present_frame_impl(const uint32_t *pixels, int allow_shared,
     /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
      * the caller keeps its own 16 ms sleep instead of spinning a core. */
     present_hr = IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0);
+    InterlockedIncrement(&g_gpu_present_count);
     present_hr = present_test_result("present", present_hr);
     present_check_device(present_hr, "presenting frame");
     if (FAILED(present_hr))

@@ -6,6 +6,8 @@ rem timing go to build-ninja\screenshots too. Only one copy of this console
 rem identity may be online at a time (console, xemu, CounterStrikeXB, this).
 setlocal
 pushd "%~dp0" || exit /b 1
+rem The updater (F1 / Config.exe) starts this launcher again after an update.
+set "H2_LAUNCHER=%~f0"
 
 set "ID=SaveData\Identity"
 if not exist "%ID%\eeprom.bin" (echo No console identity: run build-ninja\"Insignia Setup.exe" first. & popd & exit /b 1)
@@ -25,7 +27,11 @@ set "RECOMP_FB_WINDOW=1"
 if not defined RECOMP_KEYBOARD set "RECOMP_KEYBOARD=1"
 if not defined RECOMP_GPU set "RECOMP_GPU=d3d11"
 set "RECOMP_DEBUG_SCREENSHOT=1"
+rem Debug/test only: frame rate in the top-left corner (dev builds only).
+if not defined RECOMP_DEBUG_FPS set "RECOMP_DEBUG_FPS=1"
 set "RECOMP_NET=1"
+rem Test builds: log every second with Xbox Live traffic bursts (match detection tuning).
+if not defined RECOMP_NET_LIVE_LOG set "RECOMP_NET_LIVE_LOG=1"
 rem XLaunchNewImage between the game and the disc's content downloader: each
 rem image name maps to its native program (launch data goes through SaveData).
 set "RECOMP_LAUNCH_MAP=downloader.xbe=build-ninja\halo2_downloader.exe;default.xbe=build-ninja\halo2_recomp.exe"

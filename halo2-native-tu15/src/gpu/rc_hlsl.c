@@ -338,10 +338,18 @@ size_t gpu_rc_hlsl(const GpuRcKey *k, char *out, size_t cap)
         put(&b, "  { /* stage %u */\n", s);
         put(&b, "  R[1] = C0[%u]; R[2] = C1[%u];\n",
             (flags & 0x010) ? s : 0, (flags & 0x100) ? s : 0);
+        /* The mux tests one bit of spare0.alpha as the NV2A holds it: a 9-bit
+         * signed value (x * 255, two's complement). MSB is bit 7, so it is set
+         * for 0.5 <= x and also for -0.5 <= x < 0 -- not simply x >= 0.5.
+         * Halo 2's HUD meter mask (above the motion tracker) depends on it:
+         * its empty texels give spare0.alpha = -0.49, which must select CD,
+         * or the whole 128x32 quad halves the picture behind it (the dark
+         * rectangle). LSB is bit 0 of the same value. */
+        put(&b, "  int muxv = (int)round(clamp(R[12].a, -1.0, 1.0) * 255.0);\n");
         if (flags & 1)
-            put(&b, "  bool mux = R[12].a >= 0.5;\n");
+            put(&b, "  bool mux = (muxv & 0x80) != 0;\n");
         else
-            put(&b, "  bool mux = (((int)(R[12].a * 255.0)) & 1) != 0;\n");
+            put(&b, "  bool mux = (muxv & 1) != 0;\n");
         put_rgb(&b, "A", icw >> 24); put_rgb(&b, "B", icw >> 16);
         put_rgb(&b, "C", icw >> 8);  put_rgb(&b, "D", icw);
         put_alpha(&b, "aA", aicw >> 24); put_alpha(&b, "aB", aicw >> 16);

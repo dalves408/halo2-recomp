@@ -96,6 +96,19 @@ static void toggle_fullscreen(void)
     fit_child();
 }
 
+/* F11, Alt+Enter and the F1 menu: the choice is kept in settings.ini. */
+static void keep_fullscreen(void)
+{
+    Halo2Settings set;
+    memset(&set, 0, sizeof set);
+    halo2_settings_load(&set);
+    if ((set.fullscreen != 0) != (s_full != 0)) {
+        set.fullscreen = s_full;
+        halo2_settings_save(&set);
+    }
+    h2_diag_video(s_full ? "fullscreen on" : "fullscreen off");
+}
+
 static void paint(HWND h)
 {
     PAINTSTRUCT ps;
@@ -122,13 +135,14 @@ static LRESULT CALLBACK frame_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     switch (m) {
     case WM_FB_TOGGLE_FULLSCREEN:
         toggle_fullscreen();
+        keep_fullscreen();
         return 0;
     case WM_KEYDOWN:            /* only while no game window has the keyboard */
-        if (w == VK_F11 && !(l & (1 << 30))) toggle_fullscreen();
+        if (w == VK_F11 && !(l & (1 << 30))) { toggle_fullscreen(); keep_fullscreen(); }
         return 0;
     case WM_SYSKEYDOWN:
         if (w == VK_RETURN) {
-            if ((l & (1 << 29)) && !(l & (1 << 30))) toggle_fullscreen();
+            if ((l & (1 << 29)) && !(l & (1 << 30))) { toggle_fullscreen(); keep_fullscreen(); }
             return 0;
         }
         break;
@@ -287,7 +301,8 @@ int h2_frame_main(int *exit_code)
     wc.lpfnWndProc = frame_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1));     /* res/halo2.ico */
+    if (!wc.hIcon) wc.hIcon = LoadIconA(NULL, IDI_APPLICATION);
     wc.lpszClassName = "Halo2NativeFrame";
     RegisterClassA(&wc);
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
@@ -314,7 +329,7 @@ int h2_frame_main(int *exit_code)
     memset(&set, 0, sizeof set);
     halo2_settings_load(&set);
     ShowWindow(s_frame, SW_SHOWNORMAL);
-    if (set.fullscreen) toggle_fullscreen();
+    if (h2_start_fullscreen(set.fullscreen)) toggle_fullscreen();
     UpdateWindow(s_frame);
     if (!start_game()) {
         MessageBoxA(s_frame, "The game could not be started.", "Halo 2", MB_ICONERROR);

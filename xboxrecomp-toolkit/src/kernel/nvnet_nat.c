@@ -78,23 +78,70 @@ static int s_identity;                  /* 1: the player's EEPROM and hard-drive
 static int (*volatile s_gate)(void);     /* nat_set_internet_gate */
 static unsigned s_log_blocked;
 /* Xbox Live traffic (UDP 3074, either way). Signed in, the console trades a
- * keep-alive with the security gateway every few seconds; in a match it
- * trades game traffic with the other consoles, dozens of packets a second.
- * A second with at least NAT_LIVE_MATCH_PPS packets marks a match in progress
- * (nat_live_match_recent); any packet marks being signed in (nat_live_recent). */
-#define NAT_LIVE_MATCH_PPS 8
+ * keep-alive with the security gateway every few seconds, and short bursts
+ * with it (and other service gateways) at sign-in and for service requests --
+ * more than 8 packets in a second at times (Halo 2 on Insignia, 2026-11-20:
+ * 51.68.122.14 and 49.13.14.21 only, no match). In a match it trades game
+ * traffic with the other consoles without a break, dozens of packets a
+ * second. So a match is NAT_LIVE_MATCH_SECS seconds in a row with at least
+ * NAT_LIVE_MATCH_PPS packets each, outside the sign-in grace period below
+ * (nat_live_match_recent); any packet marks
+ * being signed in (nat_live_recent). RECOMP_NET_LIVE_LOG=1 logs every busy
+ * second, for tuning. */
+#define NAT_LIVE_MATCH_PPS  8
+#define NAT_LIVE_MATCH_SECS 5
+/* Signing in trades with the gateways alone at match rates for several
+ * seconds in a row (Halo 2 on Insignia: up to 64 packets a second, 6 busy
+ * seconds, 51.68.122.14 only). So the first NAT_LIVE_SIGNIN_GRACE_MS after
+ * Live traffic starts -- the first packet, or the first after
+ * NAT_LIVE_QUIET_MS without any -- never count as a match. */
+#define NAT_LIVE_SIGNIN_GRACE_MS 60000u
+#define NAT_LIVE_QUIET_MS        60000u
 static volatile DWORD s_last_live, s_last_live_match;
-static volatile LONG s_live_second, s_live_count;
+static SRWLOCK s_live_lock = SRWLOCK_INIT;
+static LONG s_live_second, s_live_count, s_live_streak;
+static DWORD s_live_signin;
+static int s_live_in_match, s_live_log = -1;
 
 static void live_note(void)
 {
     DWORD now = GetTickCount();
     LONG sec = (LONG)(now / 1000u);
+    AcquireSRWLockExclusive(&s_live_lock);
+    if (!s_last_live || now - s_last_live > NAT_LIVE_QUIET_MS) {
+        s_live_signin = now;                              /* Live traffic starts: a sign-in */
+        s_live_streak = 0;
+        fprintf(stderr, "  [NAT] Xbox Live traffic starts (sign-in): no match detection for %u s\n",
+                NAT_LIVE_SIGNIN_GRACE_MS / 1000u);
+    }
     s_last_live = now;
-    if (InterlockedExchange(&s_live_second, sec) != sec)
-        InterlockedExchange(&s_live_count, 0);
-    if (InterlockedIncrement(&s_live_count) >= NAT_LIVE_MATCH_PPS)
+    if (sec != s_live_second) {
+        /* the second before this one is complete: extend or end the streak */
+        int busy = s_live_count >= NAT_LIVE_MATCH_PPS;
+        int grace = now - s_live_signin < NAT_LIVE_SIGNIN_GRACE_MS;
+        if (s_live_log < 0) { const char *e = getenv("RECOMP_NET_LIVE_LOG"); s_live_log = e && e[0] == '1'; }
+        s_live_streak = busy && !grace && sec - s_live_second == 1 ? s_live_streak + 1 : 0;
+        if (s_live_log && s_live_count >= NAT_LIVE_MATCH_PPS)
+            fprintf(stderr, "  [NAT] Xbox Live: %ld packets in a second, %lu s after sign-in%s"
+                            " (busy seconds in a row: %ld)\n",
+                    (long)s_live_count, (unsigned long)((now - s_live_signin) / 1000u),
+                    grace ? ", ignored" : "", (long)s_live_streak);
+        s_live_second = sec;
+        s_live_count = 0;
+    }
+    s_live_count++;
+    if (s_live_streak >= NAT_LIVE_MATCH_SECS - 1 && s_live_count >= NAT_LIVE_MATCH_PPS) {
         s_last_live_match = now;
+        if (!s_live_in_match) {
+            s_live_in_match = 1;
+            fprintf(stderr, "  [NAT] Xbox Live match traffic (%d+ packets a second for %d s)\n",
+                    NAT_LIVE_MATCH_PPS, NAT_LIVE_MATCH_SECS);
+        }
+    } else if (s_live_in_match && now - s_last_live_match > 10000u) {
+        s_live_in_match = 0;
+        fprintf(stderr, "  [NAT] Xbox Live match traffic stopped\n");
+    }
+    ReleaseSRWLockExclusive(&s_live_lock);
 }
 
 static uint16_t csum(const uint8_t *p, int n, uint32_t s)

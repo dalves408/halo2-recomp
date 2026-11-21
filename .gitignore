@@ -68,3 +68,11 @@ id_ed25519*
 *.pfx
 *.ppk
 .env
+
+# Player release outputs and local-only tooling (scripts/build_installer.py)
+halo2-native-tu15/build-release/
+halo2-native-tu15/installer/Output/
+halo2-native-tu15/installer/wizard_*.png
+halo2-native-tu15/out/
+halo2-native-tu15/scripts/test_release.py
+__pycache__/

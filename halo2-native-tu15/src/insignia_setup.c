@@ -38,6 +38,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "h2_layout.h"
+#include "halo_ui.h"
+
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -71,7 +74,135 @@ static void tell(const char *text, UINT icon)
     MessageBoxA(s_main, text, APP_TITLE, icon);
 }
 
+static void path_data(const char *rel, char *out, size_t n) { h2_data_path(s_root, rel, out, n); }
 static void path_in(const char *rel, char *out, size_t n) { snprintf(out, n, "%s\\%s", s_root, rel); }
+
+/* ---- look: the Halo 2 manuals' style, as Config.exe and the F1 menu (halo_ui.c) ------------- */
+/* The standard controls stay (the key and recovery number are masked edit boxes); the window
+ * paints the background, the title band and the panels behind them, and draws the buttons. */
+#define SK_PANEL RGB(6, 24, 54)
+#define SK_EDGE  RGB(38, 92, 156)
+#define SK_EDIT  RGB(4, 16, 38)
+typedef struct { RECT r; const char *title; } SkPanel;
+typedef struct { SkPanel p[8]; int n; const char *title; int band_h; } Skin;
+static Skin s_skin_main, s_skin_rec;
+static UiFonts s_f;
+static HBRUSH s_br_panel, s_br_edit;
+static int s_show_key;                      /* the hard-drive key shown in clear */
+static int s_yoff;                          /* the main window's controls sit below its title band */
+
+static void skin_init(void)
+{
+    if (s_br_panel) return;
+    ui_fonts_make(&s_f, 0.80f);
+    s_br_panel = CreateSolidBrush(SK_PANEL);
+    s_br_edit = CreateSolidBrush(SK_EDIT);
+}
+
+static void skin_panel(Skin *s, int x, int y, int w, int h, const char *title)
+{
+    if (s->n >= 8) return;
+    SetRect(&s->p[s->n].r, x, y, x + w, y + h);
+    s->p[s->n].title = title;
+    s->n++;
+}
+
+static void skin_paint(HWND h, HDC out, const Skin *s)
+{
+    RECT cr, band;
+    HDC dc;
+    HBITMAP bm;
+    HGDIOBJ old;
+    int i;
+    GetClientRect(h, &cr);
+    dc = CreateCompatibleDC(out);
+    bm = CreateCompatibleBitmap(out, cr.right, cr.bottom);
+    old = SelectObject(dc, bm);
+    ui_background(dc, &cr);
+    if (s->title) {
+        SetRect(&band, 8, 8, cr.right - 8, 8 + s->band_h);
+        ui_header(dc, &s_f, &band, s->title, NULL, 0, 0, 0, 0, NULL);
+    }
+    for (i = 0; i < s->n; i++) {
+        ui_chamfer(dc, &s->p[i].r, 12, SK_PANEL, SK_EDGE);
+        if (s->p[i].title) {
+            RECT t = s->p[i].r;
+            t.left += 14; t.top += 2; t.bottom = t.top + 20;
+            ui_text(dc, s_f.head, RGB(242, 246, 251), &t, s->p[i].title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+    BitBlt(out, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteObject(bm);
+    DeleteDC(dc);
+}
+
+/* Status lines read green when a step passed, yellow while something is needed. */
+static COLORREF skin_text_color(HWND c)
+{
+    int id = GetDlgCtrlID(c);
+    char t[24];
+    if (id != ID_EE_STATUS && id != ID_BIOS_STATUS && id != ID_KEY_STATUS && id != ID_ACC_STATUS && id != ID_STATUS)
+        return RGB(210, 224, 240);
+    GetWindowTextA(c, t, sizeof t);
+    if (!strncmp(t, "OK", 2) || !strncmp(t, "Verified", 8) || !strncmp(t, "Saved", 5) ||
+        !strncmp(t, "Identity saved", 14) || !strncmp(t, "Recovered", 9))
+        return RGB(120, 222, 150);
+    if (!strncmp(t, "This is NOT", 11) || !strncmp(t, "Not a", 5) || strstr(t, "failed") || strstr(t, "Failed"))
+        return RGB(247, 148, 29);
+    return RGB(236, 214, 96);
+}
+
+static LRESULT skin_ctlcolor(HDC dc, HWND c)
+{
+    char cls[16];
+    GetClassNameA(c, cls, sizeof cls);
+    if (!_stricmp(cls, "Edit")) {
+        SetTextColor(dc, RGB(242, 246, 251));
+        SetBkColor(dc, SK_EDIT);
+        return (LRESULT)s_br_edit;
+    }
+    SetTextColor(dc, skin_text_color(c));
+    SetBkColor(dc, SK_PANEL);
+    return (LRESULT)s_br_panel;
+}
+
+static void skin_drawitem(const DRAWITEMSTRUCT *d)
+{
+    char t[64];
+    RECT r = d->rcItem;
+    int dis = (d->itemState & ODS_DISABLED) != 0, down = (d->itemState & ODS_SELECTED) != 0;
+    int foc = (d->itemState & ODS_FOCUS) != 0;
+    GetWindowTextA(d->hwndItem, t, sizeof t);
+    if (d->CtlID == ID_KEY_SHOW) strcpy_s(t, sizeof t, s_show_key ? "Hide" : "Show");
+    FillRect(d->hDC, &r, s_br_panel);
+    ui_chamfer(d->hDC, &r, 6, dis ? RGB(8, 22, 46) : down ? RGB(30, 96, 170) : RGB(16, 62, 122),
+               dis ? RGB(30, 52, 84) : foc ? RGB(130, 206, 255) : RGB(70, 140, 214));
+    ui_text(d->hDC, s_f.body, dis ? RGB(90, 110, 140) : RGB(242, 246, 251), &r, t,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+static HWND skin_mk(HWND parent, const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id)
+{
+    HWND c;
+    if (cls[0] == 'E') style |= WS_BORDER;
+    if (cls[0] == 'B') style = (style & ~(DWORD)0xF) | BS_OWNERDRAW;
+    c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+                        (HMENU)(INT_PTR)id, NULL, NULL);
+    SendMessageA(c, WM_SETFONT, (WPARAM)s_f.body, TRUE);
+    return c;
+}
+
+/* The messages the look needs, for both windows; returns 1 when handled. */
+static int skin_msg(HWND h, UINT m, WPARAM w, LPARAM l, const Skin *s, LRESULT *out)
+{
+    switch (m) {
+    case WM_ERASEBKGND: skin_paint(h, (HDC)w, s); *out = 1; return 1;
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: *out = skin_ctlcolor((HDC)w, (HWND)l); return 1;
+    case WM_DRAWITEM: skin_drawitem((const DRAWITEMSTRUCT *)l); *out = TRUE; return 1;
+    }
+    return 0;
+}
 
 /* ---- crypto ----------------------------------------------------------------------------------- */
 static BCRYPT_ALG_HANDLE s_hmac_alg, s_sha_alg;
@@ -164,12 +295,12 @@ static int hex_key(const char *s, uint8_t out[16])
     return n == 32 && !*s;
 }
 
-/* The game's default.xbe (game\default.xbe), or NULL. */
+/* The game's default.xbe (game_files\default.xbe; game\ in a development tree), or NULL. */
 static uint8_t *read_xbe(size_t *n)
 {
     char path[MAX_PATH];
     uint8_t *x;
-    path_in("game\\default.xbe", path, sizeof path);
+    snprintf(path, sizeof path, "%s\\%s\\default.xbe", s_root, h2_game_name());
     if (!(x = read_file(path, n)) || *n < 0x200 || memcmp(x, "XBEH", 4)) { free(x); return NULL; }
     return x;
 }
@@ -335,12 +466,12 @@ static void unlock_with_saved_key(void)
     char path[MAX_PATH];
     size_t n = 0;
     uint8_t *k;
-    path_in("SaveData\\Identity\\eepromkey.bin", path, sizeof path);
+    path_data("Identity\\eepromkey.bin", path, sizeof path);
     if (!s_ee_ok || !(k = read_file(path, &n))) return;
     if (n == 16 && try_eeprom_key(k, s_hd)) {
         memcpy(s_eekey, k, 16);
         s_unlocked = 1;
-        path_in("SaveData\\Identity\\titlekeys.bin", path, sizeof path);
+        path_data("Identity\\titlekeys.bin", path, sizeof path);
         {
             size_t tn = 0;
             uint8_t *t = read_file(path, &tn);
@@ -584,7 +715,7 @@ static int write_accounts(void)
     uint8_t cfg[16 * 512];
     FILE *f;
     int i;
-    path_in("SaveData\\DiskConfig.bin", path, sizeof path);
+    path_data("DiskConfig.bin", path, sizeof path);
     memset(cfg, 0, sizeof cfg);
     if ((f = fopen(path, "rb")) != NULL) {
         fread(cfg, 1, sizeof cfg, f);
@@ -611,22 +742,22 @@ static int save_identity(void)
     GetWindowTextA(s_key, t, sizeof t);
     hex_key(t, k);
     SecureZeroMemory(t, sizeof t);
-    path_in("SaveData", path, sizeof path); CreateDirectoryA(path, NULL);
-    path_in("SaveData\\Identity", path, sizeof path); CreateDirectoryA(path, NULL);
+    path_data("", path, sizeof path); CreateDirectoryA(path, NULL);
+    path_data("Identity", path, sizeof path); CreateDirectoryA(path, NULL);
     strcpy_s(line, sizeof line, "XboxHDKey: ");
     for (i = 0; i < 16; i++) sprintf(line + 11 + 2 * i, "%02X", k[i]);
     strcat_s(line, sizeof line, "\r\n");
     SecureZeroMemory(k, sizeof k);
-    path_in("SaveData\\Identity\\eeprom.bin", path, sizeof path);
+    path_data("Identity\\eeprom.bin", path, sizeof path);
     ok = write_file(path, s_eeprom, 256);
-    path_in("SaveData\\Identity\\hddinfo.txt", path, sizeof path);
+    path_data("Identity\\hddinfo.txt", path, sizeof path);
     ok = ok && write_file(path, line, strlen(line));
     SecureZeroMemory(line, sizeof line);
-    path_in("SaveData\\Identity\\eepromkey.bin", path, sizeof path);
+    path_data("Identity\\eepromkey.bin", path, sizeof path);
     ok = ok && write_file(path, s_eekey, 16);
-    path_in("SaveData\\Identity\\titlekeys.bin", path, sizeof path);
+    path_data("Identity\\titlekeys.bin", path, sizeof path);
     ok = ok && write_file(path, s_titlekeys, sizeof s_titlekeys);
-    if (!ok) { tell("Your identity could not be saved to SaveData\\Identity.", MB_ICONERROR); return 0; }
+    if (!ok) { tell("Your identity could not be saved to the data folder (Identity).", MB_ICONERROR); return 0; }
     return 1;
 }
 
@@ -650,11 +781,11 @@ static void save(void)
             say(s_status, "Identity saved. Accounts not added.");
             return;
         }
-        if (!write_accounts()) { tell("The accounts could not be written to SaveData\\DiskConfig.bin.", MB_ICONERROR); return; }
+        if (!write_accounts()) { tell("The accounts could not be written to DiskConfig.bin in the data folder.", MB_ICONERROR); return; }
     }
-    say(s_status, s_acc_ok ? "Saved. Start Launch-Halo2-Insignia.cmd and sign in."
+    say(s_status, s_acc_ok ? "Saved. Start Halo 2 and sign in to Xbox Live."
                            : "Saved. Now add your account: Recover from Insignia...");
-    tell(s_acc_ok ? "Your console identity and Xbox Live account are set up.\n\nStart Launch-Halo2-Insignia.cmd and sign in."
+    tell(s_acc_ok ? "Your console identity and Xbox Live account are set up.\n\nStart Halo 2 and sign in to Xbox Live."
                   : "Your console identity is set up.\n\nTo add your Xbox Live account, use Recover from Insignia... "
                     "with your gamertag and the 16-digit number from your insignia.live Web Dashboard.",
          MB_ICONINFORMATION);
@@ -689,32 +820,38 @@ static LRESULT CALLBACK rec_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (m == WM_COMMAND && LOWORD(w) == ID_REC_NUM && HIWORD(w) == EN_CHANGE) { rec_digits_only((HWND)l); return 0; }
     if (m == WM_COMMAND && (LOWORD(w) == ID_REC_OK || LOWORD(w) == ID_REC_CANCEL)) { s_rec_done = LOWORD(w) == ID_REC_OK ? 1 : -1; return 0; }
     if (m == WM_CLOSE) { s_rec_done = -1; return 0; }
+    {
+        LRESULT r;
+        if (skin_msg(h, m, w, l, &s_skin_rec, &r)) return r;
+    }
     return DefWindowProcA(h, m, w, l);
 }
 
 static HWND rec_mk(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id)
 {
-    HWND c = CreateWindowExA(cls[0] == 'E' ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                             x, y, w, h, s_rec, (HMENU)(INT_PTR)id, NULL, NULL);
-    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    return c;
+    return skin_mk(s_rec, cls, text, style, x, y + 64, w, h, id);
 }
 
 static int ask_recover(char *tag, unsigned tagn, char *num, unsigned numn)
 {
     WNDCLASSA wc;
     MSG msg;
-    RECT r = { 0, 0, 460, 262 };
+    RECT r = { 0, 0, 460, 262 + 64 };
+    skin_init();
+    s_skin_rec.n = 0;
+    s_skin_rec.title = "RECOVER ACCOUNT";
+    s_skin_rec.band_h = 48;
+    skin_panel(&s_skin_rec, 6, 64, 448, 256, NULL);
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = rec_proc;
     wc.hInstance = GetModuleHandleA(NULL);
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = "Halo2Recover";
     RegisterClassA(&wc);
     AdjustWindowRect(&r, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE);
     s_rec = CreateWindowExA(WS_EX_DLGMODALFRAME, wc.lpszClassName, "Recover your account from Insignia",
-                            WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                             r.right - r.left, r.bottom - r.top, s_main, NULL, wc.hInstance, NULL);
     rec_mk("STATIC", "Sign in to your Web Dashboard at insignia.live and press Reveal to see your account's "
            "16-digit number. Don't share it: it lets anyone recover your account.", SS_LEFT, 14, 10, 432, 44, 0);
@@ -759,9 +896,9 @@ static const char *recover_result(DWORD code)
     case 12: return "Insignia did not answer in time. Check your internet connection and try again.";
     case 13: return "Insignia did not accept that gamertag and number. Check both on your insignia.live "
                     "Web Dashboard (the number changes if you reveal a new one).";
-    case 14: return "The account could not be saved to SaveData\\DiskConfig.bin.";
+    case 14: return "The account could not be saved to DiskConfig.bin in the data folder.";
     case 15: return "All eight account slots on this console are in use.";
-    default: return "The recovery did not finish. build-ninja\\screenshots\\recovery_*.log says why.";
+    default: return "The recovery did not finish. recovery_*.log in the data folder's logs says why.";
     }
 }
 
@@ -787,8 +924,8 @@ static void recover(void)
 
     if (!verified()) { tell("Recover is locked until your identity is verified (steps 1-3).", MB_ICONWARNING); return; }
     if (!save_identity()) return;
-    path_in("build-ninja\\halo2_recomp.exe", exe, sizeof exe);
-    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) { tell("build-ninja\\halo2_recomp.exe was not found.", MB_ICONERROR); return; }
+    h2_bin_path(s_root, "halo2_recomp.exe", exe, sizeof exe);
+    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) { tell("halo2_recomp.exe was not found beside Insignia Setup.", MB_ICONERROR); return; }
     if (!ask_recover(tag, sizeof tag, num, sizeof num)) { SecureZeroMemory(num, sizeof num); return; }
     for (i = 0; num[i]; i++) if (num[i] >= '0' && num[i] <= '9') digits++;
     if (!tag[0] || digits != 16) {
@@ -799,12 +936,12 @@ static void recover(void)
     {   /* a copy of the drive's account area before the game writes it */
         char cfg[MAX_PATH], bak[MAX_PATH];
         GetLocalTime(&st);
-        path_in("SaveData\\DiskConfig.bin", cfg, sizeof cfg);
-        snprintf(bak, sizeof bak, "%s\\SaveData\\DiskConfig.before-recovery-%04u%02u%02u_%02u%02u%02u.bin", s_root,
+        path_data("DiskConfig.bin", cfg, sizeof cfg);
+        snprintf(bak, sizeof bak, "%s\\%s\\DiskConfig.before-recovery-%04u%02u%02u_%02u%02u%02u.bin", s_root, h2_data_name(),
                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         CopyFileA(cfg, bak, TRUE);
     }
-    path_in("build-ninja\\screenshots", logs, sizeof logs);
+    path_data("logs", logs, sizeof logs);
     CreateDirectoryA(logs, NULL);
     if (!CreatePipe(&rd, &wr, &sa, 0)) { SecureZeroMemory(num, sizeof num); tell("Could not start the recovery.", MB_ICONERROR); return; }
     SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);
@@ -818,11 +955,11 @@ static void recover(void)
     SetEnvironmentVariableA("H2_ACCT", "recover");
     snprintf(line, sizeof line, "%llu", (unsigned long long)(uintptr_t)rd);
     SetEnvironmentVariableA("H2_ACCT_INPUT", line);
-    path_in("SaveData\\Identity\\eeprom.bin", v, sizeof v);      SetEnvironmentVariableA("RECOMP_XBOX_EEPROM", v);
+    path_data("Identity\\eeprom.bin", v, sizeof v);      SetEnvironmentVariableA("RECOMP_XBOX_EEPROM", v);
     SetEnvironmentVariableA("RECOMP_XBOX_HDKEY", hex);
     SecureZeroMemory(hex, sizeof hex);
-    path_in("SaveData\\Identity\\eepromkey.bin", v, sizeof v);   SetEnvironmentVariableA("RECOMP_XBOX_EEPROM_KEY_FILE", v);
-    path_in("SaveData\\Identity\\titlekeys.bin", v, sizeof v);   SetEnvironmentVariableA("RECOMP_XBOX_TITLE_KEYS", v);
+    path_data("Identity\\eepromkey.bin", v, sizeof v);   SetEnvironmentVariableA("RECOMP_XBOX_EEPROM_KEY_FILE", v);
+    path_data("Identity\\titlekeys.bin", v, sizeof v);   SetEnvironmentVariableA("RECOMP_XBOX_TITLE_KEYS", v);
     SetEnvironmentVariableA("RECOMP_NET", "1");
     SetEnvironmentVariableA("RECOMP_FB_WINDOW", "1");
     SetEnvironmentVariableA("RECOMP_KEYBOARD", "1");         /* a controller, or the game waits on a screen */
@@ -870,15 +1007,15 @@ static void recover(void)
     if (why) { say(s_status, "The account was not recovered."); tell(why, MB_ICONERROR); return; }
     snprintf(line, sizeof line, "OK: %s recovered from Insignia", tag);
     say(s_acc_st, line);
-    say(s_status, "Saved. Start Launch-Halo2-Insignia.cmd and sign in.");
-    tell("Your account is on this PC now.\n\nStart Launch-Halo2-Insignia.cmd and sign in.", MB_ICONINFORMATION);
+    say(s_status, "Account Recovery Successful");
+    tell("Account Recovery Successful", MB_ICONINFORMATION);
 }
 
 /* ---- startup ---------------------------------------------------------------------------------- */
 static void load_current(void)
 {
     char path[MAX_PATH];
-    path_in("SaveData\\Identity\\eeprom.bin", path, sizeof path);
+    path_data("Identity\\eeprom.bin", path, sizeof path);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) { update_state(); return; }
     SetWindowTextA(s_ee, path);
     check_eeprom(path);
@@ -886,7 +1023,7 @@ static void load_current(void)
     if (s_unlocked)
         say(s_bios_st, s_have_titlekeys ? "OK: verified earlier against your console's BIOS (eepromkey.bin)."
                                         : "Verified earlier, but titlekeys.bin is missing: add your BIOS again.");
-    path_in("SaveData\\Identity\\hddinfo.txt", path, sizeof path);
+    path_data("Identity\\hddinfo.txt", path, sizeof path);
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) key_from_hddinfo(path);
     update_state();
 }
@@ -905,18 +1042,25 @@ static void find_root(void)
 /* ---- window ----------------------------------------------------------------------------------- */
 static HWND mk(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id)
 {
-    HWND c = CreateWindowExA(cls[0] == 'E' ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                             x, y, w, h, s_main, (HMENU)(INT_PTR)id, NULL, NULL);
-    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    return c;
+    if ((style & 0xF) == BS_GROUPBOX && cls[0] == 'B') {    /* a panel the window paints */
+        skin_panel(&s_skin_main, x, y + s_yoff, w, h, text);
+        return NULL;
+    }
+    return skin_mk(s_main, cls, text, style, x, y + s_yoff, w, h, id);
 }
 
 static void make_ui(void)
 {
     int y = 12;
+    skin_init();
+    s_yoff = 76;
+    s_skin_main.n = 0;
+    s_skin_main.title = "INSIGNIA SETUP";
+    s_skin_main.band_h = 60;
+    skin_panel(&s_skin_main, 10, s_yoff + 4, 572, 56, NULL);
     mk("STATIC", "Play Halo 2 on Xbox Live through Insignia with your own Xbox console's identity and account. "
        "Your console must already be registered with Insignia. Nothing is sent anywhere until your EEPROM and "
-       "hard-drive key are verified against your console's own BIOS.", SS_LEFT, 16, y, 560, 44, 0);
+       "hard-drive key are verified against your console's own BIOS.", SS_LEFT, 22, y - 2, 552, 44, 0);
     y += 54;
     mk("BUTTON", "1. Your console's EEPROM (eeprom.bin)", BS_GROUPBOX, 10, y, 572, 86, 0);
     s_ee = mk("EDIT", "", ES_AUTOHSCROLL | ES_READONLY, 24, y + 24, 440, 23, ID_EE_EDIT);
@@ -945,7 +1089,8 @@ static void make_ui(void)
     s_acc_st = mk("STATIC", "Optional: an account from a drive, or recover one from Insignia.", SS_LEFT, 24, y + 86, 360, 20, ID_ACC_STATUS);
     s_btn_recover = mk("BUTTON", "Recover from Insignia...", BS_PUSHBUTTON | WS_TABSTOP, 394, y + 82, 176, 25, ID_RECOVER);
     y += 128;
-    s_status = mk("STATIC", "", SS_LEFT, 16, y + 6, 360, 30, ID_STATUS);
+    skin_panel(&s_skin_main, 10, y + s_yoff - 6, 572, 40, NULL);
+    s_status = mk("STATIC", "", SS_LEFT, 22, y + 1, 354, 26, ID_STATUS);
     s_btn_save = mk("BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, 386, y, 92, 28, ID_SAVE);
     mk("BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, 488, y, 92, 28, ID_CLOSE);
 }
@@ -997,9 +1142,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (HIWORD(w) == EN_CHANGE) update_state();
             return 0;
         case ID_KEY_SHOW:
-            SendMessageA(s_key, EM_SETPASSWORDCHAR,
-                         SendMessageA((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED ? 0 : (WPARAM)'*', 0);
+            s_show_key = !s_show_key;
+            SendMessageA(s_key, EM_SETPASSWORDCHAR, s_show_key ? 0 : (WPARAM)'*', 0);
             InvalidateRect(s_key, NULL, TRUE);
+            InvalidateRect((HWND)l, NULL, TRUE);
             return 0;
         case ID_ACC_BROWSE:
             if (browse("Drive dump or image (*.bin;*.img;*.qcow2;*.raw)\0*.bin;*.img;*.qcow2;*.raw\0All files\0*.*\0", path, sizeof path)) {
@@ -1015,6 +1161,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    }
+    {
+        LRESULT r;
+        if (skin_msg(h, m, w, l, &s_skin_main, &r)) return r;
     }
     return DefWindowProcA(h, m, w, l);
 }
@@ -1077,7 +1227,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 {
     WNDCLASSA wc;
     MSG msg;
-    RECT r = { 0, 0, 592, 530 };
+    RECT r = { 0, 0, 592, 530 + 76 };
     (void)prev; (void)cmd;
     find_root();
     InitCommonControls();
@@ -1086,7 +1236,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.hInstance = inst;
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = "Halo2InsigniaSetup";
     RegisterClassA(&wc);
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
@@ -1095,7 +1245,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         for (i = 1; i + 1 < __argc; i++) if (!strcmp(__argv[i], "--root")) strcpy_s(s_root, sizeof s_root, __argv[i + 1]);
     }
     CreateWindowExA(0, wc.lpszClassName, APP_TITLE,
-                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | (__argc > 1 ? 0 : WS_VISIBLE),
+                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN | (__argc > 1 ? 0 : WS_VISIBLE),
                     CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (__argc > 1)
         return run_args();

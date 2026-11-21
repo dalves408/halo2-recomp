@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "h2_layout.h"
 #include "gen/recomp_types.h"
 #include "settings.h"
 #include "overlay.h"
@@ -77,8 +78,17 @@ static int in_play(void) { return GetTickCount() - (DWORD)s_play_tick < 300; }
  * the intros and menus. */
 static void refresh(void)
 {
-    int live = s_live_menu || nat_live_match_recent(10000);
-    int active = s_on && !live;
+    int live_match = nat_live_match_recent(10000);
+    int live = s_live_menu || live_match;
+    /* Xbox Live is played with the 4:3 view, stretched (settings.c): from the
+     * main menu's XBOX LIVE choice (its Quickmatch / Optimatch screen, parties
+     * and matches) until Campaign, Split Screen or System Link is chosen --
+     * signed in, those stay wide. A match's own traffic (nvnet_nat.c: 5 busy
+     * seconds, not in the minute after sign-in) is the backstop, for a match
+     * joined without that menu (an invite); 10 s after it stops, wide again. */
+    halo2_widescreen_live(s_live_menu || live_match);
+    /* The F1 menu and the quit prompt take the pointer for clicking (overlay.c). */
+    int active = s_on && !live && !halo2_overlay_active();
     static int was_live;                         /* the mouse is off because of Xbox Live */
     if (InterlockedExchange(&s_active, active) != active) {
         mkb_set_enabled(active);                 /* off: the pointer is given back */
@@ -152,6 +162,14 @@ void sub_0018A300_enter(void)
     putf(esp + 8, getf(esp + 8) + (float)dy * scale * (s->mouse_invert ? 1.0f : -1.0f));
 }
 
+/* The F1 menu or quit prompt opened or closed: give the pointer to the menu,
+ * or back to mouse aim. */
+void h2_mouse_overlay_changed(void)
+{
+    if (s_inited)
+        refresh();
+}
+
 void h2_mouse_apply(void)
 {
     const Halo2Settings *s = halo2_settings_get();
@@ -172,7 +190,7 @@ void h2_mouse_binds_changed(void)
     extern void xbox_InputKeymapReload(void);
     char root[MAX_PATH], km[MAX_PATH];
     halo2_install_root(root, sizeof root);
-    snprintf(km, sizeof km, "%s\\SaveData\\keymap.ini", root);
+    h2_data_path(root, "keymap.ini", km, sizeof km);
     _putenv_s("RECOMP_KEYMAP", km);
     xbox_InputKeymapReload();
 }

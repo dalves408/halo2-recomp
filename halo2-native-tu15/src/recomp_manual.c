@@ -125,8 +125,17 @@ static void crt_x87_sinh(void) { g_fp_stack[g_fp_top & 7] = sinh(g_fp_stack[g_fp
 static void crt_x87_cosh(void) { g_fp_stack[g_fp_top & 7] = cosh(g_fp_stack[g_fp_top & 7]); g_esp += 4; }
 static void crt_x87_tanh(void) { g_fp_stack[g_fp_top & 7] = tanh(g_fp_stack[g_fp_top & 7]); g_esp += 4; }
 
+/* Case blocks of the switch in sub_0005B0B0 that have no function of their
+ * own (src/h2_switch_cases.c). */
+extern void h2_case_0005B0DD(void);
+extern void h2_case_0005B115(void);
+extern void h2_case_0005B182(void);
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (xbox_va == 0x0005B0DDu) return h2_case_0005B0DD;   /* switch at 0x5B0D6, state 3 */
+    if (xbox_va == 0x0005B115u) return h2_case_0005B115;   /* state 8 */
+    if (xbox_va == 0x0005B182u) return h2_case_0005B182;   /* state 10 */
     if (xbox_va == 0x0037D370u) return crt_x87_sinh; /* TU 1.5 (1.0: 0x003732D0) */
     if (xbox_va == 0x0037D3C2u) return crt_x87_cosh; /* TU 1.5 (1.0: 0x00373322) */
     if (xbox_va == 0x0037D389u) return crt_x87_tanh; /* TU 1.5 (1.0: 0x003732E9) */
