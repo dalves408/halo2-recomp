@@ -14,6 +14,12 @@
 #ifndef BuildDir
 #define BuildDir "..\build-release"
 #endif
+; The hi-res texture pack (scripts/build_texture_pack.py writes texture_payload.iss): an optional task that downloads
+; its .bin parts from the textures-<n> release, or uses the ones beside Setup, and extracts them into textures.
+#if FileExists(AddBackslash(SourcePath) + "texture_payload.iss")
+#define HasTextures
+#include "texture_payload.iss"
+#endif
 
 [Setup]
 AppId={{6C1E2B7A-93D4-4F0E-B5A8-2D7F1C9E4A63}
@@ -69,6 +75,10 @@ Source: "..\third_party\SDL3-3.4.20\LICENSE.txt"; DestDir: "{app}"; DestName: "S
 Source: "..\keymap.ini"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\halo2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+#ifdef HasTextures
+; the hi-res texture pack's download helper, run from Setup's temp folder when the texture task is chosen
+Source: "{#BuildDir}\halo2_texture_download.exe"; Flags: dontcopy
+#endif
 
 [Dirs]
 Name: "{app}\data"
@@ -81,6 +91,9 @@ Name: "{autodesktop}\Halo 2 Recomp"; Filename: "{app}\halo2_recomp.exe"; Working
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+#ifdef HasTextures
+Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download)"; Flags: unchecked; Check: TexturePackNeedsInstall
+#endif
 
 [Run]
 Filename: "{app}\halo2_recomp.exe"; Description: "Play Halo 2 now"; Flags: nowait postinstall skipifsilent unchecked; Check: GameFilesPresent(ExpandConstant('{app}'))
@@ -95,6 +108,14 @@ var
   RepairRadio, QuitRadio: TNewRadioButton;
   QuitNow: Boolean;
   ImportError: String;
+
+#ifdef HasTextures
+#define TextureOptional
+#include "texture_download_code.iss"
+#else
+function WantTexturePack: Boolean; begin Result := False; end;
+function TexturePackInstalled: Boolean; begin Result := False; end;
+#endif
 
 { The game files are in place: the title update's default.xbe and a few of the largest maps, so an install that was
   interrupted halfway is not mistaken for a finished one. }
@@ -359,6 +380,9 @@ begin
     WizardForm.FinishedLabel.Caption := 'Halo 2 Recomp ' + NewVer + ' is installed.' + #13#10#13#10 +
       'Settings and controls: the Halo 2 Recomp Settings shortcut, or F1 in the game. ' +
       'For Xbox Live through Insignia, run Halo 2 Recomp Insignia Setup first.';
+  if (CurPageID = wpFinished) and WantTexturePack and TexturePackInstalled then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'The hi-res texture pack is installed in the textures folder and loads when the game starts.';
 end;
 
 { The "Ready to install" page says what is about to happen. }
@@ -380,6 +404,11 @@ begin
     S := S + NewLine + Space + WizardDirValue + NewLine + NewLine +
          'Only the program files are replaced. Your game files, saves, settings and console identity are kept.';
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
+#ifdef HasTextures
+    if WantTexturePack and TexturePackNeedsInstall then
+      if TextureAllPartsLocal then S := S + NewLine + NewLine + 'Hi-res texture pack: Setup will check and use the texture archive beside it.'
+      else S := S + NewLine + NewLine + 'Hi-res texture pack: Setup will download it (about {#TextureDownloadBytes / 1000000} MB).';
+#endif
     Result := S;
   end else
   begin
@@ -389,6 +418,11 @@ begin
     if Trim(TuEdit.Text) <> '' then
       S := S + 'Title update 1.5 from:' + NewLine + Space + Trim(TuEdit.Text) + NewLine;
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
+#ifdef HasTextures
+    if WantTexturePack and TexturePackNeedsInstall then
+      if TextureAllPartsLocal then S := S + NewLine + 'Hi-res texture pack: Setup will check and use the texture archive beside it.'
+      else S := S + NewLine + 'Hi-res texture pack: Setup will download it (about {#TextureDownloadBytes / 1000000} MB).';
+#endif
     Result := S;
   end;
 end;
@@ -403,6 +437,9 @@ end;
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
 begin
   if QuitNow then Confirm := False;      { Quit on the matching-version page: no "Exit Setup?" question }
+#ifdef HasTextures
+  TextureCancelButtonClick(Cancel, Confirm);
+#endif
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -450,6 +487,13 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+#ifdef HasTextures
+  { The texture parts are downloaded and checked before anything is installed; new game files need room too. }
+  if GameFilesPresent(RemoveBackslashUnlessRoot(WizardDirValue)) then
+    Result := PrepareTexturePayload(104857600)
+  else
+    Result := PrepareTexturePayload(4800000000);
+#endif
 end;
 
 { The importer's "PROGRESS done total" lines move the progress bar. }
@@ -523,11 +567,22 @@ begin
         'Run Setup again with the same folder and select a correct disc image or folder and title update.', mbError, MB_OK);
     end;
   end;
+#ifdef HasTextures
+  if (CurStep = ssPostInstall) and GameFilesPresent(ExpandConstant('{app}')) then InstallTexturePack;
+  if CurStep = ssDone then TextureFinishCacheChoice;
+#endif
 end;
+
+#ifdef HasTextures
+procedure DeinitializeSetup;
+begin
+  TextureCleanupOnExit;
+end;
+#endif
 
 function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
-  if not GameFilesPresent(ExpandConstant('{app}')) then
+  if not GameFilesPresent(ExpandConstant('{app}')) or (WantTexturePack and not TexturePackInstalled) then
     Result := 1;
 end;

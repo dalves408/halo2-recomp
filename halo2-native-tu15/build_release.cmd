@@ -10,5 +10,5 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 cd /d "%~dp0"
 where ninja >nul 2>nul || set "PATH=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe;%PATH%"
 cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DH2_RELEASE=ON -DRECOMP_DEBUG_TOOLS=OFF -DXBOXRECOMP_BUILD_TESTS=OFF || exit /b 1
-cmake --build build-release --target halo2_recomp halo2_downloader halo2_config halo2_insignia_setup halo2_updater halo2_import --parallel
+cmake --build build-release --target halo2_recomp halo2_downloader halo2_config halo2_insignia_setup halo2_updater halo2_import halo2_texture_download --parallel
 exit /b %errorlevel%

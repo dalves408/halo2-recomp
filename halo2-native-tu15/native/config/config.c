@@ -28,13 +28,13 @@ static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 5
 #define SENS_N 11
 
 /* The settings as indexes into the lists above. */
-enum { V_SCALE, V_FS, V_VSYNC, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_COUNT };
+enum { V_SCALE, V_FS, V_VSYNC, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_HIRES, V_COUNT };
 static const char *const V_LABEL[V_COUNT] = {
     "Render scale", "Fullscreen", "VSync", "Anisotropic filter", "FXAA", "MSAA",
-    "Widescreen (at next start)",
+    "Widescreen (at next start)", "Hi-res textures (at next start)",
 };
-static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT };
-static const int V_N[V_COUNT] = { 5, 2, 2, 5, 2, 4, 4 };
+static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT, OFFON };
+static const int V_N[V_COUNT] = { 5, 2, 2, 5, 2, 4, 4, 2 };
 static int s_v[V_COUNT];
 enum { M_AIM, M_SENS, M_INV };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -123,6 +123,7 @@ static void load_all(int defaults)
     s_v[V_FXAA] = on && GetPrivateProfileIntA("display", "fxaa", 0, path) != 0;
     s_v[V_MSAA] = index_of(MSAA_VAL, 4, on ? (int)GetPrivateProfileIntA("display", "msaa", 1, path) : 1);
     s_v[V_WIDE] = clampi(on ? (int)GetPrivateProfileIntA("display", "widescreen", 2, path) : 2, 0, 3);
+    s_v[V_HIRES] = on ? GetPrivateProfileIntA("display", "hires_textures", 1, path) != 0 : 1;
     s_m[M_AIM] = on && GetPrivateProfileIntA("input", "mouse_aim", 0, path) != 0;
     s_m[M_SENS] = sens_ix(on ? (int)GetPrivateProfileIntA("input", "mouse_sens", 100, path) : 100);
     s_m[M_INV] = on && GetPrivateProfileIntA("input", "mouse_invert", 0, path) != 0;
@@ -151,6 +152,7 @@ static int save_all(HWND owner)
     WritePrivateProfileStringA("display", "msaa", buf, path);
     snprintf(buf, sizeof buf, "%d", s_v[V_WIDE]);
     WritePrivateProfileStringA("display", "widescreen", buf, path);
+    WritePrivateProfileStringA("display", "hires_textures", s_v[V_HIRES] ? "1" : "0", path);
     WritePrivateProfileStringA("input", "mouse_aim", s_m[M_AIM] ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", SENS_VAL[s_m[M_SENS]]);
     WritePrivateProfileStringA("input", "mouse_sens", buf, path);
@@ -172,6 +174,17 @@ static void video_row_rect(int i, RECT *r)
 {
     int top = px(130);
     SetRect(r, px(200), top + i * px(40), px(760), top + i * px(40) + px(34));
+}
+
+/* The hi-res texture pack (the texture addon) is in <install>\textures, where the game loads it. */
+static int hires_installed(void)
+{
+    char root[MAX_PATH], dir[MAX_PATH + 16];
+    DWORD a;
+    install_root(root, sizeof root);
+    snprintf(dir, sizeof dir, "%s\\textures", root);
+    a = GetFileAttributesA(dir);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 static void draw(HDC dc, int w, int h)
@@ -212,7 +225,9 @@ static void draw(HDC dc, int w, int h)
         for (i = 0; i < V_COUNT; i++) {
             RECT row, l, rr;
             video_row_rect(i, &row);
-            ui_option_row(dc, &f, &row, V_LABEL[i], V_TXT[i][s_v[i]], 0, s_hover_row == i, &l, &rr);
+            ui_option_row(dc, &f, &row, V_LABEL[i],
+                          i == V_HIRES && !hires_installed() ? "Not installed" : V_TXT[i][s_v[i]],
+                          0, s_hover_row == i, &l, &rr);
             s_hits[s_nhits].row = i; s_hits[s_nhits].col = UI_HIT_PREV; s_hits[s_nhits++].r = l;
             s_hits[s_nhits].row = i; s_hits[s_nhits].col = UI_HIT_NEXT; s_hits[s_nhits++].r = rr;
         }
@@ -222,7 +237,7 @@ static void draw(HDC dc, int w, int h)
                 "Settings and controls are saved in the data folder (settings.ini, keymap.ini).\n"
                 "The same settings are in the game's F1 menu. A running game picks up changes\n"
                 "made here at its next start. Render scale and MSAA rebuild surfaces and may\n"
-                "flicker once.\n\nHalo 2 Native version " H2N_VERSION ".", DT_LEFT | DT_WORDBREAK);
+                "flicker once.\nHalo 2 Native version " H2N_VERSION ".", DT_LEFT | DT_WORDBREAK);
     }
     /* footer */
     {
@@ -273,6 +288,8 @@ static int hit(int x, int y, int *row, int *col)
 static void step_option(int row, int dir)
 {
     if (s_page == PAGE_VIDEO && row >= 0 && row < V_COUNT) {
+        if (row == V_HIRES && !hires_installed())
+            return;                 /* nothing to switch: the texture addon is not installed */
         s_v[row] = (s_v[row] + dir + V_N[row]) % V_N[row];
     } else if (s_page == PAGE_CONTROLS && row >= kb_action_count) {
         int m = row - kb_action_count;

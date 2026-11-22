@@ -264,6 +264,11 @@ add_executable(halo2_import installer/halo2_import.c res/tools.rc)
 target_compile_definitions(halo2_import PRIVATE UNICODE _UNICODE)
 target_link_libraries(halo2_import PRIVATE bcrypt shell32)
 
+# halo2_texture_download.exe: the Setups' download helper for the hi-res texture pack's .bin parts (resumable, checked
+# against the pinned size and SHA-256). Not installed; Setup runs it from its temp folder.
+add_executable(halo2_texture_download installer/texture_download.c res/tools.rc)
+target_link_libraries(halo2_texture_download PRIVATE winhttp bcrypt shell32)
+
 # ── The disc's content downloader (Downloader.xbe) ──────────────
 # Halo 2 starts it with XLaunchNewImage for "download content"; it is its own
 # program here (same toolkit, GPU back end and settings), started by the
@@ -306,4 +311,5 @@ if(MSVC AND H2_RELEASE)
         target_link_options(${t} PRIVATE /ENTRY:mainCRTStartup /PDBALTPATH:${t}.pdb)
     endforeach()
     target_link_options(halo2_import PRIVATE /PDBALTPATH:halo2_import.pdb)
+    target_link_options(halo2_texture_download PRIVATE /PDBALTPATH:halo2_texture_download.pdb)
 endif()

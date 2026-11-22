@@ -4,7 +4,7 @@
     python scripts/build_installer.py --version 1.0.0 [--skip-build] [--iscc <ISCC.exe>]
 
 Output in installer/Output: Halo2-Recomp-Setup-<version>.exe and Halo2-Recomp-v<version>-Windows-x64.zip, each with a
-.sha256. Both hold code translated from the game, so they stay out of git. The programs' .pdb files are kept in
+.sha256, and Halo2-Recomp-HiRes-Textures-<n>-Setup.exe when installer/texture_payload.iss exists. The game programs hold code translated from the game, so none of these is committed. The programs' .pdb files are kept in
 out/symbols/<version> (scripts/symbolize_log.py) and never shipped.
 
 Needs: Visual Studio 2022 C++ build tools, CMake, Ninja, Inno Setup 6.6 or newer, Python with Pillow, the generated
@@ -26,7 +26,8 @@ BUILD = ROOT / 'build-release'
 INSTALLER = ROOT / 'installer'
 OUTPUT = INSTALLER / 'Output'
 SMALL_SIZES = (55, 64, 80, 96, 128)
-PROGRAMS = ('halo2_recomp', 'halo2_downloader', 'Config', 'Insignia Setup', 'Halo2 Updater', 'halo2_import')
+PROGRAMS = ('halo2_recomp', 'halo2_downloader', 'Config', 'Insignia Setup', 'Halo2 Updater', 'halo2_import',
+            'halo2_texture_download')
 
 # The Halo 2 manuals' palette (src/halo_ui.c)
 BG_TOP, BG_MID, BG_BOT = (14, 52, 104), (8, 33, 72), (3, 13, 32)
@@ -203,6 +204,18 @@ def main():
     setup = OUTPUT / f'Halo2-Recomp-Setup-{args.version}.exe'
     print(f'Setup: {setup}\nSHA-256: {write_sha256(setup)}')
     run(sys.executable, ROOT / 'scripts' / 'recomplauncher_manifest.py', '--version', args.version, '--build', BUILD)
+    # The hi-res texture addon, once scripts/build_texture_pack.py has written texture_payload.iss. Its .bin parts
+    # (out/texture-release/revision-<n>) go on the textures-<n> release; the game Setup above offers the same pack as
+    # an optional task.
+    payload = INSTALLER / 'texture_payload.iss'
+    if payload.is_file():
+        revision = re.search(r'#define TextureVersion "(\d+)"', payload.read_text(encoding='ascii')).group(1)
+        run(iscc, f'/DBuildDir={BUILD}', INSTALLER / 'halo2_textures.iss')
+        addon = OUTPUT / f'Halo2-Recomp-HiRes-Textures-{revision}-Setup.exe'
+        print(f'Texture addon: {addon}\nSHA-256: {write_sha256(addon)}')
+    else:
+        print('No texture_payload.iss: the game Setup has no texture task and no addon was built '
+              '(run scripts/build_texture_pack.py first).')
 
 
 if __name__ == '__main__':

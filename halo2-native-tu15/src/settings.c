@@ -66,6 +66,7 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->fxaa = 0;
     s->msaa = 1;
     s->widescreen = 2;     /* 16:9 by default */
+    s->hires_textures = 1;
     s->mouse_aim = 0;
     s->mouse_sens = 100;
     s->mouse_invert = 0;
@@ -135,6 +136,7 @@ int halo2_settings_load(Halo2Settings *s)
     s->msaa = clamp_msaa(cfg_get("msaa", 1, path));
     s->widescreen = cfg_get("widescreen", 2, path);
     if (s->widescreen < 0 || s->widescreen > 3) s->widescreen = 2;
+    s->hires_textures = cfg_get("hires_textures", 1, path) != 0;
     s->mouse_aim = cfg_get_input("mouse_aim", 0, path) != 0;
     s->mouse_sens = clamp_sens(cfg_get_input("mouse_sens", 100, path));
     s->mouse_invert = cfg_get_input("mouse_invert", 0, path) != 0;
@@ -172,6 +174,7 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("fxaa", s->fxaa ? 1 : 0, path);
     cfg_put("msaa", clamp_msaa(s->msaa), path);
     cfg_put("widescreen", s->widescreen >= 0 && s->widescreen <= 3 ? s->widescreen : 2, path);
+    cfg_put("hires_textures", s->hires_textures ? 1 : 0, path);
     cfg_put_in("input", "mouse_aim", s->mouse_aim ? 1 : 0, path);
     cfg_put_in("input", "mouse_sens", clamp_sens(s->mouse_sens), path);
     cfg_put_in("input", "mouse_invert", s->mouse_invert ? 1 : 0, path);
@@ -284,6 +287,10 @@ static void boot_env(const Halo2Settings *s)
     /* Aniso only works on mip chains. */
     if (clamp_aniso(s->anisotropy) >= 2)
         env_if_unset("RECOMP_GPU_MIPS", "1");
+    /* Hi-res textures off: the pack in <game folder>	extures is not loaded (src/gpu/tex_pack.c reads this once,
+     * at start, so a change applies at the next start). */
+    if (!s->hires_textures)
+        env_if_unset("RECOMP_TEX_PACK", "0");
 }
 
 void halo2_settings_boot(void)
@@ -294,10 +301,10 @@ void halo2_settings_boot(void)
     widescreen_boot(s_cur.widescreen);
     s_loaded = 1;
     fprintf(stderr,
-            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d;"
+            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires_textures=%d;"
             " mouse aim=%d sens=%d%% invert=%d\n",
             s_cur.resolution_scale, s_cur.fullscreen, s_cur.vsync,
-            s_cur.anisotropy, s_cur.fxaa, s_cur.msaa,
+            s_cur.anisotropy, s_cur.fxaa, s_cur.msaa, s_cur.hires_textures,
             s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert);
 }
 
@@ -365,6 +372,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     t.fxaa = t.fxaa ? 1 : 0;
     t.msaa = clamp_msaa(t.msaa);
     if (t.widescreen < 0 || t.widescreen > 3) t.widescreen = 2;
+    t.hires_textures = t.hires_textures ? 1 : 0;
     t.mouse_aim = t.mouse_aim ? 1 : 0;
     t.mouse_sens = clamp_sens(t.mouse_sens);
     t.mouse_invert = t.mouse_invert ? 1 : 0;
