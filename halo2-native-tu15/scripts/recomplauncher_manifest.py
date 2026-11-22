@@ -5,8 +5,8 @@ it (after Marvel vs. Capcom 2's recomplauncher_manifest.py).
 
 writes Halo2-Recomp-v<version>-Windows-x64.zip (the game, its downloader, the importer, the settings program, Insignia
 Setup, the updater, SDL3, the default key map and recomplauncher.json) and its .sha256.
-Level 3 of the RecompLauncher guide: prepare (headless halo2_import --prepare), game.update (title update 1.5,
-optional: skipped, halo2_import makes it from the disc with the patches/ in the ZIP).
+Level 3 of the RecompLauncher guide: prepare (headless halo2_import --prepare). Only the disc is asked for: halo2_import
+makes title update 1.5 from it with the patches/ in the ZIP.
 The Inno Setup installer stays the choice for players who do not use the launcher.
 """
 import argparse
@@ -73,19 +73,12 @@ def manifest():
             'kind': 'iso_or_folder',
             'label': 'Your Halo 2 (USA, Europe) Xbox disc image, or the folder with its files (the one that holds default.xbe).',
             'check': {'file': 'default.xbe', 'xdvdfs': 'default.xbe'},
-            'update': {
-                'into': 'data/TitleUpdate',
-                'label': "Title update 1.5 (optional): its folder from your console's hard drive (E:\\TDATA\\4D530064\\$u, "
-                         'with default.xbe and downloader.xbe). Skip it and the update is made from your disc.',
-                'accepts': 'folder',
-                'optional': True,
-            },
         },
         'start': {'program': ['halo2_recomp.exe']},
         'prepare': {
             'program': ['halo2_import.exe'],
             'args': ['--prepare', '{game}', '{install}/game_files'],
-            'label': 'Game files from your disc, with title update 1.5',
+            'label': 'Game files from your disc (brought to title update 1.5)',
             'timeout': 1800,
         },
         'config': [{
@@ -121,8 +114,7 @@ def manifest():
             '4': 'That is not the supported Halo 2 disc (USA, Europe).',
             '5': 'The disc image is damaged or incomplete.',
             '6': 'The game files could not be written to the install folder.',
-            '7': "The title update you picked is not title update 1.5: pick its folder from your console's hard drive "
-                 '(E:\\TDATA\\4D530064\\$u), or skip it.',
+            '7': "Title update 1.5 could not be made from your disc's files: the disc image may be damaged.",
         },
         'looks': {'graphics': 'd3d11', 'lines': 480},
     }

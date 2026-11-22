@@ -592,8 +592,8 @@ static int run_import(const WCHAR *source, const WCHAR *destination, const WCHAR
     if (!r) {
         for (i = 0; i < MANIFEST_COUNT; i++)
             if (MANIFEST[i].from == 1 && !g_have[i]) printf("MISSING %s (title update 1.5)\n", MANIFEST[i].path);
-        printf("ERROR Title update 1.5 was not found, or it is not the right one: select the update's folder from "
-               "your console's drive (E:\\TDATA\\4D530064\\$u).\n");
+        printf("ERROR Title update 1.5 could not be made from the disc's files (or, given with --update, is not the "
+               "right one).\n");
         return 7;
     }
     printf("OK %d files\n", MANIFEST_COUNT);

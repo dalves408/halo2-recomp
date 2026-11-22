@@ -59,7 +59,7 @@ ExtraDiskSpaceRequired=4800000000
 
 [Messages]
 WelcomeLabel1=Halo 2 Recomp
-WelcomeLabel2=This installs Halo 2 (title update 1.5), recompiled to run natively on Windows.%n%nThe game's own files are not included. You need your own copy of the Xbox disc (a disc image or a folder with its files). Title update 1.5 is made from your disc, or Setup uses your own copy from your console's hard drive. Setup copies the files it needs, checking each one.
+WelcomeLabel2=This installs Halo 2 (title update 1.5), recompiled to run natively on Windows.%n%nThe game's own files are not included. You need your own copy of the Xbox disc (a disc image or a folder with its files). Setup copies the files it needs, brings the game to title update 1.5 and checks each file.
 FinishedHeadingLabel=Halo 2 Recomp is ready
 
 [Files]
@@ -75,7 +75,7 @@ Source: "..\third_party\SDL3-3.4.20\LICENSE.txt"; DestDir: "{app}"; DestName: "S
 Source: "..\keymap.ini"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\halo2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
-; title update 1.5 made from the disc when no update is given (scripts/convert_tu_patches.py); beside the importer
+; title update 1.5, made from the disc (scripts/convert_tu_patches.py); beside the importer
 Source: "patches\default.xbe.tu15.h2p"; DestDir: "{tmp}\patches"; Flags: ignoreversion deleteafterinstall
 Source: "patches\downloader.xbe.tu15.h2p"; DestDir: "{tmp}\patches"; Flags: ignoreversion deleteafterinstall
 #ifdef HasTextures
@@ -104,7 +104,7 @@ Filename: "{app}\halo2_recomp.exe"; Description: "Play Halo 2 now"; Flags: nowai
 [Code]
 var
   SrcPage, UpdatePage: TWizardPage;
-  SrcEdit, TuEdit: TNewEdit;
+  SrcEdit: TNewEdit;
   UpdateOnly, UpdateMode: Boolean;
   OldDir, OldVer, NewVer: String;
   VerRel: Integer;          { -1: the installed version is older, 0: same, 1: newer than this Setup }
@@ -296,15 +296,6 @@ begin
     SrcEdit.Text := D;
 end;
 
-procedure BrowseUpdate(Sender: TObject);
-var
-  D: String;
-begin
-  D := TuEdit.Text;
-  if BrowseForFolder('Select title update 1.5''s folder (TDATA\4D530064\$u from your console, with default.xbe and downloader.xbe)', D, False) then
-    TuEdit.Text := D;
-end;
-
 function MakeLabel(Page: TWizardPage; Text: String; Top: Integer): TNewStaticText;
 begin
   Result := TNewStaticText.Create(Page);
@@ -321,7 +312,7 @@ end;
 procedure InitializeWizard;
 var
   L: TNewStaticText;
-  B1, B2, B3: TNewButton;
+  B1, B2: TNewButton;
 begin
   NewVer := '{#AppVersion}';
   { Shown after the folder page, only when that folder already holds the game (filled by FillUpdatePage). }
@@ -347,20 +338,8 @@ begin
   B2.Width := ScaleX(110);
   B2.OnClick := @BrowseFolder;
 
-  L := MakeLabel(SrcPage, 'Title update 1.5 (optional): its folder from your console''s hard drive (E:\TDATA\4D530064\$u, ' +
-    'with default.xbe and downloader.xbe). Leave it empty and Setup makes the update from your disc.',
+  L := MakeLabel(SrcPage, 'Title update 1.5 is included: Setup brings the game to 1.5 from your disc''s own files.',
     B1.Top + B1.Height + ScaleY(18));
-  TuEdit := TNewEdit.Create(SrcPage);
-  TuEdit.Parent := SrcPage.Surface;
-  TuEdit.Left := 0; TuEdit.Top := L.Top + L.Height + ScaleY(4);
-  TuEdit.Width := SrcPage.SurfaceWidth;
-  TuEdit.Text := ExpandConstant('{param:UPDATE|}');   { setup /UPDATE=<title update folder> for silent installs }
-  B3 := TNewButton.Create(SrcPage);
-  B3.Parent := SrcPage.Surface;
-  B3.Caption := 'Update folder...';
-  B3.Left := 0; B3.Top := TuEdit.Top + TuEdit.Height + ScaleY(6);
-  B3.Width := ScaleX(130);
-  B3.OnClick := @BrowseUpdate;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
@@ -418,10 +397,7 @@ begin
     S := '';
     if MemoDirInfo <> '' then S := S + MemoDirInfo + NewLine + NewLine;
     S := S + 'Game files (about 4.7 GB) from:' + NewLine + Space + Trim(SrcEdit.Text) + NewLine;
-    if Trim(TuEdit.Text) <> '' then
-      S := S + 'Title update 1.5 from:' + NewLine + Space + Trim(TuEdit.Text) + NewLine
-    else
-      S := S + 'Title update 1.5: made from your disc' + NewLine;
+    S := S + 'Title update 1.5: made from your disc' + NewLine;
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
@@ -479,11 +455,6 @@ begin
     if (Trim(SrcEdit.Text) = '') or not (FileExists(Trim(SrcEdit.Text)) or DirExists(Trim(SrcEdit.Text))) then
     begin
       MsgBox('Select an existing disc image or folder.', mbError, MB_OK);
-      Result := False;
-    end
-    else if (Trim(TuEdit.Text) <> '') and not (FileExists(Trim(TuEdit.Text)) or DirExists(Trim(TuEdit.Text))) then
-    begin
-      MsgBox('The title update folder you entered does not exist. Select it again, or leave it empty.', mbError, MB_OK);
       Result := False;
     end;
   end;
@@ -544,12 +515,11 @@ begin
     UpdateOnly := GameFilesPresent(ExpandConstant('{app}'));
   if (CurStep = ssPostInstall) and not UpdateOnly then
   begin
-    WizardForm.StatusLabel.Caption := 'Copying and checking the game files from your disc and title update (about 4.7 GB, a few minutes)...';
+    WizardForm.StatusLabel.Caption := 'Copying and checking the game files from your disc (about 4.7 GB, a few minutes)...';
     WizardForm.FilenameLabel.Caption := '';
     WizardForm.ProgressGauge.Position := 0;
     LastError := '';
     Params := '"' + Trim(SrcEdit.Text) + '" "' + ExpandConstant('{app}\game_files') + '"';
-    if Trim(TuEdit.Text) <> '' then Params := Params + ' --update "' + Trim(TuEdit.Text) + '"';
     if not ExecAndLogOutput(ExpandConstant('{tmp}\halo2_import.exe'), Params, '', SW_SHOWNORMAL,
         ewWaitUntilTerminated, Code, @ImportLog) then
       Code := 99;
@@ -561,15 +531,14 @@ begin
         4: Msg := 'That is not the supported Halo 2 disc (USA, Europe).';
         5: Msg := 'Some game files are missing or damaged. The dump may be incomplete.';
         6: Msg := 'The game files could not be written to the install folder.';
-        7: Msg := 'The title update you selected is not title update 1.5. Select its folder from your console''s ' +
-                  'hard drive (E:\TDATA\4D530064\$u, with default.xbe and downloader.xbe), or leave the field empty.';
+        7: Msg := 'Title update 1.5 could not be made from your disc''s files. Your disc image may be damaged.';
       else
         Msg := 'The game files could not be copied.';
       end;
       ImportError := Msg;
       if LastError <> '' then Log('importer: ' + LastError);
       MsgBox(Msg + #13#10#13#10 + 'Halo 2 Recomp was installed but cannot start yet. ' +
-        'Run Setup again with the same folder and select a correct disc image or folder and title update.', mbError, MB_OK);
+        'Run Setup again with the same folder and select a correct disc image or folder.', mbError, MB_OK);
     end;
   end;
 #ifdef HasTextures

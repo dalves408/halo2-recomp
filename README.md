@@ -4,7 +4,7 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.3** is out: get `Halo2-Recomp-Setup-1.0.3.exe` from
+**Version 1.0.4** is out: get `Halo2-Recomp-Setup-1.0.4.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
 [hi-res texture pack](https://github.com/dalves408/halo2-recomp/releases/tag/textures-1) is a
 separate download (below).
@@ -15,20 +15,17 @@ committed.
 
 ## Installing
 
-Download `Halo2-Recomp-Setup-<version>.exe` from the latest release and run it. You need:
+Download `Halo2-Recomp-Setup-<version>.exe` from the latest release and run it. All you need
+is **your Halo 2 disc** (USA, Europe): a disc image (`.iso`/`.xiso`, a full Redump image or a
+trimmed XISO) or a folder with its files.
 
-- **Your Halo 2 disc** (USA, Europe): a disc image (`.iso`/`.xiso`, a full Redump image or a
-  trimmed XISO) or a folder with its files.
-- **Title update 1.5 (optional, 1.0.3 and newer):** leave Setup's update field empty and the
-  update is made from your disc: the disc's own `default.xbe` and `downloader.xbe` are patched
-  with the included title update patch, and each result must match the real 1.5 file byte for
-  byte. Or give the folder `E:\TDATA\4D530064\$u` from your own console's hard drive (it
-  holds `default.xbe` and `downloader.xbe`); it is also found beside the disc image, or in a
-  folder that already has the update applied. Both ways give the same game.
+**Title update 1.5 is included** (1.0.3 and newer): the disc's own `default.xbe` and
+`downloader.xbe` are patched with the included title update patch, and each result must match
+the real 1.5 file byte for byte. A folder that already has the update applied works too.
 
 Setup copies the 79 files the game uses (about 4.7 GB) and checks each one against its
-pinned size and SHA-256. It fails with a clear message (wrong disc, damaged dump, wrong
-title update, folder not writable). No game files (maps, sounds, videos, the disc's
+pinned size and SHA-256. It fails with a clear message (wrong disc, damaged dump, folder not
+writable). No game files (maps, sounds, videos, the disc's
 executables) are in the Setup or the release ZIP; the title update patch holds only the
 difference between the disc's executables and the update's.
 
@@ -45,8 +42,8 @@ difference between the disc's executables and the update's.
   and an optional desktop shortcut.
 - **Hi-res texture pack:** an optional task in Setup (unticked), or its own installer (below).
 - **RecompLauncher:** the release also has `Halo2-Recomp-v<version>-Windows-x64.zip` for
-  [RecompLauncher](https://recomplauncher.com/sdk) (level 3). It asks for the disc and
-  the title update folder (which can be skipped), imports them with `halo2_import.exe --prepare`, and uses the
+  [RecompLauncher](https://recomplauncher.com/sdk) (level 3). It asks only for the
+  disc, imports it with `halo2_import.exe --prepare` (title update 1.5 included), and uses the
   same `data\settings.ini`. Its Big Picture mode always starts the game fullscreen.
 
 ## Settings
