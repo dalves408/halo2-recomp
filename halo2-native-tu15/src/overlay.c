@@ -40,7 +40,7 @@ enum { M_AIM, M_SENS, M_INV };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
     "Render scale", "Fullscreen", "VSync", "Anisotropic filter", "FXAA", "MSAA",
-    "Widescreen (at next start)", "Hi-res textures (at next start)", "Close menu", "Quit game"
+    "Widescreen (at next start)", "Hi-res textures", "Close menu", "Quit game"
 };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -325,7 +325,7 @@ static int sens_ix(int v)
 #define IT_UPDATE IT_COUNT
 static int page_rows(void) { return s_page == PAGE_VIDEO ? IT_COUNT + update_available() : ui_controls_rows(); }
 
-/* The hi-res texture pack (the texture addon) is in <game folder>	extures, where src/gpu/tex_pack.c loads it. */
+/* The hi-res texture pack (the texture addon) is in <game folder>\textures, where src/gpu/tex_pack.c loads it. */
 static int hires_installed(void)
 {
     DWORD a = GetFileAttributesA("textures");
@@ -509,7 +509,7 @@ static void draw_settings(HDC hdc, int w, int h)
             else
                 ui_option_row(hdc, &f, &row, ITEM_NAME[i], val, i == s_sel, 0, &s_prev_r[i], &s_next_r[i]);
         }
-        hint = "Click or use the arrows to change a setting (widescreen, hi-res textures: next start). Tabs or Page Down: "
+        hint = "Click or use the arrows to change a setting (widescreen: next start). Tabs or Page Down: "
                "CONTROLS. F1 or Esc closes.";
     }
     SetRect(&foot, x + ui_px(&f, 36), y + bh - ui_px(&f, 52), x + bw - ui_px(&f, 36), y + bh - ui_px(&f, 16));

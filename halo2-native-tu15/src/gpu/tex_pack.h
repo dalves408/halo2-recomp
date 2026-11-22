@@ -13,6 +13,13 @@
  * install folder); RECOMP_TEX_PACK=0 turns the pack off. */
 int texpack_enabled(void);
 
+/* The hi-res textures setting (settings.c), switchable at any time: off,
+ * texpack_enabled() is 0 and no lookups match. The folder is scanned the
+ * first time it is on. The D3D11 back end reloads its cached textures when
+ * this changes (halo2_gpu_set_hires). */
+void texpack_set_active(int on);
+int texpack_active(void);
+
 /* Looks up the texture whose face-0 level-0 guest bytes hash to `hash` at
  * width x height (hash_bytes() in d3d11_backend.c; the key in the DDS file
  * name), directly or through mip_aliases.txt. On a match returns 1 with

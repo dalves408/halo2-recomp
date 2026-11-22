@@ -18,7 +18,8 @@
  * shaders expect the original (non-linearised) values.
  *
  * Every DDS loads once, on the first texture that asks for it, and stays on
- * the GPU; texture entries hold their own references. */
+ * the GPU; texture entries hold their own references. The pack can be
+ * switched off and on while the game runs (texpack_set_active). */
 #include "tex_pack.h"
 
 #include <stdio.h>
@@ -42,6 +43,7 @@ typedef struct {
 
 static int s_init;
 static int s_enabled;
+static volatile int s_active = 1;   /* the hi-res textures setting */
 static PackKey *s_keys;
 static int s_nkeys, s_capkeys;
 static PackFile *s_files;
@@ -105,6 +107,26 @@ static int parse_name(const char *name, uint64_t *hash, uint32_t *w, uint32_t *h
     return 1;
 }
 
+/* Textures the game keeps even when the pack has them: the zoom overlays
+ * (ui\hud\bitmaps\new_hud\scope_masks -- battle rifle, sniper, beam rifle,
+ * carbine, binoculars). They are thin line art drawn at their own size;
+ * upscaled, the lines go thick and the dotted rim is lost. Matched on the
+ * tag name the pack's file names end with. */
+static int pack_skip(const char *name)
+{
+    static const char *const skip[] = { "_scope_mask_", "_binoculars_elite", "_binoculars_human" };
+    char low[MAX_PATH];
+    size_t i, n = strlen(name);
+    if (n >= sizeof low)
+        return 0;
+    for (i = 0; i <= n; i++)
+        low[i] = (char)(name[i] >= 'A' && name[i] <= 'Z' ? name[i] + 32 : name[i]);
+    for (i = 0; i < sizeof skip / sizeof skip[0]; i++)
+        if (strstr(low, skip[i]))
+            return 1;
+    return 0;
+}
+
 static void scan_dir(const char *dir, int depth)
 {
     char pattern[MAX_PATH];
@@ -132,6 +154,8 @@ static void scan_dir(const char *dir, int depth)
         if (n < 5 || _stricmp(fd.cFileName + n - 4, ".dds") != 0)
             continue;
         if (!parse_name(fd.cFileName, &hash, &w, &h))
+            continue;
+        if (pack_skip(fd.cFileName))
             continue;
         if (s_nfiles == s_capfiles) {
             int cap = s_capfiles ? s_capfiles * 2 : 1024;
@@ -221,9 +245,21 @@ static void texpack_init(void)
 
 int texpack_enabled(void)
 {
+    if (!s_active)
+        return 0;
     if (!s_init)
         texpack_init();
     return s_enabled;
+}
+
+void texpack_set_active(int on)
+{
+    s_active = on ? 1 : 0;
+}
+
+int texpack_active(void)
+{
+    return s_active;
 }
 
 /* ---- DDS ------------------------------------------------------------------ */

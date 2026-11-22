@@ -37,6 +37,9 @@
 typedef struct {
     uint32_t color_va;          /* guest address of pixel (0,0) */
     uint32_t width, height;     /* clip rectangle size, real pixels */
+    /* Clip rectangle origin, real pixels (SET_SURFACE_CLIP_HORIZONTAL/VERTICAL bits 0-15): split-screen views
+     * draw into a clip that starts below or beside (0,0). Zero for a back end that fills the struct itself. */
+    uint32_t clip_x, clip_y;
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */

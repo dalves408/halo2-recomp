@@ -213,8 +213,16 @@ size_t gpu_rc_hlsl(const GpuRcKey *k, char *out, size_t cap)
         put(&b, "struct PSIn { float4 p : SV_Position; %sfloat4 d0 : COLOR0;\n"
                 "  %sfloat4 d1 : COLOR1; %sfloat fog : FOG;\n"
                 "  float4 tc0 : TEXCOORD0; float4 tc1 : TEXCOORD1;\n"
-                "  float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; float fogp : FOG1; };\n",
-            q, q, q);
+                "  float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; nointerpolation float fogp : FOG1;%s };\n",
+            q, q, q,
+            /* fogp is never read here, but it must keep its own register as the
+             * vertex side has it (noperspective fog, perspective fogp): declared
+             * like fog it was packed beside fog (FOG1 in v3.y), which shifted
+             * every input after it by one register.
+             * w-buffer draws come from the vertex-program path, whose geometry
+             * shader adds the triangle's screen corners (vsh_hlsl.c). */
+            k->wbuffer ? "\n  nointerpolation float4 tA : TRIA; nointerpolation float4 tB : TRIB;\n"
+                         "  nointerpolation float4 tC : TRIC;" : "");
     }
     put(&b,
         /* map_in */
@@ -250,8 +258,27 @@ size_t gpu_rc_hlsl(const GpuRcKey *k, char *out, size_t cap)
         /* SV_Position.w is the clip w, interpolated perspective-correctly as
          * the NV2A w-buffer does; depth.w is the decal bias (depth units). */
         put(&b,
+            "float ar(float2 a, float2 b, float2 c) { precise float2 u = b - a, v = c - a; precise float r = u.x * v.y - v.x * u.y; return r; }\n"
             "float4 ps_main(PSIn i, out float od : SV_Depth) : SV_Target {\n"
-            "  od = (i.p.w - depth.x) * depth.y;\n"
+            /* The pixel's w as the NV2A takes it, and xemu after it: weights
+             * from the triangle's screen corners, each over its w, blending
+             * the corners' w. The same as the perspective-correct w for a
+             * triangle in front of the camera; for one with a corner behind
+             * it (mirrored on screen) it falls to 0 or below over much of
+             * the triangle, which counts as infinitely far, and outside the
+             * clip range the pixel is dropped. Without it Halo 2's bay water
+             * covered Metropolis's tunnels below sea level. */
+            "  float wz = i.p.w;\n"
+            "  if (i.tC.w > 0.5) {\n"
+            "    float2 q = i.p.xy;\n"
+            "    precise float b0 = ar(q, i.tB.xy, i.tC.xy) / i.tA.z, b1 = ar(q, i.tC.xy, i.tA.xy) / i.tB.z;\n"
+            "    precise float b2 = ar(q, i.tA.xy, i.tB.xy) / i.tC.z, sum = b0 + b1 + b2;\n"
+            "    float inv = sum != 0.0 && isfinite(1.0 / sum) ? 1.0 / sum : 0.0;\n"
+            "    wz = i.tA.z + b1 * inv * (i.tB.z - i.tA.z) + b2 * inv * (i.tC.z - i.tA.z);\n"
+            "    if (!(wz > 0.0)) wz = 3.402823e38;\n"
+            "    if (wz < i.tA.w || i.tB.w < wz) discard;\n"
+            "  }\n"
+            "  od = (wz - depth.x) * depth.y;\n"
             "  if (depth.w > 0.0) od -= depth.w + max(abs(ddx(od)), abs(ddy(od)));\n"
             "  od = saturate(od);\n"
             "  if (!window_allows(i.p.xy)) discard;\n");
@@ -321,6 +348,14 @@ size_t gpu_rc_hlsl(const GpuRcKey *k, char *out, size_t cap)
             put_texmode(&b, k, st, mode);
             break;
         }
+        /* Alpha kill, on a stage that fetched a texel (the sampling modes:
+         * 2D/projective/cube, bump-env, dot-ST, the dot cube lookups and the
+         * dependent reads). Halo 2's water uses it on a mask stage, which is
+         * what keeps the bay's surface out of Metropolis's tunnels. */
+        if (((k->alpha_kill >> st) & 1) && k->tex_valid[st] && !k->tex_depth[st] &&
+            ((mode >= 1 && mode <= 3) || mode == 6 || mode == 7 || mode == 9 || mode == 11 ||
+             mode == 12 || mode == 14 || mode == 15 || mode == 16 || mode == 18))
+            put(&b, "  if (T[%d].a == 0.0) discard;\n", st);
     }
 
     /* The register file (nv2a_rc_eval's start). */
@@ -338,16 +373,14 @@ size_t gpu_rc_hlsl(const GpuRcKey *k, char *out, size_t cap)
         put(&b, "  { /* stage %u */\n", s);
         put(&b, "  R[1] = C0[%u]; R[2] = C1[%u];\n",
             (flags & 0x010) ? s : 0, (flags & 0x100) ? s : 0);
-        /* The mux tests one bit of spare0.alpha as the NV2A holds it: a 9-bit
-         * signed value (x * 255, two's complement). MSB is bit 7, so it is set
-         * for 0.5 <= x and also for -0.5 <= x < 0 -- not simply x >= 0.5.
-         * Halo 2's HUD meter mask (above the motion tracker) depends on it:
-         * its empty texels give spare0.alpha = -0.49, which must select CD,
-         * or the whole 128x32 quad halves the picture behind it (the dark
-         * rectangle). LSB is bit 0 of the same value. */
+        /* The mux, as xemu has it: MSB mode selects CD when spare0.alpha >=
+         * 0.5, LSB mode tests bit 0 of the value x 255. An earlier rule also
+         * took -0.5 <= x < 0 as MSB set (bit 7 of a 9-bit signed value); it
+         * left Halo 2's shield meter (above the motion tracker) half lit at
+         * full shields, and its dark-rectangle reason no longer shows. */
         put(&b, "  int muxv = (int)round(clamp(R[12].a, -1.0, 1.0) * 255.0);\n");
         if (flags & 1)
-            put(&b, "  bool mux = (muxv & 0x80) != 0;\n");
+            put(&b, "  bool mux = R[12].a >= 0.5;\n");
         else
             put(&b, "  bool mux = (muxv & 1) != 0;\n");
         put_rgb(&b, "A", icw >> 24); put_rgb(&b, "B", icw >> 16);

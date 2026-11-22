@@ -110,7 +110,7 @@ static size_t s_profile_len, s_user_len;
 
 static int important(const char *s, size_t n)
 {
-    static const char *const keys[] = { "[CRASH]", "[FREEZE]", "[BUILD]", "ERROR", "[FATAL]", "[LOG]", "[VIDEO]" };
+    static const char *const keys[] = { "[CRASH]", "[FREEZE]", "[BUILD]", "ERROR", "[FATAL]", "[LOG]", "[VIDEO]", "[RTLOG]" };
     size_t i, k;
     for (i = 0; i < sizeof keys / sizeof keys[0]; i++)
         for (k = 0; k + strlen(keys[i]) <= n; k++)

@@ -9,6 +9,7 @@ void halo2_gpu_set_msaa(int samples);
 int  halo2_gpu_msaa(void);
 int  halo2_gpu_msaa_supported(int samples);
 void halo2_gpu_set_fxaa(int on);
+void halo2_gpu_set_hires(int on);
 #include <stdint.h>
 void bruteforce_d3d11_finish(void);
 void bruteforce_d3d11_release(uint32_t address, uint32_t value);

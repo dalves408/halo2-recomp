@@ -20,6 +20,9 @@ typedef struct {
     /* w-buffer (SET_CONTROL0 Z_PERSPECTIVE_ENABLE) on a GPU vertex-program
      * draw: the shader writes depth from the perspective-correct w. */
     uint32_t wbuffer;
+    /* Bit per stage: SET_TEXTURE_CONTROL0 ALPHA_KILL_ENABLE (bit 2) -- a pixel
+     * whose texel from that stage has alpha 0 is discarded (as xemu does). */
+    uint32_t alpha_kill;
 } GpuRcKey;
 
 #define GPU_WINDOW_CLIP_HLSL \

@@ -15,7 +15,8 @@ typedef struct {
     float vsinfo[4];    /* aa scale x, aa scale y, near-plane clip on, near z */
     float foginfo[4];   /* fog enabled, fog mode (0x800..), param 0, param 1 */
     float zinfo[4];     /* SET_CLIP_MIN, SET_CLIP_MAX, cull on, w-buffer (screen w) */
-    float wideinfo[4];  /* widescreen: 2D squeeze across (1 = off), this draw may be 2D, -, - */
+    float wideinfo[4];  /* widescreen: 2D squeeze across (1 = off), this draw may be 2D, kind (1 marker, 2 zoom overlay), - */
+    float viewinfo[4];  /* render target pixels across, down; zeta maximum; - (the w-buffer's screen-space depth) */
 } GpuVshConsts;
 
 /* gpu_vsh_hlsl flags. */

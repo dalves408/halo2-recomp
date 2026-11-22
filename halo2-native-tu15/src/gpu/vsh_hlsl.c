@@ -163,6 +163,7 @@ static void put_src(Buf *b, const char *var, const uint32_t *ins, int which,
     "  noperspective float4 d1 : COLOR1; noperspective float fog : FOG;\n" \
     "  float4 tc0 : TEXCOORD0; float4 tc1 : TEXCOORD1;\n" \
     "  float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; float fogp : FOG1;\n" \
+    "  nointerpolation float4 tA : TRIA; nointerpolation float4 tB : TRIB; nointerpolation float4 tC : TRIC;\n" \
     "  float4 clip : SV_ClipDistance0; };\n"
 
 /* Widescreen (render_scale.c, settings.c): the game stays in its 4:3 mode
@@ -171,23 +172,47 @@ static void put_src(Buf *b, const char *var, const uint32_t *ins, int which,
  * corners, whatever w the title's HUD matrix gives; drawn with depth testing off into the screen, wideinfo.y) is squeezed
  * across by wideinfo.x about the centre, so the HUD and menus keep their
  * shape in the middle 4:3. A triangle that spans the whole screen across
- * (a fade, a full-screen effect) is left as it is. */
+ * (a fade, a full-screen effect) is left as it is. wideinfo.z, from the
+ * draw's texture (d3d11_backend.c, wide_kind_of): 1, a marker over a point
+ * of the 3D view, is squeezed about its own centre instead (a quad's two
+ * triangles share it), so it stays on its target; 2, a zoom overlay, is
+ * squeezed about the screen centre whatever its depth test. */
 const char gpu_vsh_gs_hlsl[] =
     "cbuffer V : register(b1) { float4 K[192]; float4 vsinfo; float4 foginfo; float4 zinfo;\n"
-    "  float4 wideinfo; };\n"
+    "  float4 wideinfo; float4 viewinfo; };\n"
     GPU_VSH_OUT
     "[maxvertexcount(3)]\n"
     "void gs_main(triangle VSOut v[3], inout TriangleStream<VSOut> s) {\n"
     "  [unroll] for (int i = 0; i < 3; i++)\n"
     "    if (any(!isfinite(v[i].p)) || any(!isfinite(v[i].clip))) return;\n"
     "  float w0 = v[0].p.w;\n"
-    "  if (wideinfo.x < 0.999 && wideinfo.y > 0.5 && w0 > 0.0 &&\n"
+    "  if (wideinfo.x < 0.999 && wideinfo.z > 1.5) {\n"
+    "    [unroll] for (int j = 0; j < 3; j++) v[j].p.x *= wideinfo.x;\n"
+    "  } else if (wideinfo.x < 0.999 && wideinfo.y > 0.5 && w0 > 0.0 &&\n"
     "      abs(v[1].p.w - w0) <= 1e-4 * w0 && abs(v[2].p.w - w0) <= 1e-4 * w0) {\n"
     "    float lo = min(v[0].p.x, min(v[1].p.x, v[2].p.x)) / w0;\n"
     "    float hi = max(v[0].p.x, max(v[1].p.x, v[2].p.x)) / w0;\n"
     "    if (hi - lo < 1.9) {\n"
-    "      [unroll] for (int j = 0; j < 3; j++) v[j].p.x *= wideinfo.x;\n"
+    "      float c = wideinfo.z > 0.5 ? (lo + hi) * 0.5 * w0 : 0.0;\n"
+    "      [unroll] for (int j = 0; j < 3; j++) v[j].p.x = c + (v[j].p.x - c) * wideinfo.x;\n"
     "    }\n"
+    "  }\n"
+    /* w-buffer: the triangle as the NV2A sets it up -- its corners where the
+     * program put them on screen (clip x, y over w, so a corner behind the
+     * camera lands mirrored, as the divide left it), in render-target pixels,
+     * with their w, and the clip range -- for the pixel shader to take each
+     * pixel's w from as xemu does (rc_hlsl.c). */
+    "  if (zinfo.w > 0.5 && viewinfo.w > 0.5) {\n"
+    "    float4 c[3];\n"
+    "    [unroll] for (int j = 0; j < 3; j++) {\n"
+    "      float iw = v[j].p.w != 0.0 ? 1.0 / v[j].p.w : 0.0;\n"
+    "      float2 n = v[j].p.xy * iw;\n"
+    "      c[j] = float4((n.x * 0.5 + 0.5) * viewinfo.x, (0.5 - n.y * 0.5) * viewinfo.y, v[j].p.w, 0.0);\n"
+    "    }\n"
+    "    c[0].w = zinfo.z > 0.5 ? zinfo.x : 0.0;\n"
+    "    c[1].w = zinfo.z > 0.5 ? zinfo.y : viewinfo.z;\n"
+    "    c[2].w = 1.0;\n"
+    "    [unroll] for (int k2 = 0; k2 < 3; k2++) { v[k2].tA = c[0]; v[k2].tB = c[1]; v[k2].tC = c[2]; }\n"
     "  }\n"
     "  s.Append(v[0]); s.Append(v[1]); s.Append(v[2]);\n"
     "}\n";
@@ -195,7 +220,7 @@ const char gpu_vsh_gs_hlsl[] =
 static const char s_head[] =
     GPU_RC_CBUFFER
     "cbuffer V : register(b1) { float4 K[192]; float4 vsinfo; float4 foginfo; float4 zinfo;\n"
-    "  float4 wideinfo; };\n"
+    "  float4 wideinfo; float4 viewinfo; };\n"
     GPU_VSH_OUT
     "uint kix(int i) { return (i < 0 || i >= 192) ? 0u : (uint)i; }\n"
     /* run_mac's comparisons, per component, NaN behaving as in C */
@@ -413,6 +438,7 @@ size_t gpu_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
         "  o.d0 = saturate(O3); o.d1 = saturate(O4);\n"
         "  o.fog = fogf(O5.x); o.fogp = o.fog;\n"
         "  o.tc0 = O9; o.tc1 = O10; o.tc2 = O11; o.tc3 = O12;\n"
+    "  o.tA = float4(0, 0, 0, 0); o.tB = float4(0, 0, 0, 0); o.tC = float4(0, 0, 0, 0);\n"
         "  return o;\n"
         "}\n");
     if (b.overflow)

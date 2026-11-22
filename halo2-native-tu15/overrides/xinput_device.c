@@ -7,9 +7,15 @@
  * gamepad layer and takes a port no XInput pad is using. Rumble works on both:
  * XInputSetState for XInput pads, SDL_RumbleGamepad for the others.
  *
- * Port rule: a port with a connected XInput pad is XInput; otherwise an SDL
- * pad may hold it. An XInput pad that appears takes its port back and the SDL
- * pad moves to a free one.
+ * Port rule: the connected XInput pads take ports 0, 1, ... in XInput slot
+ * order, with no gaps; an SDL pad holds a port no XInput pad is using. An
+ * XInput pad that appears takes its port back and the SDL pad moves to a free
+ * one.
+ *
+ * Why not port N = XInput slot N: Windows numbers XInput pads by connection
+ * history, so the only pad can sit in slot 1 or 2 (a Bluetooth pad after a
+ * virtual one, a re-paired pad) with slot 0 empty -- and then player 1 never
+ * saw it. In order, the first pad connected is player 1, the second player 2.
  */
 
 #include "xinput_xbox.h"
@@ -31,6 +37,52 @@ extern int halo2_overlay_active(void);
 
 static BOOL g_xi_ok[XBOX_MAX_CONTROLLERS];          /* XInput answered on this port last time */
 static BOOL g_controller_connected[XBOX_MAX_CONTROLLERS];
+
+/* Port -> XInput slot (-1: no XInput pad on that port), rescanned once a
+ * second: XInputGetCapabilities on an empty slot is slow, so not every read. */
+static volatile LONG g_xslot[XBOX_MAX_CONTROLLERS] = { 0, 1, 2, 3 };
+static volatile ULONGLONG g_xscan;
+
+static void xi_map(int force)
+{
+    ULONGLONG now = GetTickCount64();
+    LONG slot[XBOX_MAX_CONTROLLERS];
+    int port = 0, s;
+    if (!force && g_xscan && now - g_xscan < 1000)
+        return;
+    g_xscan = now ? now : 1;
+    for (s = 0; s < XUSER_MAX_COUNT && port < XBOX_MAX_CONTROLLERS; s++) {
+        XINPUT_CAPABILITIES caps;
+        if (XInputGetCapabilities((DWORD)s, 0, &caps) == ERROR_SUCCESS)
+            slot[port++] = s;
+    }
+    while (port < XBOX_MAX_CONTROLLERS)
+        slot[port++] = -1;
+    for (s = 0; s < XBOX_MAX_CONTROLLERS; s++) {
+        LONG old = InterlockedExchange(&g_xslot[s], slot[s]);
+        if (old != slot[s] && slot[s] >= 0)
+            fprintf(stderr, "[PAD] player %d: Xbox pad in XInput slot %ld\n", s + 1, (long)slot[s]);
+    }
+}
+
+static int xi_slot(DWORD port)
+{
+    if (port >= XBOX_MAX_CONTROLLERS) return -1;
+    xi_map(0);
+    return (int)g_xslot[port];
+}
+
+static DWORD xi_get(DWORD port, XINPUT_STATE *s)
+{
+    int slot = xi_slot(port);
+    return slot >= 0 ? XInputGetState((DWORD)slot, s) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+static DWORD xi_set(DWORD port, XINPUT_VIBRATION *v)
+{
+    int slot = xi_slot(port);
+    return slot >= 0 ? XInputSetState((DWORD)slot, v) : ERROR_DEVICE_NOT_CONNECTED;
+}
 
 /* SDL takes every pad that XInput does not already drive: an Xbox pad would
  * appear in both, so those stay with XInput. */
@@ -123,9 +175,12 @@ static void ensure_init(void)
         return;
     if (InterlockedCompareExchange(&g_state, 1, 0) == 0) {
         InitializeCriticalSection(&g_lock);
+        g_xscan = 0;
+        for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+            g_xslot[i] = -1;
+        xi_map(1);
         for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
-            XINPUT_STATE state;
-            g_xi_ok[i] = (XInputGetState(i, &state) == ERROR_SUCCESS);
+            g_xi_ok[i] = g_xslot[i] >= 0;
             g_controller_connected[i] = g_xi_ok[i];
         }
         set_sdl_hints();
@@ -160,7 +215,7 @@ static int pad_read(DWORD dwPort, XBOX_INPUT_STATE *pState, DWORD *xi_result)
     LARGE_INTEGER t0, t1;
     ensure_init();
     if (pad_perf_on()) QueryPerformanceCounter(&t0);
-    result = XInputGetState(dwPort, &xi_state);
+    result = xi_get(dwPort, &xi_state);
     if (pad_perf_on()) {
         double us;
         QueryPerformanceCounter(&t1);
@@ -310,7 +365,7 @@ static VOID CALLBACK stop_cb(PVOID arg, BOOLEAN fired)
     (void)fired;
     /* Only the stop that was scheduled last still counts. */
     if ((LONG)g_stop_arg[port] == g_stop_gen[port])
-        XInputSetState(port, &off);
+        xi_set(port, &off);
 }
 
 static int xi_min_ms(void)
@@ -345,7 +400,7 @@ static DWORD xi_rumble(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     }
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    return xi_set(dwPort, &xi_vib);
 }
 
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
@@ -380,7 +435,10 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+    {
+        int slot = xi_slot(dwPort);
+        result = slot >= 0 ? XInputGetCapabilities((DWORD)slot, dwFlags, &xi_caps) : ERROR_DEVICE_NOT_CONNECTED;
+    }
     if (result != ERROR_SUCCESS) {
         if (!sdlpad_slot_used((int)dwPort))
             return result;

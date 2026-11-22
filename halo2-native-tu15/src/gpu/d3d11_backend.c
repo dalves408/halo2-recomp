@@ -1698,6 +1698,19 @@ static void msaa_query_device(void)
 }
 
 static void tex_index_rebuild(void);
+static void tex_reload_for_pack(int on);
+
+/* The hi-res textures setting, live (settings.c, at a flip): the cached
+ * textures that change -- the replacements when it goes off, all of them
+ * when it goes on -- are dropped and upload again on their next use. */
+void halo2_gpu_set_hires(int on)
+{
+    on = on ? 1 : 0;
+    if (on == texpack_active())
+        return;
+    texpack_set_active(on);
+    tex_reload_for_pack(on);
+}
 
 void halo2_gpu_set_aniso(int level)
 {
@@ -2384,8 +2397,9 @@ static int relayout_readback(Surf *s)
 static Surf *get_surf(const Nv2aSurface *in)
 {
     uint32_t bpp = in->bytes_per_pixel ? in->bytes_per_pixel : 4;
-    uint32_t w = in->pitch && in->pitch / bpp >= in->width ? in->pitch / bpp : in->width;
-    uint32_t h = in->height;
+    /* The surface reaches the far edge of its clip, which need not start at (0,0) (split screen). */
+    uint32_t w = in->pitch && in->pitch / bpp >= in->clip_x + in->width ? in->pitch / bpp : in->clip_x + in->width;
+    uint32_t h = in->clip_y + in->height;
     uint32_t aa_sx = in->aa_sx > 1 ? in->aa_sx : 1;
     uint32_t aa_sy = in->aa_sy > 1 ? in->aa_sy : 1;
     uint32_t pw, ph;
@@ -3510,9 +3524,30 @@ static int shadow_alias_lit(void)
 static int rtlog_on(void)
 {
     static long start = -1;
+    static const char *trig = (const char *)-1;
+    static uint32_t polled;
     if (start < 0) {
         const char *e = getenv("RECOMP_RTLOG_GEN");
         start = e && *e ? atol(e) : 0;
+    }
+    /* RECOMP_RTLOG_TRIGGER=<file>: when the file appears, log the next two frames (and delete it) -- for a
+     * picture that only shows up in play, such as split screen. Checked once a frame. */
+    /* Default: data\rtlog.trigger in the install folder (the working directory), so a player's
+     * game can be logged at a glitch however it was started. */
+    if (trig == (const char *)-1) {
+        /* Copied: a pointer from getenv() goes stale when a setting is changed in F1 (_putenv_s). */
+        static char path[MAX_PATH];
+        const char *e = getenv("RECOMP_RTLOG_TRIGGER");
+        snprintf(path, sizeof path, "%s", e && *e ? e : "data\\rtlog.trigger");
+        trig = path;
+    }
+    if (trig && *trig && polled != s_gen) {
+        polled = s_gen;
+        if (GetFileAttributesA(trig) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA(trig);
+            start = (long)s_gen + 1;
+            fprintf(stderr, "[RTLOG] armed for frames %ld-%ld\n", start, start + 1);
+        }
     }
     return (start && s_gen >= (uint32_t)start && s_gen < (uint32_t)start + 2) ||
            (s_probe_armed && s_gen >= s_probe_armed && s_gen < s_probe_armed + 2);
@@ -3543,8 +3578,88 @@ static int depth_still_current(const Depth *d)
     return 1;
 }
 
+/* Render log picture dump: in the first frame of each trigger, each colour target is
+ * saved as a BMP when the game moves off it (and the shown one at the flip),
+ * to data\rtdump\g<frame>_<n>_<address>_<w>x<h>_<why>.bmp -- what every pass
+ * drew, for a glitch that only shows in play. At most 80 pictures. */
+static void rtdump_surface(Surf *s, const char *why)
+{
+    static uint32_t first_gen;
+    static unsigned n;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *st = NULL;
+    char path[MAX_PATH];
+    FILE *f;
+    uint32_t x, y, row;
+    if (!s || !s->tex || !rtlog_on())
+        return;
+    if (!first_gen || s_gen > first_gen + 1) {   /* a new trigger: start a new set */
+        first_gen = s_gen;
+        n = 0;
+    }
+    if (s_gen != first_gen || n >= 80)
+        return;
+    if (s->msaa_dirty)
+        return;
+    ID3D11Texture2D_GetDesc(s->tex, &td);
+    if (td.SampleDesc.Count != 1 || (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+                                     td.Format != DXGI_FORMAT_B5G6R5_UNORM))
+        return;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+        return;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                              (ID3D11Resource *)s->tex, 0, NULL);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
+        ID3D11Texture2D_Release(st);
+        return;
+    }
+    CreateDirectoryA("data\\rtdump", NULL);
+    snprintf(path, sizeof path, "data\\rtdump\\g%u_%02u_%08X_%ux%u_%s.bmp", s_gen, n++, s->va,
+             s->w, s->h, why);
+    f = fopen(path, "wb");
+    if (f) {
+        uint8_t h[54] = { 'B', 'M' };
+        uint8_t *line;
+        row = (td.Width * 3 + 3) & ~3u;
+#define PUT32(o, v) do { uint32_t _v = (uint32_t)(v); h[o] = (uint8_t)_v; h[o + 1] = (uint8_t)(_v >> 8); \
+        h[o + 2] = (uint8_t)(_v >> 16); h[o + 3] = (uint8_t)(_v >> 24); } while (0)
+        PUT32(2, 54 + row * td.Height); PUT32(10, 54); PUT32(14, 40); PUT32(18, td.Width);
+        PUT32(22, td.Height); h[26] = 1; h[28] = 24; PUT32(34, row * td.Height);
+#undef PUT32
+        fwrite(h, 1, 54, f);
+        line = (uint8_t *)calloc(1, row);
+        for (y = td.Height; line && y-- > 0;) {
+            const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+            for (x = 0; x < td.Width; x++) {
+                if (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+                    line[x * 3] = src[x * 4]; line[x * 3 + 1] = src[x * 4 + 1]; line[x * 3 + 2] = src[x * 4 + 2];
+                } else {
+                    uint16_t v = (uint16_t)(src[x * 2] | src[x * 2 + 1] << 8);
+                    line[x * 3] = (uint8_t)((v & 31) << 3); line[x * 3 + 1] = (uint8_t)(((v >> 5) & 63) << 2);
+                    line[x * 3 + 2] = (uint8_t)((v >> 11) << 3);
+                }
+            }
+            fwrite(line, 1, row, f);
+        }
+        free(line);
+        fclose(f);
+        fprintf(stderr, "[RTLOG] g%u dump %s\n", s_gen, path);
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    ID3D11Texture2D_Release(st);
+}
+
 static void bind_targets(Surf *s, Depth *d)
 {
+    if (rtlog_on() && s != s_cur)
+        rtdump_surface(s_cur, "left");
     if (rtlog_on() && s != s_cur)
         fprintf(stderr, "[RTLOG] g%u bind %08X %ux%u phys %ux%u aa %ux%u pitch %u bpp %u dirty %d unc %d"
                 " depth %08X %ux%u\n", s_gen,
@@ -3579,15 +3694,22 @@ static LONG scale_edge(uint32_t value, uint32_t logical, uint32_t physical)
     return logical ? (LONG)(((uint64_t)value * physical + logical / 2) / logical) : 0;
 }
 
-/* The surface clip, as the CPU rasteriser bounds its triangles. */
+/* The surface clip, as the CPU rasteriser bounds its triangles: its origin too, since split-screen views draw
+ * into the lower or right part of the frame. */
 static void apply_scissor(const Nv2aSurface *s)
 {
     D3D11_RECT r;
-    uint32_t right = s->width < s_cur->w ? s->width : s_cur->w;
-    uint32_t bottom = s->height < s_cur->h ? s->height : s_cur->h;
-    r.left = 0; r.top = 0;
+    uint32_t left = s->clip_x < s_cur->w ? s->clip_x : s_cur->w;
+    uint32_t top = s->clip_y < s_cur->h ? s->clip_y : s_cur->h;
+    uint32_t right = s->clip_x + s->width < s_cur->w ? s->clip_x + s->width : s_cur->w;
+    uint32_t bottom = s->clip_y + s->height < s_cur->h ? s->clip_y + s->height : s_cur->h;
+    r.left = scale_edge(left, s_cur->w, s_cur->pw);
+    r.top = scale_edge(top, s_cur->h, s_cur->ph);
     r.right = scale_edge(right, s_cur->w, s_cur->pw);
     r.bottom = scale_edge(bottom, s_cur->h, s_cur->ph);
+    if (rtlog_on())
+        fprintf(stderr, "[RTLOG] g%u clip %08X %u,%u %ux%u of %ux%u\n", s_gen, s_cur->va, s->clip_x, s->clip_y,
+                s->width, s->height, s_cur->w, s_cur->h);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
 }
 
@@ -3831,6 +3953,12 @@ typedef struct {
     int index_bucket;          /* bucket used at insert, or -1 */
     uint8_t cube, unsupported, indexed;
     uint8_t hires, lod_extra;       /* view is a texture-pack replacement (tex_pack.c) */
+    uint8_t wide_kind;              /* widescreen handling, WIDE_* (wide_kind_of) */
+    /* With a hi-res replacement: the game's own texture, kept for a stage
+     * with alpha kill (upscaling and BC7 move alpha off exactly 0). */
+    ID3D11Texture2D *orig_tex;
+    ID3D11ShaderResourceView *orig_srv;
+    uint32_t orig_levels;
     uint32_t view_levels;           /* mip levels of that view */
     uint8_t *snapshot;
     size_t snapshot_bytes;
@@ -4260,8 +4388,49 @@ static void release_tex_snapshot(Tex *e)
  * the draw that called get_texture(), right after it returns. */
 static unsigned s_tex_lod_extra;
 
+/* Widescreen (vsh_hlsl.c's geometry shader) treats a few HUD textures by
+ * what they are, known from the hash of their level-0 bytes (the names in
+ * the texture extraction's manifest):
+ *   WIDE_MARKER -- drawn over a point of the 3D view (the arrow over a
+ *     co-op partner, nav points): squeezed about its own centre, so it
+ *     keeps its shape and stays on its target, which the wider camera
+ *     already placed;
+ *   WIDE_SCOPE -- the zoom overlays (scope masks, binoculars): squeezed
+ *     about the screen centre like the HUD, which they do not pass as. */
+enum { WIDE_NONE, WIDE_MARKER, WIDE_SCOPE };
+static unsigned s_tex_wide_kind;     /* of the texture get_texture() last returned */
+static unsigned s_draw_wide_kind;    /* of the draw being prepared: the largest of its stages */
+
+static uint8_t wide_kind_of(uint64_t h)
+{
+    static const uint64_t marker[] = {
+        0x06cb9e49273ad1f7ull, 0x4c46850734292b85ull, 0x234dd3704a29a9eaull, 0x5bfc312935c9c07cull,
+        0x4f6074e9526f36cbull, 0x06521ef4196f5787ull, 0xb676b38e651cf235ull, 0x904dc9b01e1db72dull,
+        0xff71ab3bcfab0445ull, 0x8a90a0d26dc857a4ull, 0x3c99ab5ff5ebadabull, 0xd0236cd560725870ull,
+        0xa6dacbb81dc29071ull };
+    static const uint64_t scope[] = {
+        0x06c24b5f3956bac3ull, 0x09d5a4838e522cf3ull, 0x0c67dd7280d647a8ull, 0x191d45eaa21bc2d6ull,
+        0x2425fe2e2f8aeeb9ull, 0x26a4301114d49ffeull, 0x3998a933ed21f54cull, 0x3c7b5c7f7113ad19ull,
+        0x40e4859a1c14f2e4ull, 0x44af05238fabc3a9ull, 0x45273e544c385d54ull, 0x47982751367e793cull,
+        0x4f232baad68810e9ull, 0x523490614e292654ull, 0x6051bd2653ebf85bull, 0x6e0bd8d8d0f506d8ull,
+        0x7a77b656aae0d35aull, 0x8ac7c6031fbfe734ull, 0x91bd66399556cc9bull, 0x91c0075a57babcb8ull,
+        0x95149b384fa0f8b9ull, 0x98f71cc4300cc95cull, 0x9ea2db7e2363356full, 0xa7bc7f14008bf64full,
+        0xaadb5c97b9c1391bull, 0xcc9378e5aa7e6078ull, 0xe6f0f2973986b4c4ull, 0xeb404e8f8e1c5b25ull,
+        0xf25c6a41d132cc5cull, 0xf4bd387f553fc2e1ull, 0xf53a8c5baf0ffd78ull };
+    size_t i;
+    for (i = 0; i < sizeof marker / sizeof marker[0]; i++)
+        if (marker[i] == h) return WIDE_MARKER;
+    for (i = 0; i < sizeof scope / sizeof scope[0]; i++)
+        if (scope[i] == h) return WIDE_SCOPE;
+    return WIDE_NONE;
+}
+
+static const Tex *s_tex_last;       /* the entry get_texture() last returned */
+
 static unsigned tex_levels_out(const Tex *e)
 {
+    s_tex_last = e;
+    s_tex_wide_kind = e->wide_kind;
     if (e->hires) {
         s_tex_lod_extra = e->lod_extra;
         return e->view_levels;
@@ -4287,6 +4456,10 @@ static void release_tex(Tex *e)
 {
     if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
     if (e->tex) ID3D11Texture2D_Release(e->tex);
+    if (e->orig_srv) ID3D11ShaderResourceView_Release(e->orig_srv);
+    if (e->orig_tex) ID3D11Texture2D_Release(e->orig_tex);
+    e->orig_srv = NULL;
+    e->orig_tex = NULL;
     release_tex_snapshot(e);
     e->srv = NULL;
     e->tex = NULL;
@@ -4360,6 +4533,21 @@ static void discard_tex(Tex *e)
     }
     memset(&s_tex[last], 0, sizeof s_tex[last]);
     s_ntex = last;
+}
+
+static void tex_reload_for_pack(int on)
+{
+    int i, n = 0;
+    for (i = s_ntex - 1; i >= 0; --i) {
+        Tex *e = &s_tex[i];
+        if (e->unsupported || (!on && !e->hires))
+            continue;
+        discard_tex(e);
+        n++;
+    }
+    s_tex_lod_extra = 0;
+    fprintf(stderr, "[TEXPACK] hi-res textures %s: %d cached texture(s) reload\n", on ? "on" : "off", n);
+    fflush(stderr);
 }
 
 static void set_tex_key(Tex *e, const Nv2aTexture *t, int cube, unsigned palette_entries,
@@ -4943,6 +5131,8 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
     s_texture_soft_reject = 0;
     s_tex_fail = NULL;
     s_tex_lod_extra = 0;
+    s_tex_wide_kind = 0;
+    s_tex_last = NULL;
     *mip_levels = 1;
     if (!t || !t->width || !t->height || t->width > 4096 || t->height > 4096) {
         s_texture_soft_reject = 1;
@@ -5385,6 +5575,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
     }
     e->palette_hash = palette_hash;
     e->hash = h; e->gen = s_gen;
+    if (layout.subresource[0][0].size && layout.subresource[0][0].size <= (256u << 10))
+        e->wide_kind = wide_kind_of(hash_bytes(snapshot + layout.subresource[0][0].offset,
+                                               layout.subresource[0][0].size));
+    s_tex_wide_kind = e->wide_kind;
     if (texpack_enabled() && layout.subresource[0][0].size) {
         const GpuTextureSubresource *s0 = &layout.subresource[0][0];
         ID3D11Texture2D *ptex;
@@ -5392,8 +5586,9 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
         unsigned plevels, pextra;
         if (texpack_lookup(s_dev, hash_bytes(snapshot + s0->offset, s0->size), t->width,
                            t->height, cube, &ptex, &psrv, &plevels, &pextra)) {
-            if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
-            if (e->tex) ID3D11Texture2D_Release(e->tex);
+            e->orig_tex = e->tex;
+            e->orig_srv = e->srv;
+            e->orig_levels = e->uploaded_levels ? e->uploaded_levels : 1;
             e->tex = ptex;
             e->srv = psrv;
             e->hires = 1;
@@ -5411,6 +5606,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
                         " faces=%d levels=%u uploaded=%u palette=0x%08X\n",
                 rewritten ? "changed" : "new", path, t->offset, t->color, t->width,
                 t->height, t->pitch, faces, t->levels, layout.levels, t->palette);
+    s_tex_last = e;
     *mip_levels = e->hires ? tex_levels_out(e) : layout.levels;
     return e->srv;
 }
@@ -6308,6 +6504,7 @@ static int xdraw_prepare(const Nv2aSurface *s, const Nv2aXBatch *b)
 }
 static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
 {
+    s_draw_wide_kind = WIDE_NONE;
     const Nv2aRenderState *rs;
     const Nv2aCombiner *rc;
     Nv2aCombiner simple;
@@ -6363,6 +6560,9 @@ static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
     key.control = rc->control;
     key.stage_program = rc->stage_program;
     key.clip_plane_mode = b->clip_plane_mode;
+    for (st = 0; st < 4; st++)
+        if (nv2a_backend_reg(0x1B0C + st * 0x40) & (1u << 2))
+            key.alpha_kill |= 1u << st;
     if (s_prep_vsh) {
         float zi[4];
         zclip_info(zi);
@@ -6421,6 +6621,17 @@ static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
         if (!b->tex_valid[st] || !samples)
             continue;
         srv[st] = get_texture(&b->tex[st], cube, st, &tw, &th, &mip_levels);
+        if (srv[st] && s_tex_wide_kind > s_draw_wide_kind)
+            s_draw_wide_kind = s_tex_wide_kind;
+        /* Alpha kill (SET_TEXTURE_CONTROL0 bit 2) tests for alpha exactly 0,
+         * which a hi-res replacement does not keep: the stage samples the
+         * game's own texture instead (Halo 2's water masks). */
+        if (srv[st] && (nv2a_backend_reg(0x1B0C + st * 0x40) & (1u << 2)) && s_tex_last &&
+            s_tex_last->hires && s_tex_last->orig_srv) {
+            srv[st] = s_tex_last->orig_srv;
+            mip_levels = s_tex_last->orig_levels;
+            s_tex_lod_extra = 0;
+        }
 #ifdef RECOMP_DEBUG_TOOLS
         dl_stage(st, srv[st] != NULL, s_tex_fail);
 #endif
@@ -7149,7 +7360,7 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         static GpuVshConsts k;
         static uint32_t kgen;
         static int kgen_ok;
-        float vsinfo[4], foginfo[4], zinfo[4], wideinfo[4];
+        float vsinfo[4], foginfo[4], zinfo[4], wideinfo[4], viewinfo[4];
         /* Widescreen: a draw into the 640x480 screen with depth testing off
          * may be the 2D layer, which the geometry shader squeezes into the
          * middle 4:3 (gpu_vsh_gs_hlsl). "Off" includes a test that always
@@ -7161,18 +7372,42 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
                       b->xb.state && (!b->xb.state->depth_test_enable ||
                                       (b->xb.state->depth_func == 0x207 && !b->xb.state->depth_write))
                       ? 1.0f : 0.0f;
-        wideinfo[2] = wideinfo[3] = 0.0f;
+        wideinfo[2] = s_ui_squeeze < 0.999f && s_cur && s_cur->w == 640 && s_cur->h == 480
+                      ? (float)s_draw_wide_kind : 0.0f;
+        wideinfo[3] = 0.0f;
+        viewinfo[0] = s_cur ? (float)s_cur->pw : 0.0f;
+        viewinfo[1] = s_cur ? (float)s_cur->ph : 0.0f;
+        viewinfo[2] = zeta_max();
+        viewinfo[3] = 1.0f;
         vsinfo[0] = b->aa[0]; vsinfo[1] = b->aa[1];
         vsinfo[2] = b->xb.near_clip ? 1.0f : 0.0f; vsinfo[3] = b->xb.near_z;
         foginfo[0] = b->fog_enable ? 1.0f : 0.0f;
         foginfo[1] = (float)b->fog_mode;
         foginfo[2] = b->fog_param[0]; foginfo[3] = b->fog_param[1];
         zclip_info(zinfo);
+        if (rtlog_on() && b->xb.state) {
+            /* Render log: each vertex-program draw's depth, stencil and blend state and its textures. */
+            const Nv2aRenderState *r = b->xb.state;
+            unsigned st;
+            uint32_t tx[4];
+            for (st = 0; st < 4; st++)
+                tx[st] = b->xb.tex_valid[st] ? b->xb.tex[st].offset : 0;
+            fprintf(stderr, "[RTLOG] g%u draw tgt %08X idx %u ztest %u func %X zwrite %u zrange %g..%g"
+                            " zinfo %g %g cull %g wbuf %g nearclip %g nearz %g stencil %u func %X ref %X"
+                            " blend %u %X %X cmask %08X clipplanes %04X tex %08X %08X %08X %08X\n",
+                    s_gen, s_cur ? s_cur->va : 0, (unsigned)b->nindices, r->depth_test_enable,
+                    r->depth_func, r->depth_write, r->depth_min, r->depth_max, zinfo[0], zinfo[1],
+                    zinfo[2], zinfo[3], vsinfo[2], vsinfo[3], r->stencil_enable, r->stencil_func,
+                    r->stencil_ref, r->blend_enable, r->blend_src, r->blend_dst, r->color_mask,
+                    b->xb.clip_plane_mode,
+                    tx[0], tx[1], tx[2], tx[3]);
+        }
         if (s_kvalid && kgen_ok && b->consts_gen == kgen
                 && !memcmp(vsinfo, s_kshadow.vsinfo, sizeof vsinfo)
                 && !memcmp(foginfo, s_kshadow.foginfo, sizeof foginfo)
                 && !memcmp(zinfo, s_kshadow.zinfo, sizeof zinfo)
-                && !memcmp(wideinfo, s_kshadow.wideinfo, sizeof wideinfo)) {
+                && !memcmp(wideinfo, s_kshadow.wideinfo, sizeof wideinfo)
+                && !memcmp(viewinfo, s_kshadow.viewinfo, sizeof viewinfo)) {
             s_st.kskip++;
         } else {
             memcpy(k.k, b->consts, sizeof k.k);
@@ -7180,6 +7415,7 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
             memcpy(k.foginfo, foginfo, sizeof foginfo);
             memcpy(k.zinfo, zinfo, sizeof zinfo);
             memcpy(k.wideinfo, wideinfo, sizeof wideinfo);
+            memcpy(k.viewinfo, viewinfo, sizeof viewinfo);
             if (!s_kvalid || memcmp(&k, &s_kshadow, sizeof k)) {
                 D3D11_MAPPED_SUBRESOURCE m;
                 if (gpu_call_failed(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_kcb, 0,
@@ -9371,8 +9607,10 @@ done:
 
 static int d3d_flip_readback(uint32_t color_va)
 {
-    if (rtlog_on())
+    if (rtlog_on()) {
         fprintf(stderr, "[RTLOG] g%u flip readback %08X\n", s_gen, color_va);
+        rtdump_surface(find_surf(color_va), "flip");
+    }
     int tracked = find_surf(color_va) != NULL;
     int ok = d3d_readback(color_va);
     if (tracked && !ok) {

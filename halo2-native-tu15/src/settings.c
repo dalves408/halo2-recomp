@@ -10,6 +10,7 @@
 #include "gpu/d3d11_backend.h"
 #include "gpu/fxaa.h"
 #include "gpu/render_scale.h"
+#include "gpu/tex_pack.h"
 #include "video/gpu_present.h"
 
 extern void xbox_FramebufferWindowSetFullscreen(int on);
@@ -287,10 +288,9 @@ static void boot_env(const Halo2Settings *s)
     /* Aniso only works on mip chains. */
     if (clamp_aniso(s->anisotropy) >= 2)
         env_if_unset("RECOMP_GPU_MIPS", "1");
-    /* Hi-res textures off: the pack in <game folder>	extures is not loaded (src/gpu/tex_pack.c reads this once,
-     * at start, so a change applies at the next start). */
-    if (!s->hires_textures)
-        env_if_unset("RECOMP_TEX_PACK", "0");
+    /* Hi-res textures (the pack in <game folder>\textures): switchable while
+     * the game runs (halo2_gpu_apply_live), so it is not an env setting. */
+    texpack_set_active(s->hires_textures);
 }
 
 void halo2_settings_boot(void)
@@ -356,6 +356,8 @@ void halo2_gpu_apply_live(const Halo2Settings *s)
     snprintf(buf, sizeof buf, "%d", msaa);
     _putenv_s("RECOMP_GPU_MSAA", buf);
     halo2_gpu_set_msaa(msaa);
+
+    halo2_gpu_set_hires(s->hires_textures);
 }
 
 int halo2_settings_apply(const Halo2Settings *s, int save)
@@ -414,9 +416,9 @@ void halo2_settings_pump(void)
     LeaveCriticalSection(&s_pending_lock);
 
     snprintf(s_last_apply, sizeof s_last_apply,
-             "scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d",
+             "scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires=%d",
              t.resolution_scale, t.fullscreen, t.vsync,
-             t.anisotropy, t.fxaa, t.msaa);
+             t.anisotropy, t.fxaa, t.msaa, t.hires_textures);
     fprintf(stderr, "[SETTINGS] live apply %s\n", s_last_apply);
     fflush(stderr);
     halo2_gpu_apply_live(&t);

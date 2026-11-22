@@ -1072,6 +1072,8 @@ static void current_surface(Nv2aSurface *out)
     out->color_va        = dma_resolve(s_gpu.color_offset);
     out->width           = s_gpu.clip_w;
     out->height          = s_gpu.clip_h;
+    out->clip_x          = s_gpu.clip_x;
+    out->clip_y          = s_gpu.clip_y;
     out->pitch           = s_gpu.pitch;
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;

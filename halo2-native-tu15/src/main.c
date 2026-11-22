@@ -552,10 +552,20 @@ int main(void)
         _putenv_s("RECOMP_USB_PLUG", "boot");
         _putenv_s("H2_USB_PLUG_SET_BY_DOWNLOADER", "1");
     }
+    /* One pad in the downloader, as before (the game's four come with the hand-over in the environment). */
+    if (getenv("H2_USB_PADS_SET_BY_GAME"))
+        _putenv_s("RECOMP_USB_PADS", "1");
 #else
     if (getenv("H2_USB_PLUG_SET_BY_DOWNLOADER")) {   /* back from the downloader */
         _putenv_s("RECOMP_USB_PLUG", "");
         _putenv_s("H2_USB_PLUG_SET_BY_DOWNLOADER", "");
+    }
+    /* Four controller ports, as on the console: split screen and co-op need a pad on each player's port
+     * (ohci.c, RECOMP_USB_PADS; the default was one). A port with no host pad reads as a pad at rest; host pads
+     * take ports in order (overrides/xinput_device.c). */
+    if (!getenv("RECOMP_USB_PADS") || getenv("H2_USB_PADS_SET_BY_GAME")) {
+        _putenv_s("RECOMP_USB_PADS", "4");
+        _putenv_s("H2_USB_PADS_SET_BY_GAME", "1");
     }
 #endif
     /* fix3: 8 x 512-sample device buffers (pacing 2048..4096 queued, 43-85 ms)
