@@ -4,9 +4,9 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.4** is out: get `Halo2-Recomp-Setup-1.0.4.exe` from
+**Version 1.0.5** is out: get `Halo2-Recomp-Setup-1.0.5.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
-[hi-res texture pack](https://github.com/dalves408/halo2-recomp/releases/tag/textures-1) is a
+[hi-res texture pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2) is a
 separate download (below).
 
 **No game content is in this repository.** You need your own retail Halo 2 disc. The
@@ -52,8 +52,8 @@ difference between the disc's executables and the update's.
 the same `data\settings.ini` and `data\keymap.ini`:
 
 - **VIDEO:** render scale, fullscreen, VSync, anisotropic filtering, FXAA, MSAA,
-  widescreen, and hi-res textures on or off (both at the next start; "Not installed" when
-  there is no texture pack).
+  widescreen, and hi-res textures on or off ("Not installed" when there is no texture
+  pack; in the F1 menu it applies at once from 1.0.5).
 - **CONTROLS:** every action with up to three keys or mouse buttons, plus mouse aim,
   sensitivity and invert (below).
 - The F1 menu works with the keyboard, a controller or the mouse: click a tab, a row or its
@@ -233,21 +233,37 @@ copies off.
 
 ## Hi-res textures
 
-**For players:** the [Hi-Res Texture Pack](https://github.com/dalves408/halo2-recomp/releases/tag/textures-1)
-has 4,645 of the game's textures upscaled 4x, as BC7 with mipmaps.
+**For players:** the [Hi-Res Texture Pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2)
+has 4,645 of the game's textures upscaled 4x, with mipmaps. Most are BC7. The scope and
+binocular overlays and the Metropolis water masks are uncompressed, and their transparency
+is exact: scaled back down, they match the originals.
 
-- **Install:** run `Halo2-Recomp-HiRes-Textures-1-Setup.exe` from that release, or tick the
-  texture pack task in the game's Setup (1.0.1 and newer). Either one downloads the four
-  `texture-0N.bin` parts (3.87 GB), checks each one's size and SHA-256 and extracts them into
-  `<game folder>\textures` (6.4 GB). An interrupted download resumes; `.bin` parts placed
-  beside the Setup are used instead of downloading.
-- **On or off:** Hi-res textures in the F1 menu or `config.exe` (VIDEO), at the next start.
-  1.0.0 has no switch: it loads the folder whenever it is there.
+- **Install or update:** run `Halo2-Recomp-HiRes-Textures-2-Setup.exe` from that release, or
+  tick the texture pack task in the game's Setup (1.0.5 offers v2).
+  - **Texture pack v1 already installed:** Setup downloads only the update
+    (`texture-update-1-to-2.bin`, 2.7 MB) and replaces the 34 changed textures, each checked
+    first.
+  - **Otherwise:** Setup downloads the four `texture-0N.bin` parts (3.87 GB), checks each one's
+    size and SHA-256 and extracts them into `<game folder>\textures` (6.4 GB).
+  - An interrupted download resumes. `.bin` files placed beside the Setup are used instead of
+    downloading.
+- **On or off:** Hi-res textures in the F1 menu (at once, from 1.0.5) or `config.exe` (VIDEO,
+  at the next start). 1.0.0 has no switch: it loads the folder whenever it is there.
 - **Building the release:** `python scripts\build_texture_pack.py --revision <n>` packs a
   folder of DDS files into the `.bin` parts (each under 2 GB, checked by extracting them
   again) and writes their pins to `installer\texture_payload.iss`. `build_installer.py` then
   builds the addon, `installer\halo2_textures.iss`. The parts and the addon go on a
   `textures-<n>` release that is not marked latest, so the game's update check never sees it.
+- **Revision 2:**
+  `build_texture_pack.py --revision 2 --overlay <remade dds> --patch-from 1`
+  - It lays the remade files over the source.
+  - It also builds the update from revision 1, after checking the rebuilt revision 1 file list
+    against its pinned SHA-256.
+  - It writes `installer\texture_patch_files.iss`, so Setup recognises a revision 1 folder,
+    including one whose update was interrupted.
+  - `scripts\remake_alpha.py` rebuilt those textures on a CUDA GPU. Each 4x4 block of the result
+    averages to the original texel's alpha. Alpha 0 and 255 stay exact. Edges are cleaned up
+    with total-variation smoothing.
 
 **Making a pack:** put DDS replacements in `halo2-native-tu15\textures\`. Name each one
 `<hash16>_<W>x<H>_<anything>.dds`, keeping the extracted texture's name. A file can be

@@ -16,6 +16,9 @@
 #include <wchar.h>
 
 #include "shader_cache.h"
+#include "../h2_layout.h"
+
+void halo2_install_root(char *buf, size_t n);
 
 #define CACHE_PATH_CAP 32768
 #define CACHE_HASH_SIZE 32
@@ -171,7 +174,7 @@ static int make_directory(const wchar_t *path)
 static int configure_directory(void)
 {
     const wchar_t *custom = _wgetenv(L"RECOMP_GPU_PSCACHE_DIR");
-    const wchar_t *local = _wgetenv(L"LOCALAPPDATA");
+    char root[MAX_PATH], data[MAX_PATH];
     wchar_t parent[CACHE_PATH_CAP];
     int written;
 
@@ -188,12 +191,11 @@ static int configure_directory(void)
         }
         return 1;
     }
-    if (!local || !*local) {
-        fprintf(stderr, "[GPU-PSCACHE] LOCALAPPDATA is not set\n");
-        return 0;
-    }
-    written = _snwprintf_s(parent, CACHE_PATH_CAP, _TRUNCATE, L"%ls\\BruteForce", local);
-    if (written < 0) {
+    /* The install is portable: the cache lives in <install>\data\shader-cache
+     * (SaveData\ in a development tree), never in the user's profile. */
+    halo2_install_root(root, sizeof root);
+    h2_data_path(root, "", data, sizeof data);
+    if (!MultiByteToWideChar(CP_ACP, 0, data, -1, parent, CACHE_PATH_CAP)) {
         fprintf(stderr, "[GPU-PSCACHE] cache directory path is too long\n");
         return 0;
     }
@@ -217,9 +219,11 @@ int gpu_pscache_init(void)
     DWORD length;
     NTSTATUS status;
 
-    if (!enabled || !*enabled || strcmp(enabled, "0") == 0)
+    /* On by default: each combiner shader compiles once per install, not once
+     * per session. RECOMP_GPU_PSCACHE=0 turns it off (development builds). */
+    if (enabled && strcmp(enabled, "0") == 0)
         return 1;
-    if (strcmp(enabled, "1") != 0) {
+    if (enabled && *enabled && strcmp(enabled, "1") != 0) {
         fprintf(stderr, "[GPU-PSCACHE] RECOMP_GPU_PSCACHE must be 0 or 1\n");
         return 0;
     }
@@ -425,4 +429,18 @@ void gpu_pscache_store(const char *source, size_t length, const char *name, cons
             fprintf(stderr, "[GPU-PSCACHE] cannot remove temporary cache entry (Windows error %lu)\n",
                     (unsigned long)GetLastError());
     }
+}
+
+const wchar_t *gpu_pscache_directory(void)
+{
+    return s_enabled ? s_directory : NULL;
+}
+
+int gpu_pscache_has(const char *source, size_t length, const char *name, const char *entry,
+                    const char *target, unsigned flags)
+{
+    uint8_t key[CACHE_HASH_SIZE];
+    wchar_t path[CACHE_PATH_CAP];
+    return s_enabled && shader_key(source, length, name, entry, target, flags, key) &&
+           cache_path(key, path) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }

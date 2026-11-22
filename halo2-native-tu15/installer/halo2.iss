@@ -95,7 +95,7 @@ Name: "{autodesktop}\Halo 2 Recomp"; Filename: "{app}\halo2_recomp.exe"; Working
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 #ifdef HasTextures
-Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download)"; Flags: unchecked; Check: TexturePackNeedsInstall
+Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download; only a small update if an earlier pack is installed)"; Flags: unchecked; Check: TexturePackNeedsInstall
 #endif
 
 [Run]
@@ -388,8 +388,7 @@ begin
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
-      if TextureAllPartsLocal then S := S + NewLine + NewLine + 'Hi-res texture pack: Setup will check and use the texture archive beside it.'
-      else S := S + NewLine + NewLine + 'Hi-res texture pack: Setup will download it (about {#TextureDownloadBytes / 1000000} MB).';
+      S := S + NewLine + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
 #endif
     Result := S;
   end else
@@ -401,8 +400,7 @@ begin
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
-      if TextureAllPartsLocal then S := S + NewLine + 'Hi-res texture pack: Setup will check and use the texture archive beside it.'
-      else S := S + NewLine + 'Hi-res texture pack: Setup will download it (about {#TextureDownloadBytes / 1000000} MB).';
+      S := S + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
 #endif
     Result := S;
   end;

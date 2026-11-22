@@ -664,6 +664,202 @@ static ID3D11RasterizerState *s_rs_bias, *s_rs_cull_bias[2][2];
 typedef struct { GpuRcKey key; ID3D11PixelShader *ps; } PsEntry;
 static PsEntry *s_ps;
 static int s_nps;
+/* Hash index over s_ps (open addressing, 0 = empty, else index + 1). Every
+ * draw looks its combiner shader up; a linear memcmp over hundreds of keys
+ * cost about 3 ms a frame in Halo 2 gameplay. */
+#define PS_INDEX_SIZE 4096
+static uint16_t s_ps_index[PS_INDEX_SIZE];
+
+static uint32_t rc_key_hash(const GpuRcKey *k)
+{
+    const uint8_t *b = (const uint8_t *)k;
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < sizeof *k; i++)
+        h = (h ^ b[i]) * 16777619u;
+    return h;
+}
+
+/* ---- combiner shader prebuild ---------------------------------------------
+ * Every combiner key the game has used is appended to <cache>\keys.bin (and a
+ * release can ship a starter list as shader_keys.bin beside the game). At
+ * launch, background threads compile every listed key that is not yet in the
+ * persistent cache, so a shader is built before the game first needs it
+ * instead of stalling that frame for 25-50 ms. The render thread never waits
+ * for them: a key it needs before its turn compiles there as before. */
+void halo2_install_root(char *buf, size_t n);
+#define RC_KEYS_MAGIC "H2RCKEY1"
+typedef struct { char magic[8]; uint32_t key_size, reserved; } RcKeysHeader;
+static GpuRcKey *s_pre_keys;
+static volatile LONG s_pre_n, s_pre_next, s_pre_built, s_pre_done_threads;
+static LONG s_pre_threads;
+static double s_pre_started;
+static CRITICAL_SECTION s_keylog_lock;
+static FILE *s_keylog;
+static uint32_t *s_known_hash;  /* hashes of keys already in a list */
+static int s_nknown, s_known_cap;
+
+static int known_has(uint32_t h)
+{
+    int i;
+    for (i = 0; i < s_nknown; i++)
+        if (s_known_hash[i] == h)
+            return 1;
+    return 0;
+}
+
+static void known_add(uint32_t h)
+{
+    if (s_nknown == s_known_cap) {
+        int cap = s_known_cap ? s_known_cap * 2 : 1024;
+        uint32_t *n = (uint32_t *)realloc(s_known_hash, cap * sizeof *n);
+        if (!n)
+            return;
+        s_known_hash = n;
+        s_known_cap = cap;
+    }
+    s_known_hash[s_nknown++] = h;
+}
+
+/* Adds a list's new keys; returns how many, -1 when missing, -2 when it is
+ * from a build with another key layout. */
+static int read_key_list(const wchar_t *path, GpuRcKey **keys, int *n, int *cap)
+{
+    FILE *f = _wfopen(path, L"rb");
+    RcKeysHeader h;
+    GpuRcKey k;
+    int added = 0;
+    if (!f)
+        return -1;
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, RC_KEYS_MAGIC, 8) ||
+        h.key_size != sizeof(GpuRcKey)) {
+        fclose(f);
+        return -2;
+    }
+    while (fread(&k, sizeof k, 1, f) == 1) {
+        uint32_t hash = rc_key_hash(&k);
+        if (known_has(hash))
+            continue;
+        if (*n == *cap) {
+            int c = *cap ? *cap * 2 : 1024;
+            GpuRcKey *m = (GpuRcKey *)realloc(*keys, c * sizeof *m);
+            if (!m)
+                break;
+            *keys = m;
+            *cap = c;
+        }
+        (*keys)[(*n)++] = k;
+        known_add(hash);
+        added++;
+    }
+    fclose(f);
+    return added;
+}
+
+static DWORD WINAPI rc_prebuild_worker(LPVOID arg)
+{
+    static const char name[] = "rc", entry[] = "ps_main", target[] = "ps_5_0";
+    char *src = (char *)malloc(64 * 1024);
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    while (src) {
+        LONG i = InterlockedIncrement(&s_pre_next) - 1;
+        size_t len;
+        ID3DBlob *blob = NULL, *err = NULL;
+        if (i >= s_pre_n)
+            break;
+        len = gpu_rc_hlsl(&s_pre_keys[i], src, 64 * 1024);
+        if (!len || gpu_pscache_has(src, len, name, entry, target, SHADER_COMPILE_FLAGS))
+            continue;
+        if (SUCCEEDED(D3DCompile(src, len, name, NULL, NULL, entry, target,
+                                 SHADER_COMPILE_FLAGS, 0, &blob, &err)) && blob) {
+            gpu_pscache_store(src, len, name, entry, target, SHADER_COMPILE_FLAGS,
+                              ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob));
+            InterlockedIncrement(&s_pre_built);
+        }
+        if (blob) ID3D10Blob_Release(blob);
+        if (err) ID3D10Blob_Release(err);
+    }
+    free(src);
+    if (InterlockedIncrement(&s_pre_done_threads) == s_pre_threads)
+        fprintf(stderr, "[GPU-PSCACHE] prebuild done: %ld of %ld shaders compiled in %.1f s\n",
+                (long)s_pre_built, (long)s_pre_n, (qpc_ms() - s_pre_started) / 1000.0);
+    return 0;
+}
+
+static void rc_prebuild_start(void)
+{
+    const wchar_t *dir = gpu_pscache_directory();
+    wchar_t path[MAX_PATH + 64], wroot[MAX_PATH], seed_path[MAX_PATH + 64];
+    char root[MAX_PATH];
+    GpuRcKey *keys = NULL;
+    int n = 0, cap = 0, mine, seed = -1, threads, i;
+    SYSTEM_INFO si;
+
+    if (!dir)
+        return;
+    InitializeCriticalSection(&s_keylog_lock);
+    _snwprintf_s(path, MAX_PATH + 64, _TRUNCATE, L"%ls\\keys.bin", dir);
+    mine = read_key_list(path, &keys, &n, &cap);
+    halo2_install_root(root, sizeof root);
+    if (MultiByteToWideChar(CP_ACP, 0, root, -1, wroot, MAX_PATH)) {
+        _snwprintf_s(seed_path, MAX_PATH + 64, _TRUNCATE, L"%ls\\shader_keys.bin", wroot);
+        seed = read_key_list(seed_path, &keys, &n, &cap);
+    }
+    if (seed < 0)
+        seed = 0;
+    /* Our own list: append to it, or start it when missing or from another build. */
+    s_keylog = _wfopen(path, mine >= 0 ? L"ab" : L"wb");
+    if (s_keylog && mine < 0) {
+        RcKeysHeader h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, RC_KEYS_MAGIC, 8);
+        h.key_size = sizeof(GpuRcKey);
+        fwrite(&h, sizeof h, 1, s_keylog);
+    }
+    if (s_keylog)                /* the starter list's keys join ours */
+        for (i = n - seed; i < n; i++)
+            fwrite(&keys[i], sizeof keys[i], 1, s_keylog);
+    if (s_keylog)
+        fflush(s_keylog);
+    fprintf(stderr, "[GPU-PSCACHE] %d known combiner shaders (%d from shader_keys.bin)\n",
+            n, seed);
+    if (!n) {
+        free(keys);
+        return;
+    }
+    GetSystemInfo(&si);
+    threads = (int)si.dwNumberOfProcessors / 2;
+    if (threads < 1) threads = 1;
+    if (threads > 4) threads = 4;
+    s_pre_keys = keys;
+    s_pre_n = n;
+    s_pre_threads = threads;
+    s_pre_started = qpc_ms();
+    for (i = 0; i < threads; i++) {
+        HANDLE t = CreateThread(NULL, 0, rc_prebuild_worker, NULL, 0, NULL);
+        if (t)
+            CloseHandle(t);
+        else
+            InterlockedDecrement(&s_pre_threads);
+    }
+}
+
+/* A key the render thread just built: add it to the list for next launch. */
+static void rc_key_record(const GpuRcKey *k)
+{
+    uint32_t h;
+    if (!s_keylog)
+        return;
+    h = rc_key_hash(k);
+    EnterCriticalSection(&s_keylog_lock);
+    if (!known_has(h)) {
+        known_add(h);
+        fwrite(k, sizeof *k, 1, s_keylog);
+        fflush(s_keylog);
+    }
+    LeaveCriticalSection(&s_keylog_lock);
+}
 
 static ID3D11PixelShader *get_rc_shader(const GpuRcKey *k)
 {
@@ -679,9 +875,14 @@ static ID3D11PixelShader *get_rc_shader(const GpuRcKey *k)
     int perf = g_bruteforce_perf_counters_enabled;
     int i;
 
-    for (i = 0; i < s_nps; i++)
-        if (!memcmp(&s_ps[i].key, k, sizeof *k))
-            return s_ps[i].ps;
+    {
+        uint32_t slot = rc_key_hash(k) & (PS_INDEX_SIZE - 1);
+        for (; s_ps_index[slot]; slot = (slot + 1) & (PS_INDEX_SIZE - 1)) {
+            i = s_ps_index[slot] - 1;
+            if (!memcmp(&s_ps[i].key, k, sizeof *k))
+                return s_ps[i].ps;
+        }
+    }
     if (s_nps == MAX_PS)
         return NULL;
     len = gpu_rc_hlsl(k, src, sizeof src);
@@ -710,8 +911,6 @@ static ID3D11PixelShader *get_rc_shader(const GpuRcKey *k)
             if (ps)
                 ID3D11PixelShader_Release(ps);
             ps = NULL;
-        } else {
-            fprintf(stderr, "[GPU-PSCACHE] hit in %.3f ms\n", qpc_ms() - started);
         }
     }
     if (!ps) {
@@ -750,7 +949,14 @@ static ID3D11PixelShader *get_rc_shader(const GpuRcKey *k)
     }
     s_ps[s_nps].key = *k;
     s_ps[s_nps].ps = ps;
+    {
+        uint32_t slot = rc_key_hash(k) & (PS_INDEX_SIZE - 1);
+        while (s_ps_index[slot])
+            slot = (slot + 1) & (PS_INDEX_SIZE - 1);
+        s_ps_index[slot] = (uint16_t)(s_nps + 1);
+    }
     s_nps++;
+    rc_key_record(k);
     return ps;
 }
 
@@ -10038,6 +10244,13 @@ int bruteforce_d3d11_install(void)
     }
     if (!gpu_pscache_init())
         return 0;
+    {
+        static int prebuild_started;
+        if (!prebuild_started) {
+            prebuild_started = 1;
+            rc_prebuild_start();
+        }
+    }
     tex = (Tex *)calloc(MAX_TEX, sizeof *tex);
     if (!tex) {
         fprintf(stderr, "[GPU-D3D11] cannot allocate the D3D11 texture cache;"
