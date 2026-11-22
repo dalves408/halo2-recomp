@@ -4,7 +4,7 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.1** is out: get `Halo2-Recomp-Setup-1.0.1.exe` from
+**Version 1.0.2** is out: get `Halo2-Recomp-Setup-1.0.2.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
 [hi-res texture pack](https://github.com/dalves408/halo2-recomp/releases/tag/textures-1) is a
 separate download (below).

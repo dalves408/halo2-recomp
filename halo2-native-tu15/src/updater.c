@@ -161,6 +161,20 @@ static DWORD WINAPI work(LPVOID unused)
         CloseHandle(p);
     }
     Sleep(1500);                                 /* its helpers close too */
+    {
+        /* The game's exe must be free: the window frame (the halo2_recomp.exe the player started) closes after
+         * the game. Up to 2 minutes; robocopy's retries below are the last word. */
+        char game[MAX_PATH];
+        int i;
+        snprintf(game, sizeof game, "%s\\%shalo2_recomp.exe", s_root, dev_tree(s_root) ? "build-ninja\\" : "");
+        for (i = 0; i < 120; i++) {
+            HANDLE f = CreateFileA(game, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+            if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); break; }
+            if (GetLastError() == ERROR_FILE_NOT_FOUND) break;
+            if (i == 3) status("Waiting for Halo 2 to close...");
+            Sleep(1000);
+        }
+    }
 
     snprintf(dir, sizeof dir, "%s\\%s\\Update", s_root, dev_tree(s_root) ? "SaveData" : "data");
     snprintf(zip, sizeof zip, "%s\\update.zip", dir);

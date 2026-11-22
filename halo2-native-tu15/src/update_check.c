@@ -218,7 +218,12 @@ int upd_launch(const char *root, const char *relaunch)
              exe, (unsigned long)GetCurrentProcessId(), root, u.latest, u.url, relaunch ? relaunch : "");
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
-    if (!CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) return 0;
+    /* Outside the frame's job (h2_frame.c): inside it, the frame -- the halo2_recomp.exe the player started --
+     * would stay open until the updater ended, so its exe could never be replaced. Config.exe has no job; the
+     * plain call is the fallback for a job that does not allow breakaway (a launcher's own). */
+    if (!CreateProcessA(exe, cmd, NULL, NULL, FALSE, CREATE_BREAKAWAY_FROM_JOB, NULL, dir, &si, &pi) &&
+        !CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi))
+        return 0;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return 1;

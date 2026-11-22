@@ -251,7 +251,9 @@ static int start_game(void)
     s_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
     if (!s_job || !s_port) return 0;
     memset(&lim, 0, sizeof lim);
-    lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    /* BREAKAWAY_OK: the updater the F1 menu starts leaves the job (update_check.c), so the frame can close and
+     * its exe be replaced. */
+    lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     SetInformationJobObject(s_job, JobObjectExtendedLimitInformation, &lim, sizeof lim);
     acp.CompletionKey = s_job;
     acp.CompletionPort = s_port;
