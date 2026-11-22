@@ -5,7 +5,8 @@ it (after Marvel vs. Capcom 2's recomplauncher_manifest.py).
 
 writes Halo2-Recomp-v<version>-Windows-x64.zip (the game, its downloader, the importer, the settings program, Insignia
 Setup, the updater, SDL3, the default key map and recomplauncher.json) and its .sha256.
-Level 3 of the RecompLauncher guide: prepare (headless halo2_import --prepare), game.update (title update 1.5).
+Level 3 of the RecompLauncher guide: prepare (headless halo2_import --prepare), game.update (title update 1.5,
+optional: skipped, halo2_import makes it from the disc with the patches/ in the ZIP).
 The Inno Setup installer stays the choice for players who do not use the launcher.
 """
 import argparse
@@ -17,6 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = '{install}/data'        # data beside the game: settings.ini, keymap.ini, saves, identity, logs (portable)
+
+TU_PATCHES = ('default.xbe.tu15.h2p', 'downloader.xbe.tu15.h2p')
 
 # The files in the ZIP: name in the ZIP <- name in the build folder (or the source tree, for keymap.ini).
 PROGRAMS = {
@@ -72,16 +75,17 @@ def manifest():
             'check': {'file': 'default.xbe', 'xdvdfs': 'default.xbe'},
             'update': {
                 'into': 'data/TitleUpdate',
-                'label': "Title update 1.5: its folder from your console's hard drive (E:\\TDATA\\4D530064\\$u, with "
-                         'default.xbe and downloader.xbe).',
+                'label': "Title update 1.5 (optional): its folder from your console's hard drive (E:\\TDATA\\4D530064\\$u, "
+                         'with default.xbe and downloader.xbe). Skip it and the update is made from your disc.',
                 'accepts': 'folder',
+                'optional': True,
             },
         },
         'start': {'program': ['halo2_recomp.exe']},
         'prepare': {
             'program': ['halo2_import.exe'],
             'args': ['--prepare', '{game}', '{install}/game_files'],
-            'label': 'Game files from your disc and title update',
+            'label': 'Game files from your disc, with title update 1.5',
             'timeout': 1800,
         },
         'config': [{
@@ -117,8 +121,8 @@ def manifest():
             '4': 'That is not the supported Halo 2 disc (USA, Europe).',
             '5': 'The disc image is damaged or incomplete.',
             '6': 'The game files could not be written to the install folder.',
-            '7': "Title update 1.5 was not found or is not the right one: pick its folder from your console's hard drive "
-                 '(E:\\TDATA\\4D530064\\$u).',
+            '7': "The title update you picked is not title update 1.5: pick its folder from your console's hard drive "
+                 '(E:\\TDATA\\4D530064\\$u), or skip it.',
         },
         'looks': {'graphics': 'd3d11', 'lines': 480},
     }
@@ -141,6 +145,9 @@ def main():
         for name, source in PROGRAMS.items():
             package.write(args.build / source, name)
         package.write(ROOT / 'keymap.ini', 'keymap.ini')
+        # title update 1.5 made from the disc when the player has none (halo2_import.c; scripts/convert_tu_patches.py)
+        for name in TU_PATCHES:
+            package.write(ROOT / 'installer' / 'patches' / name, f'patches/{name}')
         package.writestr('recomplauncher.json', text)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')

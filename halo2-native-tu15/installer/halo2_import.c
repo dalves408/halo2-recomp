@@ -11,6 +11,10 @@
  * folder, a TitleUpdate folder, or the .xbe files themselves), in the install's data\TitleUpdate (where RecompLauncher
  * puts the update it asks for) and in <dest_dir> (a repair keeps it).
  *
+ * Without a title update the disc's own default.xbe and downloader.xbe (the retail 1.0 files) are patched to 1.5
+ * with the patches beside this program (patches\<file>.tu15.h2p, scripts/convert_tu_patches.py); each result must
+ * match the pinned 1.5 file exactly, so a player's own update and the patch give the same game.
+ *
  * Every file in manifest.h is written to <dest_dir> and checked against its pinned size and SHA-256 as it is copied;
  * nothing else is. Progress goes to stdout as "PROGRESS done total".
  *
@@ -19,7 +23,7 @@
  * in at the end, so a failed run never leaves a half-written game folder (an existing one is kept until then).
  *
  * Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image, 4 not the supported Halo 2 disc, 5 files missing
- * or damaged, 6 cannot write, 7 title update 1.5 not found or not the right one. */
+ * or damaged, 6 cannot write, 7 title update 1.5 not found or not the right one (and no patch to make it). */
 #include <windows.h>
 #include <bcrypt.h>
 #include <shlobj.h>
@@ -43,6 +47,17 @@ static DiscFile g_disc[MANIFEST_COUNT];
 static unsigned long long g_disc_xbe_sector;
 static int g_disc_xbe_found;
 static int g_sdk;
+/* the retail disc's default.xbe and downloader.xbe, kept for the title update patch */
+static const unsigned char DISC_DL_SHA256[32] = {   /* 9b10c579...c03c698 */
+    0x9b,0x10,0xc5,0x79,0x6f,0x73,0x75,0xdc,0x73,0x35,0x2d,0x77,0x51,0xae,0x45,0xa8,
+    0x1d,0xb8,0xbe,0x39,0x06,0xab,0x3f,0x52,0x3d,0x21,0xf7,0xff,0x1c,0x03,0xc6,0x98 };
+#define DISC_DL_SIZE 1134592ULL
+static unsigned long long g_disc_dl_sector;
+static int g_disc_dl_found;
+static unsigned char *g_retail[2];          /* [0] default.xbe, [1] downloader.xbe */
+static size_t g_retail_n[2];
+static void keep_retail(int k, unsigned char *b, size_t n);
+static unsigned char *read_all(const WCHAR *path, size_t *n);
 
 static void progress(void)
 {
@@ -208,6 +223,8 @@ static int walk(unsigned long long dir_sector, unsigned dir_size, const char *pr
                 if (!walk(sector, size, sub, depth + 1)) { free(d); return 0; }
             } else if (!_stricmp(rel, "default.xbe")) {
                 if (size == DISC_XBE_SIZE) { g_disc_xbe_sector = sector; g_disc_xbe_found = 1; }
+            } else if (!_stricmp(rel, "downloader.xbe")) {
+                if (size == DISC_DL_SIZE) { g_disc_dl_sector = sector; g_disc_dl_found = 1; }
             } else {
                 int mi = manifest_find(rel);
                 if (mi >= 0 && MANIFEST[mi].from == 0) {
@@ -253,6 +270,15 @@ static int import_image(const WCHAR *source)
         copy_checked(g_img, DISC_XBE_SIZE, DISC_XBE_SHA256, NULL, 0) != 1) {
         printf("ERROR This is not the supported Halo 2 disc (USA, Europe): its default.xbe differs.\n");
         return 4;
+    }
+    {   /* the disc's own default.xbe and downloader.xbe, for the title update patch */
+        unsigned char *b = malloc((size_t)DISC_XBE_SIZE);
+        if (b && img_read(g_base + g_disc_xbe_sector * SECTOR, b, (DWORD)DISC_XBE_SIZE)) keep_retail(0, b, (size_t)DISC_XBE_SIZE);
+        else free(b);
+        if (g_disc_dl_found && (b = malloc((size_t)DISC_DL_SIZE)) != NULL) {
+            if (img_read(g_base + g_disc_dl_sector * SECTOR, b, (DWORD)DISC_DL_SIZE)) keep_retail(1, b, (size_t)DISC_DL_SIZE);
+            else free(b);
+        }
     }
     for (i = 0; i < MANIFEST_COUNT; i++) {
         int r;
@@ -309,6 +335,13 @@ static int import_folder(const WCHAR *source)
         !(tu >= 0 && file_matches(t, MANIFEST[tu].size, MANIFEST[tu].sha256))) {
         printf("ERROR This is not the supported Halo 2 disc (USA, Europe): its default.xbe differs.\n");
         return 4;
+    }
+    {   /* a retail folder: its default.xbe and downloader.xbe, for the title update patch */
+        size_t n;
+        unsigned char *b;
+        if ((b = read_all(t, &n)) != NULL) keep_retail(0, b, n);
+        swprintf_s(t, MAX_PATH, L"%s\\downloader.xbe", root);
+        if ((b = read_all(t, &n)) != NULL) keep_retail(1, b, n);
     }
     for (i = 0; i < MANIFEST_COUNT; i++) {
         if (g_have[i]) continue;
@@ -404,13 +437,138 @@ static int find_update(const WCHAR *source, const WCHAR *update, const WCHAR *ex
     return have_update();
 }
 
+
+/* ---- title update 1.5 from the included patch ------------------------------------------------------------------- */
+static int sha_of(const unsigned char *b, size_t n, unsigned char out[32])
+{
+    Sha s;
+    if (!sha_begin(&s)) return 0;
+    BCryptHashData(s.h, (PUCHAR)b, (ULONG)n, 0);
+    sha_end(&s, out);
+    return 1;
+}
+
+/* Keep one of the disc's own files (the retail default.xbe or downloader.xbe) when it is the known one. */
+static void keep_retail(int k, unsigned char *b, size_t n)
+{
+    unsigned char got[32];
+    const unsigned char *want = k ? DISC_DL_SHA256 : DISC_XBE_SHA256;
+    if (n == (k ? DISC_DL_SIZE : DISC_XBE_SIZE) && sha_of(b, n, got) && !memcmp(got, want, 32)) {
+        free(g_retail[k]);
+        g_retail[k] = b;
+        g_retail_n[k] = n;
+    } else
+        free(b);
+}
+
+static unsigned char *read_all(const WCHAR *path, size_t *n)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    LARGE_INTEGER sz;
+    unsigned char *b = NULL;
+    DWORD got;
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    if (GetFileSizeEx(f, &sz) && sz.QuadPart > 0 && sz.QuadPart < (1 << 28) && (b = malloc((size_t)sz.QuadPart)) != NULL &&
+        (!ReadFile(f, b, (DWORD)sz.QuadPart, &got, NULL) || got != (DWORD)sz.QuadPart)) {
+        free(b);
+        b = NULL;
+    }
+    CloseHandle(f);
+    if (b) *n = (size_t)sz.QuadPart;
+    return b;
+}
+
+static long long offtin(const unsigned char *p)
+{
+    unsigned long long v = 0;
+    int i;
+    for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return (v & 0x8000000000000000ull) ? -(long long)(v & 0x7FFFFFFFFFFFFFFFull) : (long long)v;
+}
+
+/* bspatch over an .h2p (BSDIFF40 with its blocks stored, scripts/convert_tu_patches.py). NULL on a bad patch. */
+static unsigned char *bspatch(const unsigned char *old, size_t old_n, const unsigned char *p, size_t pn, size_t *out_n)
+{
+    long long clen, dlen, nsize, np = 0, op = 0, x, y, z, i;
+    const unsigned char *ctrl, *diff, *extra, *end = p + pn;
+    unsigned char *nw;
+    if (pn < 32 || memcmp(p, "H2TUPAT1", 8)) return NULL;
+    clen = offtin(p + 8); dlen = offtin(p + 16); nsize = offtin(p + 24);
+    if (clen < 0 || dlen < 0 || nsize <= 0 || nsize > (1 << 28) || 32 + clen + dlen > (long long)pn) return NULL;
+    ctrl = p + 32; diff = ctrl + clen; extra = diff + dlen;
+    if (!(nw = malloc((size_t)nsize))) return NULL;
+    while (np < nsize) {
+        if (ctrl + 24 > diff) goto bad;
+        x = offtin(ctrl); y = offtin(ctrl + 8); z = offtin(ctrl + 16); ctrl += 24;
+        if (x < 0 || y < 0 || np + x + y > nsize || diff + x > extra || extra + y > end) goto bad;
+        for (i = 0; i < x; i++)
+            nw[np + i] = (unsigned char)(diff[i] + (op + i >= 0 && op + i < (long long)old_n ? old[op + i] : 0));
+        diff += x; np += x; op += x;
+        memcpy(nw + np, extra, (size_t)y);
+        extra += y; np += y; op += z;
+    }
+    *out_n = (size_t)nsize;
+    return nw;
+bad:
+    free(nw);
+    return NULL;
+}
+
+/* Write a whole buffer as manifest entry i, checked. 1 ok, 0 wrong, -1 cannot write. */
+static int write_entry(int i, const unsigned char *b, size_t n)
+{
+    unsigned char got[32];
+    WCHAR dst[MAX_PATH];
+    HANDLE out;
+    DWORD w;
+    if (n != MANIFEST[i].size || !sha_of(b, n, got) || memcmp(got, MANIFEST[i].sha256, 32)) return 0;
+    dest_path(MANIFEST[i].path, dst);
+    if (!make_dirs_for(dst)) return -1;
+    out = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out == INVALID_HANDLE_VALUE) return -1;
+    if (!WriteFile(out, b, (DWORD)n, &w, NULL) || w != n) { CloseHandle(out); DeleteFileW(dst); return -1; }
+    CloseHandle(out);
+    g_done += n;
+    progress();
+    return 1;
+}
+
+/* The title update's files made from the disc's own with the included patches. 1 done, 0 not possible (no retail
+ * files or no patches), -1 cannot write. */
+static int patch_update(void)
+{
+    WCHAR dir[MAX_PATH], pp[MAX_PATH], *sl;
+    int i, k;
+    if (!GetModuleFileNameW(NULL, dir, MAX_PATH) || !(sl = wcsrchr(dir, L'\\'))) return 0;
+    *sl = 0;
+    for (i = 0; i < MANIFEST_COUNT; i++) {
+        unsigned char *patch, *nw;
+        size_t pn, nn;
+        int r;
+        if (MANIFEST[i].from != 1 || g_have[i]) continue;
+        k = !_stricmp(MANIFEST[i].path, "downloader.xbe") ? 1 : !_stricmp(MANIFEST[i].path, "default.xbe") ? 0 : -1;
+        if (k < 0 || !g_retail[k]) return 0;
+        swprintf_s(pp, MAX_PATH, L"%s\\patches\\%hs.tu15.h2p", dir, MANIFEST[i].path);
+        if (!(patch = read_all(pp, &pn))) return 0;
+        nw = bspatch(g_retail[k], g_retail_n[k], patch, pn, &nn);
+        free(patch);
+        if (!nw) { printf("ERROR The included title update patch for %s is damaged.\n", MANIFEST[i].path); return 0; }
+        r = write_entry(i, nw, nn);
+        free(nw);
+        if (r < 0) return -1;
+        if (!r) { printf("ERROR The patched %s does not match title update 1.5.\n", MANIFEST[i].path); return 0; }
+        g_have[i] = 1;
+    }
+    return have_update();
+}
+
 static int run_import(const WCHAR *source, const WCHAR *destination, const WCHAR *update, const WCHAR *existing)
 {
     DWORD attr;
     int i, r;
     size_t n;
 
-    g_done = 0; g_total = MANIFEST_BYTES; g_base = 0; g_disc_xbe_found = 0;
+    g_done = 0; g_total = MANIFEST_BYTES; g_base = 0; g_disc_xbe_found = 0; g_disc_dl_found = 0;
     memset(g_have, 0, sizeof g_have);
     memset(g_disc, 0, sizeof g_disc);
     wcscpy_s(g_dest, MAX_PATH, destination);
@@ -426,6 +584,11 @@ static int run_import(const WCHAR *source, const WCHAR *destination, const WCHAR
     if (r) return r;
     r = find_update(source, update, existing);
     if (r < 0) { printf("ERROR Could not write to the install folder.\n"); return 6; }
+    if (!r && !(update && *update)) {    /* no update given or found: make it from the disc's own files */
+        r = patch_update();
+        if (r < 0) { printf("ERROR Could not write to the install folder.\n"); return 6; }
+        if (r) printf("PATCHED title update 1.5 made from the disc's files with the included patch\n");
+    }
     if (!r) {
         for (i = 0; i < MANIFEST_COUNT; i++)
             if (MANIFEST[i].from == 1 && !g_have[i]) printf("MISSING %s (title update 1.5)\n", MANIFEST[i].path);

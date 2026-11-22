@@ -59,7 +59,7 @@ ExtraDiskSpaceRequired=4800000000
 
 [Messages]
 WelcomeLabel1=Halo 2 Recomp
-WelcomeLabel2=This installs Halo 2 (title update 1.5), recompiled to run natively on Windows.%n%nThe game's own files are not included. You need your own copy of the Xbox disc (a disc image or a folder with its files) and title update 1.5 from your console's hard drive. Setup asks for both and copies the files it needs, checking each one.
+WelcomeLabel2=This installs Halo 2 (title update 1.5), recompiled to run natively on Windows.%n%nThe game's own files are not included. You need your own copy of the Xbox disc (a disc image or a folder with its files). Title update 1.5 is made from your disc, or Setup uses your own copy from your console's hard drive. Setup copies the files it needs, checking each one.
 FinishedHeadingLabel=Halo 2 Recomp is ready
 
 [Files]
@@ -75,6 +75,9 @@ Source: "..\third_party\SDL3-3.4.20\LICENSE.txt"; DestDir: "{app}"; DestName: "S
 Source: "..\keymap.ini"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\halo2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+; title update 1.5 made from the disc when no update is given (scripts/convert_tu_patches.py); beside the importer
+Source: "patches\default.xbe.tu15.h2p"; DestDir: "{tmp}\patches"; Flags: ignoreversion deleteafterinstall
+Source: "patches\downloader.xbe.tu15.h2p"; DestDir: "{tmp}\patches"; Flags: ignoreversion deleteafterinstall
 #ifdef HasTextures
 ; the hi-res texture pack's download helper, run from Setup's temp folder when the texture task is chosen
 Source: "{#BuildDir}\halo2_texture_download.exe"; Flags: dontcopy
@@ -324,7 +327,7 @@ begin
   { Shown after the folder page, only when that folder already holds the game (filled by FillUpdatePage). }
   UpdatePage := CreateCustomPage(wpSelectDir, 'Halo 2 Recomp is already installed', 'The folder you chose already has the game.');
   SrcPage := CreateCustomPage(wpSelectDir, 'Your copy of the game',
-    'Select your Halo 2 disc and title update 1.5. Setup copies the game files from them and checks each one.');
+    'Select your Halo 2 disc. Setup copies the game files from it, brings them to title update 1.5 and checks each one.');
   L := MakeLabel(SrcPage, 'Halo 2 disc (USA, Europe): a disc image (.iso, .xiso) or a folder containing default.xbe:', 0);
   SrcEdit := TNewEdit.Create(SrcPage);
   SrcEdit.Parent := SrcPage.Surface;
@@ -344,9 +347,9 @@ begin
   B2.Width := ScaleX(110);
   B2.OnClick := @BrowseFolder;
 
-  L := MakeLabel(SrcPage, 'Title update 1.5: its folder from your console''s hard drive (E:\TDATA\4D530064\$u, with ' +
-    'default.xbe and downloader.xbe). Leave it empty if the folder above already has the update, or if the update''s ' +
-    'files are beside the disc image.', B1.Top + B1.Height + ScaleY(18));
+  L := MakeLabel(SrcPage, 'Title update 1.5 (optional): its folder from your console''s hard drive (E:\TDATA\4D530064\$u, ' +
+    'with default.xbe and downloader.xbe). Leave it empty and Setup makes the update from your disc.',
+    B1.Top + B1.Height + ScaleY(18));
   TuEdit := TNewEdit.Create(SrcPage);
   TuEdit.Parent := SrcPage.Surface;
   TuEdit.Left := 0; TuEdit.Top := L.Top + L.Height + ScaleY(4);
@@ -416,7 +419,9 @@ begin
     if MemoDirInfo <> '' then S := S + MemoDirInfo + NewLine + NewLine;
     S := S + 'Game files (about 4.7 GB) from:' + NewLine + Space + Trim(SrcEdit.Text) + NewLine;
     if Trim(TuEdit.Text) <> '' then
-      S := S + 'Title update 1.5 from:' + NewLine + Space + Trim(TuEdit.Text) + NewLine;
+      S := S + 'Title update 1.5 from:' + NewLine + Space + Trim(TuEdit.Text) + NewLine
+    else
+      S := S + 'Title update 1.5: made from your disc' + NewLine;
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
@@ -556,8 +561,8 @@ begin
         4: Msg := 'That is not the supported Halo 2 disc (USA, Europe).';
         5: Msg := 'Some game files are missing or damaged. The dump may be incomplete.';
         6: Msg := 'The game files could not be written to the install folder.';
-        7: Msg := 'Title update 1.5 was not found, or it is not the right one. Select its folder from your console''s ' +
-                  'hard drive (E:\TDATA\4D530064\$u, with default.xbe and downloader.xbe).';
+        7: Msg := 'The title update you selected is not title update 1.5. Select its folder from your console''s ' +
+                  'hard drive (E:\TDATA\4D530064\$u, with default.xbe and downloader.xbe), or leave the field empty.';
       else
         Msg := 'The game files could not be copied.';
       end;

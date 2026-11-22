@@ -198,6 +198,8 @@ def main():
     if not args.skip_build:
         run('cmd', '/c', ROOT / 'build_release.cmd')
     keep_symbols(args.version)
+    # title update 1.5 for players without their own (installer/patches/*.h2p, in the Setup and the ZIP)
+    run(sys.executable, ROOT / 'scripts' / 'convert_tu_patches.py')
     wizard_images()
     OUTPUT.mkdir(exist_ok=True)
     run(iscc, f'/DAppVersion={args.version}', f'/DBuildDir={BUILD}', INSTALLER / 'halo2.iss')

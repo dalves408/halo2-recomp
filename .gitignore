@@ -19,8 +19,9 @@ halo2-decompiled/
 XDK*.exe
 *Recovery*.zip
 
-# Title update delta patches (derived from Microsoft's TU binary; held back pending a decision)
+# Title update delta patches (derived from Microsoft's TU binary): shipped in the release Setup and ZIP, never committed
 *.bsdiff
+*.h2p
 
 # Emulator, BIOS, EEPROM and HDD images
 xemu*/
