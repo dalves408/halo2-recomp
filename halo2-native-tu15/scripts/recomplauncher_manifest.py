@@ -79,7 +79,6 @@ def manifest():
             'program': ['halo2_import.exe'],
             'args': ['--prepare', '{game}', '{install}/game_files'],
             'label': 'Game files from your disc (brought to title update 1.5)',
-            'timeout': 1800,
         },
         'config': [{
             'format': 'ini',

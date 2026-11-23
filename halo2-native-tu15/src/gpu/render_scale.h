@@ -55,6 +55,8 @@ int gpu_scale_integer(void);
 int gpu_scale_blit(ID3D11ShaderResourceView *source, UINT source_width, UINT source_height,
                    ID3D11RenderTargetView *target, UINT target_width, UINT target_height,
                    enum GpuScaleBlitMode mode);
+int gpu_relayout_blit(ID3D11ShaderResourceView *source, ID3D11RenderTargetView *target,
+                      UINT target_width, UINT target_height, const uint32_t k[6]);
 
 #ifdef BRUTEFORCE_D3D11_TESTING
 void gpu_scale_test_fail_init(const char *stage);

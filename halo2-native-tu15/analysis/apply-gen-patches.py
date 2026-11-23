@@ -107,3 +107,52 @@ patch(p, "    xmm3.f[0] = xmm3.f[0] / MEMF(eax + 0x14); /* divss */\n",
       "    { extern float g_h2_wide_fov;   /* true widescreen (hand fix, src/settings.c) */\n"
       "      xmm3.f[0] = xmm3.f[0] * g_h2_wide_fov; }\n",
       "true widescreen (hand fix, src/settings.c)")
+
+# 8. Switch at 0x002346F7 in sub_002346D9 (table 0x0023487D, index = arg - 0xE446): the table
+#    has 16 cases, 8 zero slots, then a live 25th slot (index 24 -> 0x0023473D, `or dl, 0FFh`).
+#    The lifter stops at the first zero slot, so index 24 fell to RECOMP_ITAIL ("[ICALL] Failed
+#    to resolve VA 0x0023473D"), which returned with the 0x220-byte frame still on the stack and
+#    crashed soon after (seen once in a System Link Slayer match).
+p = find("    if (_jt == 0x00234739u) goto loc_00234739;\n")
+patch(p, "    if (_jt == 0x00234739u) goto loc_00234739;\n",
+      "    if (_jt == 0x00234739u) goto loc_00234739;\n"
+      "    if (_jt == 0x0023473Du) goto loc_0023473D; /* slot 24 (hand-extended) */\n",
+      "goto loc_0023473D; /* slot 24 (hand-extended)")
+patch(p, "loc_00234739: ;\n    SET_LO8(edx, 0xF);\n    goto loc_00234740;\n\nloc_00234740: ;",
+      "loc_00234739: ;\n    SET_LO8(edx, 0xF);\n    goto loc_00234740;\n\n"
+      "loc_0023473D: ;\n    SET_LO8(edx, 0xFF); /* or dl, 0FFh (hand-extended slot 24) */\n\n"
+      "loc_00234740: ;", "or dl, 0FFh (hand-extended slot 24)")
+
+# 9. Switch at 0x002445D3 (table 0x002446B0, index = MEM32(esi + 0xC14) - 1): 4 cases, 2 zero
+#    slots, then slots 6-8 (0x002445ED `shr eax, 6`, 0x002445F2 `shr eax, 7`, 0x002445DF).
+#    Same lifter stop at the first zero slot as patch 8; 0x002445ED/F2 had no translation.
+#    (The similar table at 0x0021D498 needs nothing: its extra slots were lifted as small
+#    functions, sub_0021D471/489/48F, which RECOMP_ITAIL finds.)
+p = find("MEM32(esi * 4 + 0x2446B0)")
+patch(p, "    if (_jt == 0x002445E8u) goto loc_002445E8;\n",
+      "    if (_jt == 0x002445E8u) goto loc_002445E8;\n"
+      "    if (_jt == 0x002445EDu) goto loc_002445ED; /* slot 6 (hand-extended) */\n"
+      "    if (_jt == 0x002445F2u) goto loc_002445F2; /* slot 7 (hand-extended) */\n",
+      "goto loc_002445ED; /* slot 6 (hand-extended)")
+patch(p, "    eax = (uint32_t)(eax) >> ((2) & 31u);\n"
+         "    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* shift result */\n"
+         "    goto loc_002445F5;\n\nloc_002445F5: ;",
+      "    eax = (uint32_t)(eax) >> ((2) & 31u);\n"
+      "    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* shift result */\n"
+      "    goto loc_002445F5;\n\n"
+      "loc_002445ED: ;   /* shr eax, 6 (hand-extended slot 6) */\n"
+      "    eax = (uint32_t)(eax) >> 6;\n    goto loc_002445F5;\n\n"
+      "loc_002445F2: ;   /* shr eax, 7 (hand-extended slot 7) */\n"
+      "    eax = (uint32_t)(eax) >> 7;\n\n"
+      "loc_002445F5: ;", "shr eax, 6 (hand-extended slot 6)")
+
+# 10. Test switch RECOMP_HALO2_UNLOCK_LEVELS (src/main.c): sub_0019337D (1.0 0x190565) gives the
+#     highest campaign level any signed-in profile has reached; Select Level lists up to it and a
+#     custom-game map list compares against it. With the switch on it answers 0x7FFF (every level).
+#     It is a cdecl function with no arguments, so the hook returns before its prologue.
+p = find("void sub_0019337D(void)\n{")
+patch(p, "void sub_0019337D(void)\n{\n",
+      "void sub_0019337D(void)\n{\n"
+      "    extern int g_halo2_unlock_levels;   /* test switch (hand hook, src/main.c) */\n"
+      "    if (g_halo2_unlock_levels) { eax = 0x7FFF; esp += 4; return; }\n",
+      "extern int g_halo2_unlock_levels;")

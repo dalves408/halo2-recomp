@@ -606,6 +606,104 @@ int gpu_scale_blit(ID3D11ShaderResourceView *source, UINT source_width, UINT sou
     return 1;
 }
 
+/* Byte-exact relayout of a color surface on the GPU: the target texel at
+ * guest (x, y) holds the bytes at y * target_pitch + x pixels, which the
+ * source (another layout of the same guest memory) has at that offset's own
+ * row and column. Texels the source does not cover are discarded, so they
+ * keep what the target was seeded with. Same pixel size and the same integer
+ * scale on both. k: target pitch and source pitch in pixels, source width
+ * and height in guest pixels, scale x and y. */
+static const char s_relayout_hlsl[] =
+    "Texture2D<float4> rt0 : register(t0);\n"
+    "cbuffer R : register(b0) { uint4 ra; uint4 rb; };\n"
+    "float4 ps_relayout(float4 p : SV_Position) : SV_Target {\n"
+    "  uint px = (uint)p.x, py = (uint)p.y;\n"
+    "  uint gx = px / rb.x, gy = py / rb.y;\n"
+    "  uint o = gy * ra.x + gx;\n"
+    "  uint ay = o / ra.y, ax = o - ay * ra.y;\n"
+    "  if (ay >= ra.w || ax >= ra.z) discard;\n"
+    "  return rt0.Load(int3(ax * rb.x + (px - gx * rb.x), ay * rb.y + (py - gy * rb.y), 0)); }\n";
+static ID3D11PixelShader *s_relayout_ps;
+static ID3D11Buffer *s_relayout_cb;
+static int s_relayout_failed;
+
+int gpu_relayout_blit(ID3D11ShaderResourceView *source, ID3D11RenderTargetView *target,
+                      UINT target_width, UINT target_height, const uint32_t k[6])
+{
+    ID3D11ShaderResourceView *none[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_VIEWPORT viewport;
+    uint32_t constants[8];
+    HRESULT hr;
+
+    if (!s_gpu_ok || s_relayout_failed || !source || !target || !target_width || !target_height ||
+        !k[0] || !k[1] || !k[4] || !k[5])
+        return 0;
+    if (!s_relayout_ps) {
+        ID3DBlob *code = NULL, *errors = NULL;
+        D3D11_BUFFER_DESC buffer;
+        hr = D3DCompile(s_relayout_hlsl, sizeof s_relayout_hlsl - 1, "relayout", NULL, NULL,
+                        "ps_relayout", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+        if (FAILED(hr))
+            fprintf(stderr, "[GPU-SCALE] relayout shader failed: %s\n",
+                    errors ? (const char *)ID3D10Blob_GetBufferPointer(errors) : "unknown error");
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D11Device_CreatePixelShader(s_device, ID3D10Blob_GetBufferPointer(code),
+                                                ID3D10Blob_GetBufferSize(code), NULL, &s_relayout_ps);
+            ID3D10Blob_Release(code);
+        }
+        memset(&buffer, 0, sizeof buffer);
+        buffer.ByteWidth = 32;
+        buffer.Usage = D3D11_USAGE_DYNAMIC;
+        buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateBuffer(s_device, &buffer, NULL, &s_relayout_cb);
+        if (FAILED(hr)) {
+            gpu_d3d11_check_device(s_device, hr, "creating the relayout shader");
+            if (s_relayout_ps) ID3D11PixelShader_Release(s_relayout_ps);
+            s_relayout_ps = NULL;
+            s_relayout_failed = 1;
+            return 0;
+        }
+    }
+    memset(constants, 0, sizeof constants);
+    memcpy(constants, k, 4 * sizeof *k);
+    constants[4] = k[4];
+    constants[5] = k[5];
+    hr = ID3D11DeviceContext_Map(s_context, (ID3D11Resource *)s_relayout_cb, 0,
+                                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        gpu_d3d11_check_device(s_device, hr, "mapping relayout constants");
+        return 0;
+    }
+    memcpy(mapped.pData, constants, sizeof constants);
+    ID3D11DeviceContext_Unmap(s_context, (ID3D11Resource *)s_relayout_cb, 0);
+    viewport.TopLeftX = viewport.TopLeftY = 0;
+    viewport.Width = (float)target_width;
+    viewport.Height = (float)target_height;
+    viewport.MinDepth = 0;
+    viewport.MaxDepth = 1;
+    ID3D11DeviceContext_PSSetShaderResources(s_context, 0, 8, none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_context, 1, &target, NULL);
+    ID3D11DeviceContext_RSSetViewports(s_context, 1, &viewport);
+    ID3D11DeviceContext_IASetInputLayout(s_context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_context, s_vs, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(s_context, NULL, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_context, s_relayout_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_context, 0, 1, &s_relayout_cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_context, 0, 1, &source);
+    ID3D11DeviceContext_RSSetState(s_context, s_rasterizer);
+    ID3D11DeviceContext_OMSetBlendState(s_context, s_blend, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_context, s_depth, 0);
+    ID3D11DeviceContext_Draw(s_context, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_context, 0, 8, none);
+    return 1;
+}
+
 int gpu_scale_integer(void)
 {
     int n;

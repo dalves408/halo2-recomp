@@ -32,6 +32,7 @@
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -463,6 +464,50 @@ static DWORD WINAPI halo2_dsp_probe(LPVOID arg)
 
 int g_halo2_single_vblank;
 
+/* RECOMP_HALO2_UNLOCK_LEVELS=1 (testing; release builds drop RECOMP_*): every
+ * campaign level is offered in Select Level. The hook is at the top of
+ * sub_0019337D (1.0 0x190565, analysis/apply-gen-patches.py), which gives the
+ * highest level any signed-in profile has reached; with this on it answers
+ * 0x7FFF, above every map id. Nothing is written to a profile for that, but
+ * finishing a level the player had not reached would record it, so the run
+ * keeps its profiles and saves apart: RECOMP_SAVE_DIR (UDATA, TDATA,
+ * TitleCache) is pointed at data\SaveData-unlocked, a copy of the player's
+ * UDATA made the first time. The player's own saves are never opened. */
+int g_halo2_unlock_levels;
+
+static void halo2_debug_unlock_setup(void)
+{
+    const char *on = getenv("RECOMP_HALO2_UNLOCK_LEVELS");
+    char root[MAX_PATH], data[MAX_PATH], dir[MAX_PATH];
+    if (!on || *on != '1')
+        return;
+    g_halo2_unlock_levels = 1;
+    halo2_install_root(root, sizeof root);
+    h2_data_path(root, "", data, sizeof data);
+    if (getenv("RECOMP_SAVE_DIR") && *getenv("RECOMP_SAVE_DIR")) {
+        fprintf(stderr, "[UNLOCK] all campaign levels unlocked (test); saves in RECOMP_SAVE_DIR %s\n",
+                getenv("RECOMP_SAVE_DIR"));
+        return;
+    }
+    snprintf(dir, sizeof dir, "%s\\SaveData-unlocked", data);
+    if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) {
+        char from[MAX_PATH + 2] = { 0 }, to[MAX_PATH + 2] = { 0 };
+        SHFILEOPSTRUCTA op;
+        CreateDirectoryA(dir, NULL);
+        snprintf(from, MAX_PATH, "%s\\UDATA", data);          /* double-NUL ended lists */
+        snprintf(to, MAX_PATH, "%s", dir);
+        memset(&op, 0, sizeof op);
+        op.wFunc = FO_COPY;
+        op.pFrom = from;
+        op.pTo = to;
+        op.fFlags = FOF_NO_UI;
+        if (GetFileAttributesA(from) != INVALID_FILE_ATTRIBUTES && SHFileOperationA(&op) != 0)
+            fprintf(stderr, "[UNLOCK] could not copy the profiles to %s\n", dir);
+    }
+    _putenv_s("RECOMP_SAVE_DIR", dir);
+    fprintf(stderr, "[UNLOCK] all campaign levels unlocked (test); profiles and saves use the copy in %s\n", dir);
+}
+
 #ifndef H2_DOWNLOADER
 /* The frame rate: 60 or 30 fps (g_halo2_single_vblank: a frame targets the
  * next vblank instead of every second one, recomp_0029.c).
@@ -695,6 +740,7 @@ int main(void)
         if (!getenv("RECOMP_KEYMAP") && GetFileAttributesA(km) != INVALID_FILE_ATTRIBUTES)
             _putenv_s("RECOMP_KEYMAP", km);
     }
+    halo2_debug_unlock_setup();   /* RECOMP_HALO2_UNLOCK_LEVELS (test builds) */
 #ifndef H2_DOWNLOADER
     h2_mouse_init();          /* mouse aim, off on Xbox Live (src/h2_mouse.c) */
 #endif

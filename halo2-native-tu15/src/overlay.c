@@ -14,8 +14,9 @@
 #include <xinput.h>
 
 /* The F1 menu: a layered window over the game, drawn like Config.exe
- * (halo_ui.c) with two pages, VIDEO and CONTROLS. The game is paused while
- * it is open. Keyboard: arrows, Enter, Esc or F1 to close. Pad: D-pad or
+ * (halo_ui.c) with two pages, VIDEO and CONTROLS. In single player the game
+ * is paused while it is open; in any multiplayer game it keeps running
+ * (game_may_pause). Keyboard: arrows, Enter, Esc or F1 to close. Pad: D-pad or
  * stick, A, B or Start. Mouse: the pointer is freed while a menu is open
  * (mouse aim gives it up); pointing selects, left click changes or presses,
  * right click steps a setting back or clears a key, the wheel moves the
@@ -231,14 +232,72 @@ static void start_update(void)
     }
 }
 
-static void pause_on(void)
+#ifndef H2_DOWNLOADER
+/* Whether the game may be paused under a menu: only in single player. In a
+ * split-screen, co-op, System Link or Xbox Live game the clock keeps running
+ * while the menu is open (player 1 gets no input meanwhile), because a
+ * paused console stops answering the others and drops out of the game.
+ *
+ * Read from the game (TU 1.5 addresses, matched by code bytes to the 1.0
+ * functions the Halo 2 decompilation documents):
+ * - the game options, *(0x4F3218) (1.0 g_4e6948): +0x08 state, 1 = campaign
+ *   (2 multiplayer; the menus are neither); +0x0C mode, 2 to 5 = the game runs
+ *   on the network's ticks (1.0 0x138840, 1.5 0x13B320);
+ * - the controllers, 0x55D770 + 0xC74 * n (1.0 0x54E8E0 + 0xC70 * n), bit 4
+ *   set when a profile is signed in there (1.0 0x190565, 1.5 0x19337D).
+ * So only a campaign with one local player and no network pauses. Menus
+ * (including a System Link or Xbox Live lobby) never do. */
+extern ptrdiff_t g_xbox_mem_offset;
+
+static int game_may_pause(void)
 {
+    const volatile uint8_t *m = (const volatile uint8_t *)g_xbox_mem_offset;
+    int may = 0;
+    if (!m)
+        return 0;
+    __try {
+        uint32_t opt = *(const volatile uint32_t *)(m + 0x4F3218u);
+        int i, local = 0;
+        for (i = 0; i < 4; i++)
+            local += (*(const volatile uint32_t *)(m + 0x55D770u + 0xC74u * i) >> 4) & 1;
+        if (opt && local <= 1) {
+            int32_t state = *(const volatile int32_t *)(m + opt + 0x08);
+            int8_t mode = *(const volatile int8_t *)(m + opt + 0x0C);
+            may = state == 1 && !(mode >= 2 && mode <= 5);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        may = 0;
+    }
+    return may;
+}
+#else
+static int game_may_pause(void) { return 0; }
+#endif
+
+static int s_paused;        /* this menu paused the game (pause_on) */
+
+/* force: the first-start shader build, which pauses wherever it happens. */
+static void pause_on_if(int force)
+{
+    if (!force && !game_may_pause()) {
+        fprintf(stderr, "[OVERLAY] not single player: the game keeps running under the menu\n");
+        return;
+    }
+    s_paused = 1;
     xbox_time_pause_begin();
     g_audio_muted = 1;
 }
 
+static void pause_on(void)
+{
+    pause_on_if(0);
+}
+
 static void pause_off(void)
 {
+    if (!s_paused)
+        return;
+    s_paused = 0;
     g_audio_muted = 0;
     xbox_time_pause_end();
 }
@@ -278,7 +337,7 @@ static DWORD s_build_painted;
 
 static void open_build(void)
 {
-    pause_on();
+    pause_on_if(1);
     InterlockedExchange(&s_listen, 0);
     InterlockedExchange(&s_mode, MODE_BUILD);
     pointer_to_menu();

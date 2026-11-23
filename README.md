@@ -4,7 +4,7 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.7** is out: get `Halo2-Recomp-Setup-1.0.7.exe` from
+**Version 1.0.8** is out: get `Halo2-Recomp-Setup-1.0.8.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
 [hi-res texture pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2) is a
 separate download (below).
@@ -63,6 +63,9 @@ the same `data\settings.ini` and `data\keymap.ini`:
   arrows, the wheel moves between rows, right click steps a setting back or clears a
   binding. On a controller, **hold Back and press Start** to open or close it.
 - F11 or Alt+Enter switches fullscreen in the game and keeps the choice. Esc asks to quit.
+- Esc and F1 pause the game only in single-player campaign (from 1.0.8). In split screen,
+  co-op, System Link and Xbox Live the game keeps running under the menu, so no one drops out;
+  your own player stands still while it is open.
 - **Updates:** the F1 menu and `config.exe` check this repository's latest release (at most
   once every two hours) and show an UPDATE banner when there is a newer one. Choosing it
   runs `Halo2 Updater.exe`, which downloads the release ZIP, copies it over the install and
@@ -88,7 +91,12 @@ The game writes one log per run, keeping the last three and stopping routine lin
 - `[SHADER-KEY]` lines (from 1.0.6): the shaders your PC has built that the release's starter
   list does not have yet. They hold only the game's own shader settings, no names, paths
   or hardware details, and they let the next release build them in the background at the
-  first start instead of mid-level (`scripts/merge_shader_keys.py`).
+  first start instead of mid-level (`scripts/merge_shader_keys.py`);
+- `[XA2]` audio lines (from 1.0.8): the kind of output device (speakers, headphones, HDMI...,
+  never its name), when the game first makes sound, and every 30 seconds its peak level,
+  silent time, underruns and refused buffers. A lost output device or a change of Windows'
+  default output is logged, and the sound moves to the current default device by itself
+  (`RECOMP_AUDIO_FOLLOW_DEFAULT=0` keeps the first one).
 
 Your Windows user name is blanked out. The `.pdb` files stay with the developer:
 `scripts/symbolize_log.py` turns the offsets in a report into function names.
@@ -311,6 +319,9 @@ Recent rendering fixes, each on by default with a switch to turn it off:
 | 60 FPS frame target (the frame rate setting; this forces 30) | `RECOMP_HALO2_SINGLE_VBLANK=0` |
 | Visibility tests answered when the GPU has them, not by waiting at each one (1.0.6: about 18% faster on integrated graphics) | `RECOMP_GPU_ZPASS=sync` |
 | Vertex batches with scattered indices or unaligned layouts repacked for the GPU instead of converted on the CPU (1.0.6) | `RECOMP_GPU_VSH_PACK=0` |
+| A render target that changes size each frame is re-laid out on the GPU and copied back later, not waited for (1.0.8) | `RECOMP_GPU_RELAYOUT_ASYNC=0` |
+| A draw's vertices and indices sent in one upload (1.0.8) | `RECOMP_GPU_GEOM_ONE_MAP=0` |
+| Textures, scissor and clip constants not re-sent when unchanged (1.0.8) | `RECOMP_GPU_BIND_CACHE=0` |
 
 Known issue: the HUD is missing from DEL debug screenshots (development builds) when MSAA
 is on.

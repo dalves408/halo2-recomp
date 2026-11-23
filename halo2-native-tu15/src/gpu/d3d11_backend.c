@@ -100,7 +100,25 @@ static struct {
     ID3D11SamplerState *samplers[4];
     float factor[4];
     UINT stencil;
+    /* Per-draw bindings skipped when unchanged (RECOMP_GPU_BIND_CACHE=0: always
+     * set). Only trusted while valid is set; srv_valid and scissor_valid also
+     * drop when a target bind or a clear changes them behind this cache. */
+    ID3D11ShaderResourceView *srv[4];
+    int srv_valid;
+    D3D11_RECT scissor;
+    int scissor_valid;
+    ID3D11Buffer *window_cb;
 } s_fragment;
+
+static int bind_cache_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_BIND_CACHE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
 
 /* Vertex-program draws in a row (most of a frame) keep their input layout,
  * shaders and constant buffers bound between draws instead of setting them
@@ -542,10 +560,13 @@ static void stats_flip(void)
         {
             extern unsigned s_relayout_rb_n(void), s_relayout_rb_fail_n(void);
             extern unsigned arb_stat(int);
+            extern unsigned rla_stat(int);
             fprintf(stderr, "[GPU-D3D11] relayout readbacks %u, failed %u, write-order wins %u;"
-                            " delayed readbacks %u done %u dropped %u; msaa-resolve samples %u\n",
+                            " delayed readbacks %u done %u dropped %u; msaa-resolve samples %u;"
+                            " queued relayouts %u landed %u dropped %u early %u sync %u covered %u\n",
                     s_relayout_rb_n(), s_relayout_rb_fail_n(), s_order_wins,
-                    arb_stat(0), arb_stat(1), arb_stat(2), s_st.msaa_resolve_samples);
+                    arb_stat(0), arb_stat(1), arb_stat(2), s_st.msaa_resolve_samples,
+                    rla_stat(0), rla_stat(1), rla_stat(2), rla_stat(3), rla_stat(4), rla_stat(5));
         }
         fprintf(stderr, "[GPU-D3D11] %u flips: %u draws (%u extended, %u vertex programs"
                         " [%u raw], %u back to the CPU), %u triangles, %u uploads,"
@@ -1841,6 +1862,10 @@ static uint64_t guest_allocation_identity(uint32_t va, uint32_t *remaining)
     return 0;
 }
 
+static void rla_touch(uint32_t va, uint64_t bytes);   /* async relayout, below */
+static void rla_touch_mode(uint32_t va, uint64_t bytes, int write);
+static int s_rla_hold;      /* get_surf is seeding a relayout's successor from guest memory as it is */
+
 static GuestCopyResult checked_guest_copy(uint32_t va, size_t bytes, void *dest,
                                           int bounds_policy, GuestSpanIdentity *identity,
                                           enum GuestReadKind kind)
@@ -1854,6 +1879,9 @@ static GuestCopyResult checked_guest_copy(uint32_t va, size_t bytes, void *dest,
     int perf = g_bruteforce_perf_counters_enabled;
     uint64_t read_start = 0;
     BOOL readable;
+
+    if (!s_rla_hold)
+        rla_touch(va, bytes);
 
     if (perf) start = bruteforce_perf_clock();
     if (!guest_data_span(va, bytes, &physical) || offset > UINTPTR_MAX - va)
@@ -1935,6 +1963,8 @@ static int guest_physical_bytes_match(uint32_t va, const void *snapshot, size_t 
                                       const GuestSpanIdentity *expected)
 {
     uint64_t physical;
+    if (!s_rla_hold)
+        rla_touch(va, bytes);
     return s_tex_physical_read && !s_tex_strict_bounds && snapshot && expected->allocation &&
            guest_data_span(va, bytes, &physical) == 2 &&
            guest_identity_still_valid(va, bytes, GUEST_BOUNDS_IGNORE, expected) &&
@@ -2431,6 +2461,7 @@ static struct { uint32_t lo, hi; LONG epoch; } s_tex_wr[TEX_WR_RING];
 
 static int guarded_guest_write(void *destination, const void *source, size_t bytes)
 {
+    rla_touch_mode((uint32_t)((uintptr_t)destination - (uintptr_t)GUEST(0)), bytes, 1);
     {
         LONG e = InterlockedIncrement(&s_tex_epoch);
         uintptr_t va = (uintptr_t)destination - (uintptr_t)GUEST(0);
@@ -2707,17 +2738,42 @@ static void relayout_fail(Surf *s, int why)
     }
 }
 
-static int relayout_readback(Surf *s)
+/* Staging textures for relayout readbacks, by guest size. */
+static ID3D11Texture2D *relayout_staging(uint32_t w, uint32_t h, uint32_t bpp)
 {
     static struct { uint32_t w, h, bpp; ID3D11Texture2D *tex; } cache[4];
     static int next;
-    ID3D11Texture2D *st = NULL, *src;
-    D3D11_MAPPED_SUBRESOURCE m;
-    HRESULT hr;
-    size_t row = surf_guest_row(s);
-    uint32_t y;
-    int i, ok = 0;
+    ID3D11Texture2D *st = NULL;
+    int i;
+    for (i = 0; i < 4; ++i)
+        if (cache[i].tex && cache[i].w == w && cache[i].h == h && cache[i].bpp == bpp)
+            return cache[i].tex;
+    {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = surf_format(bpp);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+            return NULL;
+    }
+    if (cache[next].tex)
+        ID3D11Texture2D_Release(cache[next].tex);   /* a pending copy holds its own reference */
+    cache[next].tex = st;
+    cache[next].w = w;
+    cache[next].h = h;
+    cache[next].bpp = bpp;
+    next = (next + 1) % 4;
+    return st;
+}
 
+static int relayout_checks(Surf *s)
+{
     /* Guest images can be 640x480x4 (1.2 MB), so the old 1 MB cap rejected
      * every full framebuffer. Scale > 1x also used to bail because pw!=w. */
     if (!s_dev || !s->tex) {
@@ -2736,32 +2792,26 @@ static int relayout_readback(Surf *s)
         relayout_fail(s, RELAYOUT_FAIL_SHADOW);
         return 0;
     }
-    for (i = 0; i < 4; ++i)
-        if (cache[i].tex && cache[i].w == s->w && cache[i].h == s->h && cache[i].bpp == s->bpp)
-            st = cache[i].tex;
-    if (!st) {
-        D3D11_TEXTURE2D_DESC td;
-        memset(&td, 0, sizeof td);
-        td.Width = s->w;
-        td.Height = s->h;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = surf_format(s->bpp);
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_STAGING;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        hr = ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st);
-        if (FAILED(hr)) {
-            relayout_fail(s, RELAYOUT_FAIL_STAGING);
-            return 0;
-        }
-        if (cache[next].tex)
-            ID3D11Texture2D_Release(cache[next].tex);
-        cache[next].tex = st;
-        cache[next].w = s->w;
-        cache[next].h = s->h;
-        cache[next].bpp = s->bpp;
-        next = (next + 1) % 4;
+    return 1;
+}
+
+static void rla_complete(void);
+
+static int relayout_readback(Surf *s)
+{
+    ID3D11Texture2D *st, *src;
+    D3D11_MAPPED_SUBRESOURCE m;
+    HRESULT hr;
+    size_t row = surf_guest_row(s);
+    uint32_t y;
+    int ok = 0;
+
+    rla_complete();
+    if (!relayout_checks(s))
+        return 0;
+    if (!(st = relayout_staging(s->w, s->h, s->bpp))) {
+        relayout_fail(s, RELAYOUT_FAIL_STAGING);
+        return 0;
     }
     surf_resolve(s);
     src = s->tex;
@@ -2787,6 +2837,233 @@ static int relayout_readback(Surf *s)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     if (ok) s_relayout_rb++; else relayout_fail(s, RELAYOUT_FAIL_WRITE);
+    return ok;
+}
+
+static int relayout_readback_timed(Surf *s)
+{
+    RPZ_BEGIN(rpz_u2);
+    int r = relayout_readback(s);
+    RPZ_END(RPZ_USER2, rpz_u2);
+    return r;
+}
+
+/* ---- relayout without waiting for the GPU ---------------------------------
+ *
+ * Halo 2 draws two passes a frame into one buffer (82B1B000) with different
+ * layouts, 128x128 and 160x120. Each switch read the old layout back
+ * (CopyResource + Map, which waits for everything the GPU has queued) so the
+ * new layout could be seeded from guest memory: two pipeline drains a frame,
+ * about 8% of the command thread on a Pentium J5005.
+ *
+ * Now the copy to the staging texture is queued and the CPU carries on. At 1x
+ * the new layout is seeded on the GPU from the old texture
+ * (gpu_relayout_blit: the same bytes at the same guest addresses, which is
+ * what the guest-memory seed gave); above 1x the new layout already starts
+ * from the old texture (migrate). The staged bytes reach guest memory later:
+ * after the next flip's readback (when the GPU has finished anyway), at the
+ * next relayout, or before the backend reads or writes guest memory that
+ * overlaps them. The successor surface's shadow gets the same bytes then, as
+ * the synchronous path's snapshot would have given it.
+ * RECOMP_GPU_RELAYOUT_ASYNC=0 restores the synchronous readback. */
+static struct {
+    int pending;
+    uint32_t va, w, h, pitch, bpp;
+    GuestSpanIdentity identity;
+    ID3D11Texture2D *st;            /* referenced while pending */
+    uint32_t lo;                    /* guest range, masked as s_tex_wr */
+    uint64_t hi;
+    int succ;                       /* successor surface slot, or -1 */
+    uint32_t succ_w, succ_h, succ_pitch, succ_bpp;
+} s_rla;
+static unsigned s_rla_issued, s_rla_done, s_rla_dropped, s_rla_early, s_rla_sync, s_rla_covered;
+unsigned rla_stat(int i)
+{
+    return i == 0 ? s_rla_issued : i == 1 ? s_rla_done : i == 2 ? s_rla_dropped :
+           i == 3 ? s_rla_early : i == 4 ? s_rla_sync : s_rla_covered;
+}
+
+static int relayout_async_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_RELAYOUT_ASYNC");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* The successor's shadow gets the staged bytes where its rows cover them. */
+static void rla_successor_shadow(const uint8_t *data, size_t data_pitch)
+{
+    Surf *b;
+    size_t arow = (size_t)s_rla.w * s_rla.bpp, brow;
+    uint32_t y;
+    if (s_rla.succ < 0 || s_rla.succ >= s_nsurf)
+        return;
+    b = &s_surf[s_rla.succ];
+    if (b->va != s_rla.va || b->w != s_rla.succ_w || b->h != s_rla.succ_h ||
+        b->pitch != s_rla.succ_pitch || b->bpp != s_rla.succ_bpp || !b->guest_shadow ||
+        !b->pitch)
+        return;
+    brow = surf_guest_row(b);
+    if (b->guest_shadow_bytes != brow * b->h)
+        return;
+    for (y = 0; y < s_rla.h; ++y) {
+        size_t base = (size_t)y * s_rla.pitch, g = base, end = base + arow;
+        const uint8_t *src = data + (size_t)y * data_pitch;
+        while (g < end) {
+            size_t by = g / b->pitch, bx = g % b->pitch, n;
+            if (by >= b->h)
+                return;
+            n = b->pitch - bx;                    /* bytes to the end of this guest row */
+            if (n > end - g)
+                n = end - g;
+            if (bx < brow) {
+                size_t m = brow - bx < n ? brow - bx : n;
+                memcpy(b->guest_shadow + by * brow + bx, src + (g - base), m);
+            }
+            g += n;
+        }
+    }
+}
+
+static void rla_complete(void)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    Surf tmp;
+    int ok = 0;
+    if (!s_rla.pending)
+        return;
+    s_rla.pending = 0;                  /* the writes below come back through the hooks */
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_rla.st, 0, D3D11_MAP_READ,
+                                          0, &m))) {
+        memset(&tmp, 0, sizeof tmp);
+        tmp.va = s_rla.va;
+        tmp.w = s_rla.w;
+        tmp.h = s_rla.h;
+        tmp.pitch = s_rla.pitch;
+        tmp.bpp = s_rla.bpp;
+        tmp.identity = s_rla.identity;
+        if (checked_write_guest_surface(&tmp, m.pData, m.RowPitch)) {
+            rla_successor_shadow((const uint8_t *)m.pData, m.RowPitch);
+            ok = 1;
+        }
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_rla.st, 0);
+    }
+    ID3D11Texture2D_Release(s_rla.st);
+    s_rla.st = NULL;
+    if (ok) {
+        s_rla_done++;
+        s_relayout_rb++;
+    } else {
+        s_rla_dropped++;
+        s_relayout_rb_fail++;
+    }
+}
+
+/* Before the backend touches guest bytes [va, va+bytes): staged bytes there go
+ * first. A write that covers all of them (a full clear of the successor) makes
+ * them moot: they are dropped instead, with no wait. */
+static void rla_touch_mode(uint32_t va, uint64_t bytes, int write)
+{
+    uint32_t lo;
+    uint64_t hi;
+    if (!s_rla.pending || !bytes)
+        return;
+    lo = va & TEX_WR_MASK;
+    hi = (uint64_t)lo + bytes;
+    if (hi > TEX_WR_MASK + 1ull || (lo < s_rla.hi && s_rla.lo < hi)) {
+        if (write && hi <= TEX_WR_MASK + 1ull && lo <= s_rla.lo && hi >= s_rla.hi) {
+            s_rla.pending = 0;
+            ID3D11Texture2D_Release(s_rla.st);
+            s_rla.st = NULL;
+            s_rla_covered++;
+            return;
+        }
+        s_rla_early++;
+        rla_complete();
+    }
+}
+
+static void rla_touch(uint32_t va, uint64_t bytes)
+{
+    rla_touch_mode(va, bytes, 0);
+}
+
+/* Queue the old layout's readback. 1: queued (at 1x the caller then seeds the
+ * successor on the GPU); 0: use the synchronous readback. */
+static int relayout_issue(Surf *s, int need_gpu_seed)
+{
+    ID3D11Texture2D *st, *src;
+    size_t span;
+    rla_complete();
+    if (need_gpu_seed && (s->bpp != 4 || s->pitch % 4 || s->pw != s->w || s->ph != s->h))
+        return 0;
+    if (!relayout_checks(s) || !surface_guest_span(s, &span) ||
+        !(st = relayout_staging(s->w, s->h, s->bpp)))
+        return 0;
+    surf_resolve(s);
+    src = s->tex;
+    if (s->pw != s->w || s->ph != s->h) {
+        src = readback_source(s);
+        if (!src)
+            return 0;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)src);
+    ID3D11Texture2D_AddRef(st);
+    s_rla.st = st;
+    s_rla.va = s->va;
+    s_rla.w = s->w;
+    s_rla.h = s->h;
+    s_rla.pitch = s->pitch;
+    s_rla.bpp = s->bpp;
+    s_rla.identity = s->identity;
+    s_rla.lo = s->va & TEX_WR_MASK;
+    s_rla.hi = (uint64_t)s_rla.lo + span;
+    if (s_rla.hi > TEX_WR_MASK + 1ull) {        /* wraps the mask: everything overlaps */
+        s_rla.lo = 0;
+        s_rla.hi = TEX_WR_MASK + 1ull;
+    }
+    s_rla.succ = -1;
+    s_rla.pending = 1;
+    s->gpu_dirty = 0;                   /* as the synchronous readback leaves it */
+    s->guest_exact = 0;
+    s->guest_check_gen = s_gen;
+    s_rla_issued++;
+    return 1;
+}
+
+/* The successor at 1x: its texture holds guest memory as it is now (seeded by
+ * create_surf); the old layout's bytes go over it where the old one covered. */
+static int relayout_gpu_seed(Surf *old, Surf *next)
+{
+    uint32_t k[6];
+    int counting, ok;
+    if (next->bpp != 4 || next->pitch % 4 || next->pw != next->w || next->ph != next->h ||
+        !old->srv || !next->rtv)
+        return 0;
+    /* The blit resources are made with a render scale above 1x; at 1x on first use. */
+    if (!gpu_scale_gpu_init(s_dev, s_ctx))
+        return 0;
+    k[0] = next->pitch / 4;
+    k[1] = old->pitch / 4;
+    k[2] = old->w;
+    k[3] = old->h;
+    k[4] = 1;
+    k[5] = 1;
+    counting = query_suspend_clear();
+    s_fragment.valid = 0;
+    s_pipe.valid = 0;
+    ok = gpu_relayout_blit(old->srv, next->rtv, next->pw, next->ph, k);
+    if (ok && next->msaa_rtv && next->srv) {
+        ok = d3d_scale_blit(next->srv, next->pw, next->ph, next->msaa_rtv, next->pw, next->ph,
+                            GPU_SCALE_BLIT_BILINEAR);
+        if (ok)
+            next->msaa_dirty = 0;
+    }
+    restore_targets();
+    query_resume_clear(counting);
     return ok;
 }
 
@@ -2823,12 +3100,31 @@ static Surf *get_surf(const Nv2aSurface *in)
         int guest_layout_changed =
             stale || s->bpp != bpp || s->w != w || s->h != h || s->pitch != in->pitch;
         int migrate = !stale && gpu_scale_requested() && s->srv;
-        int uncertain = 0;
-        if (guest_layout_changed && !stale && s->tex && s->gpu_dirty &&
-            surf_relayout_enabled() && relayout_readback(s))
-            s->alias_uncertain = 0;
+        int uncertain = 0, rla = 0, rla_seeded = 0;
+        {   /* debug: RECOMP_GPU_RELAYOUT_LOG=<n> logs the first n layout switches */
+            static int lim = -1, logged;
+            if (lim < 0) { const char *e = getenv("RECOMP_GPU_RELAYOUT_LOG"); lim = e ? atoi(e) : 0; }
+            if (logged < lim && guest_layout_changed && !stale) {
+                ++logged;
+                fprintf(stderr, "[RELAYOUT-LOG] g%u %08X %ux%u p%u b%u dirty %d -> %ux%u p%u b%u\n",
+                        s_gen, s->va, s->w, s->h, s->pitch, s->bpp, s->gpu_dirty, w, h,
+                        in->pitch, bpp);
+            }
+        }
+        if (guest_layout_changed && !stale && s->tex && s->gpu_dirty && surf_relayout_enabled()) {
+            if (relayout_async_enabled() &&
+                (migrate || (bpp == 4 && in->pitch % 4 == 0 && pw == w && ph == h)) &&
+                relayout_issue(s, !migrate)) {
+                rla = 1;
+                s_rla_hold = 1;
+                s->alias_uncertain = 0;
+            } else if (relayout_readback_timed(s))
+                s->alias_uncertain = 0;
+        }
         if (guest_layout_changed && !stale && s->tex) {
-            int changed = guest_surface_changed(s);
+            /* After a queued readback guest memory is as the synchronous one
+             * leaves it once the bytes land, so it counts as unchanged. */
+            int changed = rla ? (surf_identity_current(s) ? 0 : -1) : guest_surface_changed(s);
             if (changed < 0 || (changed && s->gpu_dirty) || (s->gpu_dirty && !migrate))
                 uncertain = 1;
             if (changed > 0 && !s->gpu_dirty)
@@ -2872,8 +3168,21 @@ static Surf *get_surf(const Nv2aSurface *in)
             release_surf(&replacement);
             if (guest_layout_changed)
                 release_surf_guest(&replacement);
+            if (rla) {      /* the old surface stays: the bytes land in it now */
+                s_rla_hold = 0;
+                s_rla.succ = (int)(s - s_surf);
+                s_rla.succ_w = s->w; s_rla.succ_h = s->h;
+                s_rla.succ_pitch = s->pitch; s_rla.succ_bpp = s->bpp;
+                s_rla_sync++;
+                rla_complete();
+            }
             fprintf(stderr, "[GPU-D3D11] retaining prior color resources for %08X\n", s->va);
             return NULL;
+        }
+        if (rla && !migrate) {
+            rla_seeded = relayout_gpu_seed(s, &replacement);
+            if (rla_seeded)
+                replacement.gpu_dirty = 1;
         }
         if (guest_layout_changed && migrate && guest_surface_changed(s) != 0)
             replacement.alias_uncertain = 1;
@@ -2888,6 +3197,23 @@ static Surf *get_surf(const Nv2aSurface *in)
         if (guest_layout_changed)
             release_surf_guest(s);
         *s = replacement;
+        if (rla) {
+            s_rla_hold = 0;
+            s_rla.succ = (int)(s - s_surf);
+            s_rla.succ_w = s->w; s_rla.succ_h = s->h;
+            s_rla.succ_pitch = s->pitch; s_rla.succ_bpp = s->bpp;
+            /* Its seed was compared with guest memory just now (validate_seed_shadow). */
+            s->guest_check_gen = s_gen;
+            if (!migrate && !rla_seeded) {
+                /* No GPU seed: land the bytes now and seed from them, as before. */
+                s_rla_sync++;
+                rla_complete();
+                if (s->guest_shadow && s->tex && s->pw == s->w && s->ph == s->h)
+                    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s->tex, 0, NULL,
+                                                          s->guest_shadow,
+                                                          (UINT)surf_guest_row(s), 0);
+            }
+        }
     }
     if (s) {
         s->aa_sx = aa_sx;
@@ -3880,6 +4206,7 @@ static ID3D11ShaderResourceView *get_packed_depth_texture(const Nv2aTexture *t, 
     }
     views[1] = *stencil;
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    s_fragment.srv_valid = 0;
     ID3D11DeviceContext_CSSetShader(s_ctx, packed_depth_cs(layout), NULL, 0);
     ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 2, views);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &d->packed_uav, NULL);
@@ -4066,6 +4393,7 @@ static void bind_targets(Surf *s, Depth *d)
 
     /* A surface about to be drawn into must not stay bound as a texture. */
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    s_fragment.srv_valid = 0;
     if (s->msaa_rtv && (!d || (d->msaa_dsv && d->msaa_count == s->msaa_count))) {
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s->msaa_rtv,
                                                d ? d->msaa_dsv : NULL);
@@ -4106,7 +4434,12 @@ static void apply_scissor(const Nv2aSurface *s)
     if (rtlog_on())
         fprintf(stderr, "[RTLOG] g%u clip %08X %u,%u %ux%u of %ux%u\n", s_gen, s_cur->va, s->clip_x, s->clip_y,
                 s->width, s->height, s_cur->w, s_cur->h);
+    if (bind_cache_on() && s_fragment.valid && s_fragment.scissor_valid &&
+        !memcmp(&s_fragment.scissor, &r, sizeof r))
+        return;
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
+    s_fragment.scissor = r;
+    s_fragment.scissor_valid = 1;
 }
 
 static void surface_clear_rect(const Nv2aSurface *s, const Surf *surf, D3D11_RECT *rect)
@@ -6357,10 +6690,13 @@ static int ring_ensure(UINT bytes)
     if (s_vring) ID3D11Buffer_Release(s_vring);
     s_vring = NULL;
     s_vring_size = 0;
+    s_pipe.valid = 0;                   /* a new buffer to bind */
     memset(&bd, 0, sizeof bd);
     bd.ByteWidth = want;
     bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    /* Vertex-program draws put their indices in the same ring, so a draw
+     * maps one buffer instead of two (geom_push). */
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (gpu_call_failed(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vring),
                         "creating vertex ring"))
@@ -6542,6 +6878,7 @@ static void clear_draw(const D3D11_RECT *rect, uint32_t flags, uint32_t argb,
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_clear_cb);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, rect);
+    s_fragment.scissor_valid = 0;
     ID3D11DeviceContext_OMSetBlendState(s_ctx, blend, NULL, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, (UINT8)zstencil);
     counting = query_suspend_clear();
@@ -6704,7 +7041,10 @@ static int set_window_clip(const Nv2aSurface *s)
         memcpy(&last, &c, sizeof c);
         have_last = 1;
     }
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_window_cb);
+    if (!bind_cache_on() || !s_fragment.valid || s_fragment.window_cb != s_window_cb) {
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_window_cb);
+        s_fragment.window_cb = s_window_cb;
+    }
     return 1;
 }
 
@@ -6857,6 +7197,10 @@ static void bind_fragment_pipeline(ID3D11PixelShader *ps, ID3D11RasterizerState 
                                    UINT stencil, const float factor[4],
                                    ID3D11SamplerState *const samplers[4])
 {
+    if (!s_fragment.valid) {
+        s_fragment.srv_valid = 0;
+        s_fragment.scissor_valid = 0;
+    }
     if (!s_fragment.valid || s_fragment.ps != ps)
         ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
     if (!s_fragment.valid)
@@ -6925,14 +7269,20 @@ static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
 #endif
         return 0;
     }
-    if (!begin(s, b->state, 0)) {
+    RPZ_BEGIN(rpz_u0);
+    int began = begin(s, b->state, 0);
+    RPZ_END(RPZ_USER0, rpz_u0);
+    if (!began) {
         s_xrej[1]++;
 #ifdef RECOMP_DEBUG_TOOLS
         debug_note("declined", "begin_failed", s->color_va, 0, 0, 0, 1);
 #endif
         return 0;
     }
-    if (!sync_guest_surface(s_cur, 0) || !set_window_clip(s)) {
+    RPZ_BEGIN(rpz_u1);
+    int synced = sync_guest_surface(s_cur, 0) && set_window_clip(s);
+    RPZ_END(RPZ_USER1, rpz_u1);
+    if (!synced) {
         s_xrej[2]++;
 #ifdef RECOMP_DEBUG_TOOLS
         debug_note("declined", "guest_sync_clip", s->color_va, 0, 0, 0, 2);
@@ -7077,6 +7427,7 @@ static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
     if (texture_started)
         s_st.texture_prepare_ticks += bruteforce_perf_clock() - texture_started;
     RPZ_END(RPZ_DRAW_TEX, rpz_tex);
+    RPZ_BEGIN(rpz_u3);
     ps = get_rc_shader(&key);
     if (!ps) {
         s_xrej[4]++;
@@ -7112,7 +7463,13 @@ static int xdraw_prepare_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
     blend_factor(rs, bf);
     bind_fragment_pipeline(ps, rst, get_required_blend(rs), ds,
                            rs->stencil_ref & 0xFF, bf, ss);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    if (!bind_cache_on() || !s_fragment.srv_valid ||
+        memcmp(s_fragment.srv, srv, sizeof s_fragment.srv)) {
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+        memcpy(s_fragment.srv, srv, sizeof s_fragment.srv);
+        s_fragment.srv_valid = 1;
+    }
+    RPZ_END(RPZ_USER3, rpz_u3);
     return 1;
 }
 
@@ -7660,6 +8017,56 @@ static UINT index_push(const uint32_t *data, UINT count)
     return off;
 }
 
+/* A vertex-program draw's streams and its indices in one map of the vertex
+ * ring (it is an index buffer too): one Map/Unmap a draw instead of two, which
+ * the driver charges for on slow CPUs. RECOMP_GPU_GEOM_ONE_MAP=0 maps the
+ * streams and the index ring separately as before. Returns the indices' byte
+ * offset, or ~0u. */
+static int geom_one_map(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_GEOM_ONE_MAP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static UINT geom_push(const Nv2aXVsBatch *b)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+    UINT pos[NV2A_XVS_MAX_STREAMS], total = 0, base, k, ipos, ibytes = b->nindices * 4u;
+
+    for (k = 0; k < b->nstreams; k++) {
+        total = (total + 15u) & ~15u;
+        pos[k] = total;
+        total += b->streams[k].bytes;
+    }
+    total = (total + 15u) & ~15u;
+    ipos = total;
+    total += ibytes;
+    if (!ibytes || !ring_ensure(total))
+        return ~0u;
+    base = (s_vring_pos + 15u) & ~15u;
+    if (base > s_vring_size || s_vring_size - base < total) {
+        mode = D3D11_MAP_WRITE_DISCARD;
+        base = 0;
+    }
+    if (gpu_call_failed(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vring, 0, mode, 0, &m),
+                        "mapping vertex streams and indices"))
+        return ~0u;
+    for (k = 0; k < b->nstreams; k++) {
+        memcpy((uint8_t *)m.pData + base + pos[k], b->streams[k].data, b->streams[k].bytes);
+        s_vlast_strides[k] = b->streams[k].stride;
+        s_vlast_offs[k] = base + pos[k];
+    }
+    memcpy((uint8_t *)m.pData + base + ipos, b->indices, ibytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vring, 0);
+    s_vring_pos = base + total;
+    return base + ipos;
+}
+
 /* Several streams into the vertex ring at once, 16-byte aligned each. */
 static int vertex_streams_push(const Nv2aXVsBatch *b)
 {
@@ -7695,7 +8102,7 @@ static int vertex_streams_push(const Nv2aXVsBatch *b)
 static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
 {
     Vsh *v;
-    ID3D11Buffer *cbs[2];
+    ID3D11Buffer *cbs[2], *ib;
     UINT voff = 0, ioff, stride;
     ID3D11InputLayout *il;
     int r;
@@ -7835,13 +8242,19 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
     }
     stride = 16u * v->nin;
     il = v->il;
+    ioff = ~0u;
+    ib = NULL;
     if (b->nstreams && v->nin) {
         ID3D11Buffer *bufs[NV2A_XVS_MAX_STREAMS];
         static int conv_bound;
         UINT k;
         if (b->nstreams > NV2A_XVS_MAX_STREAMS || !(il = vfetch_layout(v, b)))
             return 0;
-        if (!vertex_streams_push(b))
+        if (geom_one_map()) {
+            if ((ioff = geom_push(b)) == ~0u)
+                return 0;
+            ib = s_vring;
+        } else if (!vertex_streams_push(b))
             return 0;
         for (k = 0; k < b->nstreams; k++)
             bufs[k] = s_vring;
@@ -7867,7 +8280,10 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         }
         s_vlast_raw = 0;
     }
-    ioff = index_push(b->indices, b->nindices);
+    if (ib != s_vring) {                /* indices in their own ring */
+        ioff = index_push(b->indices, b->nindices);
+        ib = s_iring;
+    }
     RPZ_END(RPZ_DRAW_VERTEX, rpz_vtx);
     if (ioff == ~0u)
         return 0;
@@ -7875,9 +8291,13 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
     cbs[1] = s_kcb;
     {
         ID3D11GeometryShader *gs = vsh_filter_gs();
+        static ID3D11Buffer *ib_bound;
+        if (!s_pipe.valid || ib_bound != ib) {
+            ID3D11DeviceContext_IASetIndexBuffer(s_ctx, ib, DXGI_FORMAT_R32_UINT, 0);
+            ib_bound = ib;
+        }
         if (!s_pipe.valid) {
             ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_iring, DXGI_FORMAT_R32_UINT, 0);
             ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
             ID3D11DeviceContext_GSSetConstantBuffers(s_ctx, 1, 1, &cbs[1]);   /* wideinfo */
         }
@@ -8898,9 +9318,13 @@ static void publish_shared_present(Surf *sf)
             return;
         }
     }
-    if (halo2_fxaa_enabled())
+    if (halo2_fxaa_enabled()) {
+        /* FXAA sets its own shaders, constants, sampler and output state
+         * and does not put them back. */
         s_pipe.valid = 0;
-        halo2_fxaa_apply(s_dev, s_ctx, s_present_shared, s_present_rtv, width, height);
+        s_fragment.valid = 0;
+    }
+    halo2_fxaa_apply(s_dev, s_ctx, s_present_shared, s_present_rtv, width, height);
     ID3D11DeviceContext_Flush(s_ctx);
 #ifdef RECOMP_DEBUG_TOOLS
     if (halo2_screenshot_enabled())
@@ -10029,6 +10453,7 @@ static int d3d_flip_readback(uint32_t color_va)
     }
     int tracked = find_surf(color_va) != NULL;
     int ok = d3d_readback(color_va);
+    rla_complete();         /* queued relayout bytes: the GPU is past them by now */
     if (tracked && !ok) {
         fprintf(stderr, "[GPU-D3D11] cannot make tracked color surface %08X guest-visible;"
                         " stopping before presentation, dumps or frame statistics\n", color_va);
