@@ -16,7 +16,12 @@ typedef struct Halo2Settings {
     int mouse_aim;        /* 0/1: mouse turns the view (h2_mouse.c); off in Xbox Live */
     int mouse_sens;       /* percent, 10..500 */
     int mouse_invert;     /* 0/1: mouse up looks down */
+    int frame_rate;       /* 0 Auto (60, or 30 when the PC can't hold 60), 1 60 fps, 2 30 fps; live */
 } Halo2Settings;
+
+/* The frame rate the game targets now (main.c): 60 or 30. With the Auto
+ * setting, *auto_low says it went to 30 because this PC could not hold 60. */
+int halo2_fps_current(int *auto_low);
 
 /* Settings live in the install folder: <install>\SaveData\settings.ini
  * (the folder that holds build-ninja\). An older %LOCALAPPDATA% copy is

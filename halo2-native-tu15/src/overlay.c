@@ -33,13 +33,13 @@ extern volatile int g_audio_muted;
 extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
-enum { IT_SCALE, IT_FS, IT_VSYNC, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
 enum { MODE_NONE, MODE_QUIT, MODE_SET };
 enum { PAGE_VIDEO, PAGE_CONTROLS };
 enum { M_AIM, M_SENS, M_INV };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
-    "Render scale", "Fullscreen", "VSync", "Anisotropic filter", "FXAA", "MSAA",
+    "Render scale", "Fullscreen", "VSync", "Frame rate", "Anisotropic filter", "FXAA", "MSAA",
     "Widescreen (at next start)", "Hi-res textures", "Close menu", "Quit game"
 };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
@@ -338,6 +338,15 @@ static void item_text(int item, char *out, size_t n)
     case IT_SCALE: snprintf(out, n, "%dx", clamp_to(s_edit.resolution_scale, 1, 5)); break;
     case IT_FS: snprintf(out, n, "%s", OFFON[s_edit.fullscreen ? 1 : 0]); break;
     case IT_VSYNC: snprintf(out, n, "%s", OFFON[s_edit.vsync ? 1 : 0]); break;
+    case IT_FPS: {
+        int low = 0, now = halo2_fps_current(&low);
+        if (s_edit.frame_rate == 1 || s_edit.frame_rate == 2)
+            snprintf(out, n, "%s fps%s", s_edit.frame_rate == 1 ? "60" : "30",
+                     s_edit.frame_rate == 1 && now == 30 ? " (30 in Xbox Live)" : "");
+        else
+            snprintf(out, n, "Auto (%d fps)", now);
+        break;
+    }
     case IT_ANISO: snprintf(out, n, "%s", ANISO_TXT[aniso_ix(s_edit.anisotropy)]); break;
     case IT_FXAA: snprintf(out, n, "%s", OFFON[s_edit.fxaa ? 1 : 0]); break;
     case IT_MSAA: snprintf(out, n, "%s", MSAA_TXT[msaa_ix(s_edit.msaa)]); break;
@@ -384,6 +393,7 @@ static void nudge(int item, int dir)
     case IT_SCALE: s_edit.resolution_scale = clamp_to(s_edit.resolution_scale + dir, 1, 5); break;
     case IT_FS: s_edit.fullscreen = !s_edit.fullscreen; break;
     case IT_VSYNC: s_edit.vsync = !s_edit.vsync; break;
+    case IT_FPS: s_edit.frame_rate = (clamp_to(s_edit.frame_rate, 0, 2) + dir + 3) % 3; break;   /* Auto, 60, 30 */
     case IT_ANISO:
         v = aniso_ix(s_edit.anisotropy) + dir;
         s_edit.anisotropy = ANISO_VAL[clamp_to(v, 0, 4)];
@@ -496,7 +506,7 @@ static void draw_settings(HDC hdc, int w, int h)
         for (i = 0; i < IT_COUNT; i++) {
             RECT row;
             char val[40];
-            int top = ry + i * ui_px(&f, 40) + (i >= IT_CLOSE ? ui_px(&f, 20) : 0);
+            int top = ry + i * ui_px(&f, 38) + (i >= IT_CLOSE ? ui_px(&f, 18) : 0);
             SetRect(&row, rx0, top, rx1, top + ui_px(&f, 34));
             s_row_r[i] = row;
             SetRect(&s_prev_r[i], 0, 0, 0, 0);
@@ -770,6 +780,22 @@ static void poll_pad(void)
     }
     press = (WORD)(b & ~s_pad_prev);
     s_pad_prev = b;
+    /* A controller has no F1: hold BACK and press START for the settings
+     * menu, and again to close it. The pad is then ignored until every
+     * button is up, so the START still held does not act in the menu; the
+     * game never sees that START (overrides/xinput_device.c hides START
+     * while BACK is held). */
+    if ((b & 0x0020) && (press & 0x0010) && !s_listen && mode != MODE_QUIT) {
+        if (mode == MODE_SET)
+            close_overlay();
+        else
+            open_settings();
+        s_unblock = 1;
+        s_repeat_dir = 0;
+        if (s_hwnd)
+            paint();
+        return;
+    }
     if (mode == MODE_NONE || s_listen)
         return;
 

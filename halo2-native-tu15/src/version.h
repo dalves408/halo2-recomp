@@ -3,7 +3,7 @@
 #ifndef H2N_VERSION_H
 #define H2N_VERSION_H
 
-#define H2N_VERSION "1.0.5"
+#define H2N_VERSION "1.0.6"
 
 /* The GitHub repository whose latest release the menus check ("owner/name").
  * Empty: the check is off and nothing is contacted. Each release carries

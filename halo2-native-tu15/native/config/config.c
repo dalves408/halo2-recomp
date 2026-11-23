@@ -28,13 +28,14 @@ static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 5
 #define SENS_N 11
 
 /* The settings as indexes into the lists above. */
-enum { V_SCALE, V_FS, V_VSYNC, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_HIRES, V_COUNT };
+static const char *const FPS_TXT[] = { "Auto", "60 fps", "30 fps" };
+enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_HIRES, V_COUNT };
 static const char *const V_LABEL[V_COUNT] = {
-    "Render scale", "Fullscreen", "VSync", "Anisotropic filter", "FXAA", "MSAA",
+    "Render scale", "Fullscreen", "VSync", "Frame rate", "Anisotropic filter", "FXAA", "MSAA",
     "Widescreen (at next start)", "Hi-res textures (at next start)",
 };
-static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT, OFFON };
-static const int V_N[V_COUNT] = { 5, 2, 2, 5, 2, 4, 4, 2 };
+static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT, OFFON };
+static const int V_N[V_COUNT] = { 5, 2, 2, 3, 5, 2, 4, 4, 2 };
 static int s_v[V_COUNT];
 enum { M_AIM, M_SENS, M_INV };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -119,6 +120,7 @@ static void load_all(int defaults)
     s_v[V_SCALE] = clampi(on ? (int)GetPrivateProfileIntA("display", "resolution_scale", 1, path) : 1, 1, 5) - 1;
     s_v[V_FS] = on && GetPrivateProfileIntA("display", "fullscreen", 0, path) != 0;
     s_v[V_VSYNC] = on ? GetPrivateProfileIntA("display", "vsync", 1, path) != 0 : 1;
+    s_v[V_FPS] = clampi(on ? (int)GetPrivateProfileIntA("display", "frame_rate", 0, path) : 0, 0, 2);
     s_v[V_ANISO] = index_of(ANISO_VAL, 5, on ? (int)GetPrivateProfileIntA("display", "anisotropy", 1, path) : 1);
     s_v[V_FXAA] = on && GetPrivateProfileIntA("display", "fxaa", 0, path) != 0;
     s_v[V_MSAA] = index_of(MSAA_VAL, 4, on ? (int)GetPrivateProfileIntA("display", "msaa", 1, path) : 1);
@@ -145,6 +147,8 @@ static int save_all(HWND owner)
     WritePrivateProfileStringA("display", "resolution_scale", buf, path);
     WritePrivateProfileStringA("display", "fullscreen", s_v[V_FS] ? "1" : "0", path);
     WritePrivateProfileStringA("display", "vsync", s_v[V_VSYNC] ? "1" : "0", path);
+    snprintf(buf, sizeof buf, "%d", s_v[V_FPS]);
+    WritePrivateProfileStringA("display", "frame_rate", buf, path);
     snprintf(buf, sizeof buf, "%d", ANISO_VAL[s_v[V_ANISO]]);
     WritePrivateProfileStringA("display", "anisotropy", buf, path);
     WritePrivateProfileStringA("display", "fxaa", s_v[V_FXAA] ? "1" : "0", path);
@@ -233,11 +237,10 @@ static void draw(HDC dc, int w, int h)
         }
         SetRect(&note, px(212), px(130) + V_COUNT * px(40) + px(16), px(760), h - px(80));
         ui_text(dc, f.fine, RGB(150, 178, 210), &note,
-                "Widescreen widens the 3D view; the HUD and menus keep their shape.\n"
-                "Settings and controls are saved in the data folder (settings.ini, keymap.ini).\n"
-                "The same settings are in the game's F1 menu. A running game picks up changes\n"
-                "made here at its next start. Render scale and MSAA rebuild surfaces and may\n"
-                "flicker once.\nHalo 2 Native version " H2N_VERSION ".", DT_LEFT | DT_WORDBREAK);
+                "Frame rate Auto plays at 60 fps and drops to 30 if this PC can't keep up.\n"
+                "Also in the game's F1 menu; a running game takes changes made here at its next\n"
+                "start. Saved in the data folder. Halo 2 Native version " H2N_VERSION ".",
+                DT_LEFT | DT_WORDBREAK);
     }
     /* footer */
     {

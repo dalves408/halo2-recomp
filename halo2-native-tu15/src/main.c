@@ -464,33 +464,135 @@ static DWORD WINAPI halo2_dsp_probe(LPVOID arg)
 int g_halo2_single_vblank;
 
 #ifndef H2_DOWNLOADER
-/* 30 fps on Xbox Live, 60 fps everywhere else.
+/* The frame rate: 60 or 30 fps (g_halo2_single_vblank: a frame targets the
+ * next vblank instead of every second one, recomp_0029.c).
  *
- * Halo 2 simulates 30 ticks a second whatever the frame rate (0x004F2C5C
- * counts them). At 60 fps a frame is not tied to a tick: measured in an
- * Insignia match, a quarter of the ticks were shown for 1 frame and a quarter
- * for 3 (2026-11-19), which reads as jitter. Until frames are paced to ticks,
- * an Xbox Live match goes back to the console's one frame per tick. Only a
- * match counts: the router seeing game traffic on UDP 3074 (8 or more packets
- * in a second, nvnet_nat.c), not a signed-in console's keep-alives with the
- * security gateway. Campaign and system link (which never goes through the
- * router) keep 60 fps, signed in or not; 10 s after the match traffic stops
- * it is 60 again. RECOMP_HALO2_LIVE_60=1 keeps 60 fps in Live matches too. */
+ * The setting (settings.h frame_rate, F1 menu and Config.exe):
+ *   - 60: always 60.
+ *   - 30: always 30, the console's own cadence.
+ *   - Auto (default): 60, until this PC shows it cannot hold 60 in play; then
+ *     30 for the rest of the session. A PC that can't keep up gives an uneven
+ *     40-55 fps, which reads worse than an even 30 (one frame per simulation
+ *     tick) and asks twice the GPU work. Auto watches 5-second windows and
+ *     counts only those that draw a scene (100+ draws a frame: not the intro
+ *     video or loading screens, which run near 30 on any PC). Time spent
+ *     building shaders is taken out of a window before its rate is worked out,
+ *     and a window that is mostly building is skipped: a first run on a slow
+ *     CPU builds shaders in nearly every window (180 at 85-235 ms each on an
+ *     i5-8250U), so skipping every window with builds never decided. A fast PC
+ *     whose only dips are shader builds stays at 60. When all of the last 4
+ *     such windows are under 52 fps and they average under 45, it goes to 30
+ *     (3 of 4 under 50 dropped the test laptop's GTX 1650, which holds 60, to
+ *     30 while a level streamed in: 48.8, 59.0, 48.1 fps). It
+ *     never goes back up by itself: switching back and forth would look worse
+ *     than either rate. Measured 2026-11-22 on the test laptop's Intel UHD at
+ *     1x: 38-55 fps in play, 5-13 ms a frame waiting for the GPU; its GTX 1650
+ *     held 60 with 1-3 ms. Choosing a setting again in the F1 menu starts over.
+ *
+ * Over everything: 30 fps in an Xbox Live match. Halo 2 simulates 30 ticks a
+ * second whatever the frame rate (0x004F2C5C counts them). At 60 fps a frame
+ * is not tied to a tick: measured in an Insignia match, a quarter of the
+ * ticks were shown for 1 frame and a quarter for 3 (2026-11-19), which reads
+ * as jitter. Only a match counts: the router seeing game traffic on UDP 3074
+ * (8 or more packets in a second, nvnet_nat.c), not a signed-in console's
+ * keep-alives with the security gateway. Campaign and system link (which
+ * never goes through the router) follow the setting; 10 s after the match
+ * traffic stops the setting applies again. RECOMP_HALO2_LIVE_60=1 keeps the
+ * setting in Live matches too; RECOMP_HALO2_SINGLE_VBLANK=0 forces 30. */
 int nat_live_match_recent(unsigned ms);   /* toolkit nvnet_nat.c */
-static DWORD WINAPI halo2_live_fps_watch(LPVOID unused)
+uint32_t halo2_gpu_flip_count(void);      /* gpu/d3d11_backend.c */
+uint32_t halo2_gpu_draw_count(void);
+double halo2_gpu_compile_ms(void);
+
+static volatile LONG s_fps_rate = 60, s_fps_auto_low;
+static int s_fps_forced30;
+
+int halo2_fps_current(int *auto_low)
 {
-    int in_match_was = 0;
+    if (auto_low)
+        *auto_low = (int)s_fps_auto_low;
+    return (int)s_fps_rate;
+}
+
+static int fps_setting(void)
+{
+    const Halo2Settings *st = halo2_settings_get();
+    return st && st->frame_rate >= 0 && st->frame_rate <= 2 ? st->frame_rate : 0;
+}
+
+static void fps_apply(int setting, int in_match)
+{
+    int want60 = !s_fps_forced30 && !in_match &&
+                 (setting == 1 || (setting == 0 && !s_fps_auto_low));
+    g_halo2_single_vblank = want60;
+    InterlockedExchange(&s_fps_rate, want60 ? 60 : 30);
+}
+
+#define FPS_WINDOW_MS 5000
+#define FPS_WINDOWS 4
+static DWORD WINAPI halo2_fps_policy(LPVOID unused)
+{
+    const char *live60 = getenv("RECOMP_HALO2_LIVE_60");
+    int live_rule = getenv("RECOMP_NET") && !(live60 && *live60 == '1');
+    int setting_was = fps_setting(), in_match_was = 0, n = 0;
+    double hist[FPS_WINDOWS];
+    uint32_t f0 = halo2_gpu_flip_count(), d0 = halo2_gpu_draw_count();
+    double c0 = halo2_gpu_compile_ms();
+    DWORD t0 = GetTickCount();
     (void)unused;
     for (;;) {
-        int in_match = nat_live_match_recent(10000);
+        int setting, in_match;
+        DWORD now;
         Sleep(500);
-        if (in_match == in_match_was)
-            continue;
-        in_match_was = in_match;
-        g_halo2_single_vblank = !in_match;
-        fprintf(stderr, "[FPS] %s\n", in_match ? "Xbox Live match: 30 fps (one frame per simulation tick)"
-                                               : "no Xbox Live match: back to 60 fps");
+        setting = fps_setting();
+        in_match = live_rule && nat_live_match_recent(10000);
+        now = GetTickCount();
+        if (setting != setting_was || in_match != in_match_was) {
+            if (setting != setting_was) {
+                InterlockedExchange(&s_fps_auto_low, 0);
+                fprintf(stderr, "[FPS] frame rate set to %s\n",
+                        setting == 1 ? "60" : setting == 2 ? "30" : "Auto");
+            }
+            if (in_match != in_match_was)
+                fprintf(stderr, "[FPS] %s\n", in_match ? "Xbox Live match: 30 fps (one frame per simulation tick)"
+                                                       : "no Xbox Live match: the frame rate setting applies again");
+            setting_was = setting;
+            in_match_was = in_match;
+            n = 0;                               /* judge afresh */
+            f0 = halo2_gpu_flip_count(); d0 = halo2_gpu_draw_count(); c0 = halo2_gpu_compile_ms(); t0 = now;
+        } else if (now - t0 >= FPS_WINDOW_MS) {
+            uint32_t f = halo2_gpu_flip_count(), d = halo2_gpu_draw_count();
+            double c = halo2_gpu_compile_ms(), secs = (now - t0) / 1000.0;
+            double play = secs - (c - c0) / 1000.0;     /* the window less its shader builds */
+            if (setting == 0 && !s_fps_auto_low && !in_match && !s_fps_forced30 && f != f0 &&
+                (double)(d - d0) / (f - f0) >= 100.0 && play >= secs / 2.0) {
+                int i, slow = 0;
+                double sum = 0.0;
+                hist[n % FPS_WINDOWS] = (f - f0) / play;
+                n++;
+                for (i = 0; i < FPS_WINDOWS && i < n; i++) {
+                    sum += hist[i];
+                    slow += hist[i] < 52.0;
+                }
+                if (n >= FPS_WINDOWS && slow == FPS_WINDOWS && sum / FPS_WINDOWS < 45.0) {
+                    InterlockedExchange(&s_fps_auto_low, 1);
+                    fprintf(stderr, "[FPS] Auto: %.1f fps on average over the last %d s of play;"
+                                    " 30 fps for the rest of this session\n",
+                            sum / FPS_WINDOWS, FPS_WINDOWS * FPS_WINDOW_MS / 1000);
+                }
+            }
+            f0 = f; d0 = d; c0 = c; t0 = now;
+        }
+        fps_apply(setting, in_match);
     }
+}
+#else
+/* The downloader draws its own screens at its own rate; its F1 menu shows 60. */
+int halo2_fps_current(int *auto_low)
+{
+    if (auto_low)
+        *auto_low = 0;
+    return 60;
 }
 #endif
 
@@ -689,11 +791,9 @@ int main(void)
      * Insignia with the player's own console identity (RECOMP_NET=1). */
     xbox_NvnetInit();
 #ifndef H2_DOWNLOADER
-    {
-        const char *live60 = getenv("RECOMP_HALO2_LIVE_60");
-        if (g_halo2_single_vblank && getenv("RECOMP_NET") && !(live60 && *live60 == '1'))
-            CloseHandle(CreateThread(NULL, 0, halo2_live_fps_watch, NULL, 0, NULL));
-    }
+    s_fps_forced30 = !g_halo2_single_vblank;     /* RECOMP_HALO2_SINGLE_VBLANK=0 */
+    fps_apply(fps_setting(), 0);
+    CloseHandle(CreateThread(NULL, 0, halo2_fps_policy, NULL, 0, NULL));
 #endif
 
     /* Step 6: Initialize stack */

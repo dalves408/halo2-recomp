@@ -4289,6 +4289,134 @@ unsigned nv2a_test_verify_skips(void) { return s_vsh_verify_skips; }
 unsigned nv2a_test_verify_reports(void) { return s_vsh_verify_skip_reports; }
 #endif
 
+/* A batch xvs_streams turns down -- indices spread over a wide range
+ * (copying the span would move more than the batch uses), or a stride or
+ * offset the input layout cannot take -- is repacked instead of gathered:
+ * each vertex the batch uses is copied once, each attribute's bytes as the
+ * title wrote them, into one stream laid out on 4-byte boundaries, and the
+ * back end converts them exactly as it does a raw stream. Gathering read
+ * every attribute through fetch_attr and wrote four floats for it; on an
+ * i5-8250U a third of Halo 2's program batches went that way and fetch_attr
+ * alone took 12% of the GPU thread (profiled on a test laptop, 2026-11-22).
+ * Fills s_xvs_map and s_xvs_uidx; 0 (gather instead) when an input has no
+ * twin in the back end's formats or a vertex reads outside guest memory.
+ * RECOMP_GPU_VSH_PACK=0 gathers as before. */
+static uint8_t *s_xvc_buf;
+static size_t s_xvc_cap;
+static uint64_t s_xvs_packed;
+
+static int xvs_pack(Nv2aXVsBatch *vb, uint32_t n, uint32_t mask, uint32_t *count)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t a, k = 0, ns = 0, i, j, nv = 0, cstride = 0, nvar = 0;
+    uint32_t src_off[16], src_stride[16], fbs[16], doff[16];
+    static int pack_on = -1;
+
+    if (pack_on < 0)
+        pack_on = switch_default_on("RECOMP_GPU_VSH_PACK");
+    if (!pack_on || !n || !s_xbackend->vsh_raw_ok || !s_xbackend->vsh_raw_ok())
+        return 0;
+    memset(vb, 0, sizeof *vb);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+        if ((mask & (1u << a)) && s_gpu.attr[a].size)
+            nvar++;
+    ns = nvar ? 1 : 0;                       /* stream 0: the packed vertices */
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        uint32_t fb = 0;
+        uint8_t conv;
+
+        if (!(mask & (1u << a)))
+            continue;
+        if (k >= 16)
+            return 0;
+        if (!at->size) {                     /* no array: the current value */
+            if (ns == NV2A_XVS_MAX_STREAMS)
+                return 0;
+            vb->streams[ns].data = s_gpu.imm_attr[a];
+            vb->streams[ns].bytes = 16;
+            vb->streams[ns].stride = 0;
+            vb->in[k].stream = (uint8_t)ns;
+            vb->in[k].conv = (uint8_t)(NV2A_XVS_CONST << 4 | 4);
+            vb->in[k].offset = 0;
+            ns++;
+            k++;
+            continue;
+        }
+        if (!at->stride || (!s_gpu.inline_active && !at->offset))
+            return 0;
+        if (!(conv = xvs_conv(at, &fb)))
+            return 0;
+        src_off[k] = at->offset;
+        src_stride[k] = at->stride;
+        fbs[k] = fb;
+        doff[k] = cstride;
+        vb->in[k].stream = 0;
+        vb->in[k].conv = conv;
+        vb->in[k].offset = (uint16_t)cstride;
+        cstride += (fb + 3u) & ~3u;
+        k++;
+    }
+    if (!k || cstride > 2048u)
+        return 0;
+    if (++s_xvs_batch == 0) {
+        memset(s_xvs_stamp, 0, sizeof s_xvs_stamp);
+        s_xvs_batch = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t idx = s_gpu.idx[i], l;
+        if (idx < XVS_CACHE && s_xvs_stamp[idx] == s_xvs_batch) {
+            s_xvs_map[i] = s_xvs_slot[idx];
+            continue;
+        }
+        l = nv++;
+        s_xvs_uidx[l] = idx;
+        if (idx < XVS_CACHE) {
+            s_xvs_stamp[idx] = s_xvs_batch;
+            s_xvs_slot[idx] = l;
+        }
+        s_xvs_map[i] = l;
+    }
+    if (nvar) {
+        size_t want = (size_t)nv * cstride;
+        if (want > (8u << 20))
+            return 0;
+        if (want > s_xvc_cap) {
+            uint8_t *b = (uint8_t *)realloc(s_xvc_buf, want);
+            if (!b)
+                return 0;
+            s_xvc_buf = b;
+            s_xvc_cap = want;
+        }
+        for (j = 0; j < k; j++) {
+            uint8_t *dst = s_xvc_buf + doff[j];
+            if ((vb->in[j].conv >> 4) == NV2A_XVS_CONST)
+                continue;
+            for (i = 0; i < nv; i++, dst += cstride) {
+                uint64_t at = (uint64_t)src_off[j] + (uint64_t)s_xvs_uidx[i] * src_stride[j];
+                const uint8_t *src;
+                if (s_gpu.inline_active) {
+                    if (at + fbs[j] > (uint64_t)s_gpu.inline_count * 4u)
+                        return 0;
+                    src = (const uint8_t *)s_gpu.inline_buf + at;
+                } else {
+                    if (!guest_span_ok(at, fbs[j]))
+                        return 0;
+                    src = mem + at;
+                }
+                memcpy(dst, src, fbs[j]);
+            }
+        }
+        vb->streams[0].data = s_xvc_buf;
+        vb->streams[0].bytes = (uint32_t)want;
+        vb->streams[0].stride = cstride;
+    }
+    vb->nstreams = ns;
+    *count = nv;
+    s_xvs_packed++;
+    return 1;
+}
+
 static int gpu_vsh_batch(void)
 {
     uint32_t n = s_gpu.idx_count, i, a, nins = 0, mask, nin, nv = 0, ni = 0, first = 0;
@@ -4325,14 +4453,16 @@ static int gpu_vsh_batch(void)
     }
     memset(&vb, 0, sizeof vb);
     raw = xvs_streams(&vb, n, mask, &first, &nv);
-    if (raw) {
+    if (!raw && xvs_pack(&vb, n, mask, &nv)) {
+        raw = 1;                             /* streams, already mapped */
+    } else if (raw) {
         for (i = 0; i < n; i++)
             s_xvs_map[i] = s_gpu.idx[i] - first;
         for (i = 0; i < nv; i++)
             s_xvs_uidx[i] = first + i;
         s_xvs_raw++;
     } else {
-        vb.nstreams = 0;
+        memset(&vb, 0, sizeof vb);
         if ((size_t)n * nin * 4 > s_xvs_in_cap) {
             size_t want = (size_t)n * nin * 4;
             float *p = (float *)realloc(s_xvs_in, want * sizeof *p);
@@ -6818,6 +6948,8 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "[GPU] programs on the GPU: %llu raw, %llu gathered;"
                         " %llu declined (CPU)\n", (unsigned long long)s_xvs_raw,
                 (unsigned long long)s_xvs_gathered, (unsigned long long)s_xvs_cpu);
+    if (s_xvs_packed)
+        fprintf(stderr, "[GPU] programs repacked into one stream: %llu\n", (unsigned long long)s_xvs_packed);
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);

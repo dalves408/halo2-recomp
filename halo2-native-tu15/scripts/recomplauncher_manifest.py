@@ -137,6 +137,10 @@ def main():
         for name, source in PROGRAMS.items():
             package.write(args.build / source, name)
         package.write(ROOT / 'keymap.ini', 'keymap.ini')
+        # the shader starter list (installer/shader_keys.bin, recorded in play): built in the background at the
+        # first start instead of mid-level (src/gpu/d3d11_backend.c). Shipped, never committed.
+        if (ROOT / 'installer' / 'shader_keys.bin').is_file():
+            package.write(ROOT / 'installer' / 'shader_keys.bin', 'shader_keys.bin')
         # title update 1.5 made from the disc when the player has none (halo2_import.c; scripts/convert_tu_patches.py)
         for name in TU_PATCHES:
             package.write(ROOT / 'installer' / 'patches' / name, f'patches/{name}')

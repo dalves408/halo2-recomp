@@ -609,12 +609,48 @@ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
  * page the title made read-only (XPhysicalProtect) would fault the OHCI
  * thread and take the process down. Drop such a write and say so once. */
 #if defined(_WIN32)
+/* The page's protection from the working set (QueryWorkingSetEx), which looks
+ * up that one page. VirtualQuery also works out how far the region runs, and
+ * on the guest's large mapped views that is a walk over thousands of page
+ * entries: about 3 ms a call on an i5-8250U, twice per pad report, most of a
+ * core for the OHCI thread (profiled on a test laptop, 2026-11-22). A page that is
+ * not resident is asked of VirtualQuery as before. */
+typedef struct {
+    PVOID VirtualAddress;
+    ULONG_PTR Flags;          /* bit 0 Valid, bits 1-3 ShareCount, bits 4-14 Win32Protection, 15 Shared */
+} OhciWsExInfo;
+typedef BOOL (WINAPI *OhciQueryWsEx)(HANDLE, PVOID, DWORD);
+static int page_protect_fast(const void *p, DWORD *protect)
+{
+    static OhciQueryWsEx query;
+    static int tried;
+    OhciWsExInfo w;
+    if (!tried) {
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        query = k ? (OhciQueryWsEx)(void *)GetProcAddress(k, "K32QueryWorkingSetEx") : NULL;
+        tried = 1;
+    }
+    if (!query)
+        return 0;
+    w.VirtualAddress = (PVOID)p;
+    w.Flags = 0;
+    if (!query(GetCurrentProcess(), &w, sizeof w) || !(w.Flags & 1))
+        return 0;
+    *protect = (DWORD)((w.Flags >> 4) & 0x7FF);
+    return 1;
+}
+
 static int host_writable(const void *p, DWORD *protect)
 {
     MEMORY_BASIC_INFORMATION mbi;
     *protect = 0;
     const DWORD ok = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE
                    | PAGE_EXECUTE_WRITECOPY;
+    if (page_protect_fast(p, protect)) {
+        if (*protect & (PAGE_GUARD | PAGE_NOACCESS))
+            return 0;
+        return (*protect & ok) != 0;
+    }
     if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
         return 0;
     *protect = mbi.Protect;

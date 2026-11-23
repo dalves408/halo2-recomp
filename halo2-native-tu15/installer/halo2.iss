@@ -73,6 +73,8 @@ Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\third_party\SDL3-3.4.20\LICENSE.txt"; DestDir: "{app}"; DestName: "SDL3-LICENSE.txt"; Flags: ignoreversion skipifsourcedoesntexist
 ; the default keyboard and mouse layout (a player's own changes are in data\keymap.ini)
 Source: "..\keymap.ini"; DestDir: "{app}"; Flags: ignoreversion
+; the shader starter list, recorded in play: built in the background at the first start (shipped, never committed)
+Source: "shader_keys.bin"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\halo2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 ; title update 1.5, made from the disc (scripts/convert_tu_patches.py); beside the importer

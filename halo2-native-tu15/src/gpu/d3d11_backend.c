@@ -102,11 +102,26 @@ static struct {
     UINT stencil;
 } s_fragment;
 
+/* Vertex-program draws in a row (most of a frame) keep their input layout,
+ * shaders and constant buffers bound between draws instead of setting them
+ * and unbinding the geometry shader around every one: on an Intel UHD 620
+ * the driver's work behind those calls was the largest single cost of the
+ * GPU thread (2026-11-22). Anything else that draws on the context resets
+ * this, as it resets s_fragment; the other draw paths and FXAA, scaling and
+ * clears set their own geometry shader (none). */
+static struct {
+    int valid;
+    ID3D11InputLayout *il;
+    ID3D11VertexShader *vs;
+    ID3D11GeometryShader *gs;
+} s_pipe;
+
 static int d3d_scale_blit(ID3D11ShaderResourceView *source, UINT source_width, UINT source_height,
                          ID3D11RenderTargetView *target, UINT target_width, UINT target_height,
                          enum GpuScaleBlitMode mode)
 {
     s_fragment.valid = 0;
+    s_pipe.valid = 0;
     return gpu_scale_blit(source, source_width, source_height, target, target_width,
                           target_height, mode);
 }
@@ -125,6 +140,8 @@ static unsigned s_texrej_skips;
  * dirty non-exact overlap, dirty overlap beside an exact one, strict bounds, no view */
 static unsigned s_arej[7];
 static uint32_t s_flip_life;
+static uint32_t s_draw_life, s_draws_seen;   /* halo2_gpu_draw_count */
+static double s_compile_ms_life;             /* halo2_gpu_compile_ms */
 static uint64_t s_wserial;      /* color write order */
 static unsigned s_order_wins;
 static unsigned s_sync_order_wins;  /* perf10: raced partial overlaps superseded by a newer exact alias */
@@ -495,12 +512,20 @@ static void report_detailed_perf(void)
 /* Frames the game has completed so far (debug FPS counter, overlay.c). */
 uint32_t halo2_gpu_flip_count(void) { return *(volatile uint32_t *)&s_flip_life; }
 
+/* Draws and pixel-shader build time since start, for the frame rate's Auto
+ * setting (main.c): it judges only windows that draw a scene and are not
+ * building shaders. Read from another thread; a stale value is harmless. */
+uint32_t halo2_gpu_draw_count(void) { return *(volatile uint32_t *)&s_draw_life; }
+double halo2_gpu_compile_ms(void) { return *(volatile double *)&s_compile_ms_life; }
+
 static void stats_flip(void)
 {
     static double last;
     double now = qpc_ms();
     s_st.flips++;
     s_flip_life++;
+    s_draw_life += s_st.draws - s_draws_seen;
+    s_draws_seen = s_st.draws;
     if (!last)
         last = now;
     if (now - last >= 10000.0) {
@@ -555,6 +580,7 @@ static void stats_flip(void)
         s_q_wait_ms = 0.0;
         s_rep_written = s_rep_flushes = 0;
         memset(&s_st, 0, sizeof s_st);
+        s_draws_seen = 0;
         last = now;
     }
 }
@@ -787,10 +813,91 @@ static DWORD WINAPI rc_prebuild_worker(LPVOID arg)
     return 0;
 }
 
+/* The shaders this PC has built that the shipped starter list does not have,
+ * written into the log at each start as "[SHADER-KEY] H2K1 <base64 key>".
+ * RecompLauncher sends the newest .log with a player's report, and a log is
+ * what a player attaches to an issue, so every report carries the player's
+ * whole collection, not one session's; scripts/merge_shader_keys.py folds
+ * them into installer/shader_keys.bin for the next release. A key is only
+ * the combiner state (no paths, names or hardware). At most 3000 lines. */
+#define RC_KEYS_LOG_MAX 3000
+static void rc_log_extra_keys(const wchar_t *mine_path, const wchar_t *seed_path)
+{
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint32_t *seed = NULL, *seen = NULL;
+    int nseed = 0, cseed = 0, nseen = 0, cseen = 0, logged = 0, total = 0, i;
+    RcKeysHeader h;
+    GpuRcKey k;
+    FILE *f;
+
+    if (seed_path && (f = _wfopen(seed_path, L"rb")) != NULL) {
+        if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, RC_KEYS_MAGIC, 8) &&
+            h.key_size == sizeof(GpuRcKey))
+            while (fread(&k, sizeof k, 1, f) == 1) {
+                if (nseed == cseed) {
+                    int c = cseed ? cseed * 2 : 1024;
+                    uint32_t *m = (uint32_t *)realloc(seed, c * sizeof *m);
+                    if (!m) break;
+                    seed = m; cseed = c;
+                }
+                seed[nseed++] = rc_key_hash(&k);
+            }
+        fclose(f);
+    }
+    if (!(f = _wfopen(mine_path, L"rb"))) {
+        free(seed);
+        return;
+    }
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, RC_KEYS_MAGIC, 8) ||
+        h.key_size != sizeof(GpuRcKey)) {
+        fclose(f);
+        free(seed);
+        return;
+    }
+    while (fread(&k, sizeof k, 1, f) == 1) {
+        uint32_t hash = rc_key_hash(&k);
+        char line[(sizeof k + 2) / 3 * 4 + 1];
+        const uint8_t *b = (const uint8_t *)&k;
+        size_t j, o = 0;
+        int dup = 0;
+        for (i = 0; i < nseed && !dup; i++) dup = seed[i] == hash;
+        for (i = 0; i < nseen && !dup; i++) dup = seen[i] == hash;
+        if (dup)
+            continue;
+        if (nseen == cseen) {
+            int c = cseen ? cseen * 2 : 1024;
+            uint32_t *m = (uint32_t *)realloc(seen, c * sizeof *m);
+            if (!m) break;
+            seen = m; cseen = c;
+        }
+        seen[nseen++] = hash;
+        total++;
+        if (logged >= RC_KEYS_LOG_MAX)
+            continue;
+        for (j = 0; j < sizeof k; j += 3) {
+            uint32_t v = (uint32_t)b[j] << 16 | (j + 1 < sizeof k ? (uint32_t)b[j + 1] << 8 : 0) |
+                         (j + 2 < sizeof k ? b[j + 2] : 0);
+            line[o++] = b64[v >> 18 & 63];
+            line[o++] = b64[v >> 12 & 63];
+            line[o++] = j + 1 < sizeof k ? b64[v >> 6 & 63] : '=';
+            line[o++] = j + 2 < sizeof k ? b64[v & 63] : '=';
+        }
+        line[o] = 0;
+        fprintf(stderr, "[SHADER-KEY] H2K1 %s\n", line);
+        logged++;
+    }
+    fclose(f);
+    fprintf(stderr, "[SHADER-KEYS] %d shader%s built here that shader_keys.bin does not have"
+                    " (%d in this log; key %u bytes)\n",
+            total, total == 1 ? "" : "s", logged, (unsigned)sizeof(GpuRcKey));
+    free(seed);
+    free(seen);
+}
+
 static void rc_prebuild_start(void)
 {
     const wchar_t *dir = gpu_pscache_directory();
-    wchar_t path[MAX_PATH + 64], wroot[MAX_PATH], seed_path[MAX_PATH + 64];
+    wchar_t path[MAX_PATH + 64], wroot[MAX_PATH], seed_path[MAX_PATH + 64] = L"";
     char root[MAX_PATH];
     GpuRcKey *keys = NULL;
     int n = 0, cap = 0, mine, seed = -1, threads, i;
@@ -824,6 +931,7 @@ static void rc_prebuild_start(void)
         fflush(s_keylog);
     fprintf(stderr, "[GPU-PSCACHE] %d known combiner shaders (%d from shader_keys.bin)\n",
             n, seed);
+    rc_log_extra_keys(path, seed_path[0] ? seed_path : NULL);
     if (!n) {
         free(keys);
         return;
@@ -939,6 +1047,7 @@ static ID3D11PixelShader *get_rc_shader(const GpuRcKey *k)
             bruteforce_perf_record_pixel_shader_compile(
                 1, bruteforce_perf_clock() - perf_started);
         s_st.ps_compiles++;
+        s_compile_ms_life += qpc_ms() - started;
         if (gpu_pscache_enabled()) {
             fprintf(stderr, "[GPU-PSCACHE] compiled in %.3f ms\n", qpc_ms() - started);
             gpu_pscache_store(src, len, name, entry, target, SHADER_COMPILE_FLAGS,
@@ -1159,6 +1268,7 @@ failed:
     if (s_dev) ID3D11Device_Release(s_dev);
     s_ctx = NULL;
     s_fragment.valid = 0;
+    s_pipe.valid = 0;
     s_dev = NULL;
     s_failed = 0;
     InterlockedExchange(&s_device_thread, 0);
@@ -6347,6 +6457,7 @@ static void clear_draw(const D3D11_RECT *rect, uint32_t flags, uint32_t argb,
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 2, 1, &s_clear_cb);
     ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
     s_fragment.valid = 0;
+    s_pipe.valid = 0;
     ID3D11DeviceContext_PSSetShader(s_ctx, s_clear_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_clear_cb);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
@@ -6589,6 +6700,7 @@ static void d3d_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_base_cb);
     ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
     s_fragment.valid = 0;
+    s_pipe.valid = 0;
     ID3D11DeviceContext_PSSetShader(s_ctx, s_base_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_base_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
@@ -6944,6 +7056,7 @@ static void d3d_xdraw_impl(const Nv2aSurface *s, const Nv2aXBatch *b)
     offs = ring_push(b->vertices, b->count * stride, stride);
     if (offs == ~0u)
         return;
+    s_pipe.valid = 0;
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_xlayout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vring, &stride, &offs);
@@ -7440,6 +7553,7 @@ static UINT index_push(const uint32_t *data, UINT count)
         UINT want = bytes * 4 > (16u << 20) ? bytes * 4 : (16u << 20);
         if (s_iring) ID3D11Buffer_Release(s_iring);
         s_iring = NULL;
+        s_pipe.valid = 0;                    /* a new buffer to bind */
         s_iring_size = 0;
         memset(&bd, 0, sizeof bd);
         bd.ByteWidth = want;
@@ -7558,6 +7672,7 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         if (gpu_call_failed(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_kcb),
                             "creating vertex-program constants"))
             return 0;
+        s_pipe.valid = 0;
     }
     RPZ_BEGIN(rpz_vtx);
     {
@@ -7678,13 +7793,25 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
         return 0;
     cbs[0] = s_xcb;
     cbs[1] = s_kcb;
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, il);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_iring, DXGI_FORMAT_R32_UINT, 0);
-    ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
-    ID3D11DeviceContext_GSSetShader(s_ctx, vsh_filter_gs(), NULL, 0);
-    ID3D11DeviceContext_GSSetConstantBuffers(s_ctx, 1, 1, &cbs[1]);   /* wideinfo */
+    {
+        ID3D11GeometryShader *gs = vsh_filter_gs();
+        if (!s_pipe.valid) {
+            ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_iring, DXGI_FORMAT_R32_UINT, 0);
+            ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
+            ID3D11DeviceContext_GSSetConstantBuffers(s_ctx, 1, 1, &cbs[1]);   /* wideinfo */
+        }
+        if (!s_pipe.valid || s_pipe.il != il)
+            ID3D11DeviceContext_IASetInputLayout(s_ctx, il);
+        if (!s_pipe.valid || s_pipe.vs != v->vs)
+            ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
+        if (!s_pipe.valid || s_pipe.gs != gs)
+            ID3D11DeviceContext_GSSetShader(s_ctx, gs, NULL, 0);
+        s_pipe.il = il;
+        s_pipe.vs = v->vs;
+        s_pipe.gs = gs;
+        s_pipe.valid = 1;
+    }
     if (zeq_enabled() && s_probe_armed && s_gen >= s_probe_armed && s_cur_depth && b->xb.state && b->xb.state->depth_test_enable &&
         b->xb.state->depth_func == 0x202)
         zeq_measure(b->xb.state, b->nindices, ioff / 4u);
@@ -7713,7 +7840,6 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
     s_cur->guest_exact = 0;
     if (s_cur_depth && depth_state_can_write(b->xb.state))
         depth_written(s_cur_depth);
-    ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
     s_vlast = v;
     s_vlast_voff = voff;
     s_vlast_stride = stride;
@@ -7812,6 +7938,7 @@ static int d3d_vsh_readback(Nv2aXVsOut *out, uint32_t n)
             ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vring, &s_vlast_stride,
                                                    &s_vlast_voff);
     }
+    s_pipe.valid = 0;
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
     ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
     ID3D11DeviceContext_GSSetShader(s_ctx, v->so, NULL, 0);
@@ -8265,11 +8392,13 @@ static void query_resume_clear(int counting)
         query_begin();
 }
 
-/* RECOMP_GPU_ZPASS=async: a report is written into guest memory when its
- * queries complete, polled from the NV2A thread's loop, instead of waiting
- * for the GPU at GET_REPORT. The title sees the result later in time, as it
- * would from the console's GPU, and D3D's own polling waits for it. Off by
- * default while it is measured. */
+/* Asynchronous visibility reports (the default; RECOMP_GPU_ZPASS=sync turns
+ * them off): a report is written into guest memory when its queries
+ * complete, polled from the NV2A thread's loop, instead of waiting for the
+ * GPU at GET_REPORT. The title sees the result later in time, as it would
+ * from the console's GPU, and D3D's own polling waits for it. Waiting at
+ * every report kept the CPU and GPU taking turns: on Intel UHD graphics at 1x
+ * (Metropolis, standing still) the default went from 45.8 to 54.2 fps. */
 typedef struct {
     uint32_t va;
     uint64_t stamp;
@@ -8690,6 +8819,7 @@ static void publish_shared_present(Surf *sf)
         }
     }
     if (halo2_fxaa_enabled())
+        s_pipe.valid = 0;
         halo2_fxaa_apply(s_dev, s_ctx, s_present_shared, s_present_rtv, width, height);
     ID3D11DeviceContext_Flush(s_ctx);
 #ifdef RECOMP_DEBUG_TOOLS
@@ -9936,6 +10066,7 @@ void bruteforce_d3d11_test_finish_work(void)
 
 static void d3d_flip(void)
 {
+    s_pipe.valid = 0;
     pump_live_settings();
     if (s_dev) {
         gpu_d3d11_check_device(s_dev, S_OK, "completing flip");
@@ -10323,7 +10454,7 @@ int bruteforce_d3d11_install(void)
         fprintf(stderr, "[FXAA] enabled (applied at present)\n");
     s_vsh_flags = mulzero && strcmp(mulzero, "1") == 0 ? GPU_VSH_MULZERO : 0;
     s_vsh_sync = getenv("RECOMP_GPU_VSH_SYNC") && strcmp(getenv("RECOMP_GPU_VSH_SYNC"), "1") == 0;
-    s_zpass_async = getenv("RECOMP_GPU_ZPASS") && strcmp(getenv("RECOMP_GPU_ZPASS"), "async") == 0;
+    s_zpass_async = !getenv("RECOMP_GPU_ZPASS") || strcmp(getenv("RECOMP_GPU_ZPASS"), "sync") != 0;
     nv2a_backend_ext_register(&s_backend_ext);
     nv2a_backend_register(&s_backend);
     installed = 1;

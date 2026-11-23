@@ -319,6 +319,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         h2_mouse_pad_end(&pState->Gamepad.wButtons, pState->Gamepad.bAnalogButtons);
     }
 
+    /* BACK held + START opens the settings menu (overlay.c), so START does
+     * not also reach the game and open its pause menu behind it. */
+    if (dwPort == 0 && (pState->Gamepad.wButtons & XBOX_GAMEPAD_BACK))
+        pState->Gamepad.wButtons &= (WORD)~XBOX_GAMEPAD_START;
     if (halo2_overlay_active() && dwPort == 0)
         memset(pState, 0, sizeof *pState);
     return ERROR_SUCCESS;
