@@ -3,10 +3,15 @@
 add_library(xbox_usb STATIC
     ohci.c
     usb_gamepad.c
+    usb_xblc.c
+    usb_hub.c
 )
 
 target_include_directories(xbox_usb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_usb PUBLIC platform xbox_input)
+if(WIN32)
+    target_link_libraries(xbox_usb PUBLIC winmm)   # usb_xblc.c: microphone
+endif()
 
 if(MSVC)
     target_compile_options(xbox_usb PRIVATE /W4 /O2)

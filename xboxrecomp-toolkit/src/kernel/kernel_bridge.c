@@ -3767,9 +3767,26 @@ int xbox_DpcDrainHere(void)
  * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
  *                       PVOID DeferredContext)
  *
- * Initializes a DPC object. The Xbox KDPC structure is 32 bytes.
+ * Initializes a DPC object. The Xbox KDPC is 28 bytes (0x1C):
+ *
+ *   +0  Type (CSHORT), Inserted, Padding
+ *   +4  DpcListEntry
+ *   +12 DeferredRoutine
+ *   +16 DeferredContext
+ *   +20 SystemArgument1
+ *   +24 SystemArgument2
+ *
  * We zero it and set the routine and context pointers.
+ *
+ * Twenty-eight, not thirty-two. This cleared 32 bytes, and the four past the
+ * end belong to whatever the title put after its KDPC. Halo 2's voice library
+ * (XHV) keeps its engine pointer immediately after its DPC (DPC 0x490A90,
+ * engine 0x490AAC in the 1.5 build): InitEngine created the engine, set up
+ * its DPC, and the DPC's initialisation wiped the pointer. XHVEngineCreate
+ * then handed the title a NULL engine, every processing mode after the first
+ * failed with E_FAIL, and voice chat never started.
  */
+#define XBOX_KDPC_SIZE 28u
 static void bridge_KeInitializeDpc(void)
 {
     uint32_t dpc_va = STACK_ARG(0);
@@ -3780,13 +3797,12 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, XBOX_KDPC_SIZE, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    memset(XBOX_TO_NATIVE(dpc_va), 0, XBOX_KDPC_SIZE);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
@@ -3977,9 +3993,8 @@ static void bridge_KeInitializeTimerEx(void)
  * during XInitDevices and enumerates from it.
  *
  * A due time is in 100 ns units, negative for relative and positive for an
- * absolute time since 1601. Only the relative form is honoured here; an
- * absolute due time is treated as immediate, which is wrong in principle and
- * has not come up in practice.
+ * absolute time since 1601, measured against KeQuerySystemTime's clock (see
+ * kernel_set_timer; Halo 2's voice engine schedules its frames this way).
  *
  * ponytail: one thread, a fixed table, and a 10 ms tick, so a due time is late
  * by up to a tick and a periodic timer drifts. Nothing here is scheduling
@@ -4271,11 +4286,46 @@ static void kernel_timer_start(void)
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
 {
-    long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
+    long long delay_ms;
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
+    /* A negative due time is relative; a positive one is an absolute system
+     * time, the clock KeQuerySystemTime reads. Absolute times used to fire at
+     * once. The voice engine (XHV) keeps its 20 ms beat that way -- a due
+     * time advanced by 20 ms at each ScheduleWork -- so its frame ran every
+     * time anything scheduled work, about 500 times a second: the sender
+     * encoded each 20 ms of microphone audio several times over and the
+     * receiver drained its queue into silence. A time already past fires at
+     * once, which is how a schedule that fell behind catches up. */
+    if (due_100ns < 0) {
+        delay_ms = (-due_100ns) / 10000;
+    } else if (due_100ns == 0) {
+        delay_ms = 0;
+    } else {
+        LARGE_INTEGER now;
+        long long ahead;
+        xbox_KeQuerySystemTime(&now);
+        ahead = due_100ns - now.QuadPart;
+        delay_ms = ahead > 0 ? (ahead + 9999) / 10000 : 0;
+        if (delay_ms > 3600000)          /* an hour: not a plausible schedule */
+            delay_ms = 0;
+    }
+
     kernel_timer_start();
+
+    {   /* RECOMP_DPC_STATS: the first timers set, with their period and DPC */
+        static int on = -1;
+        static unsigned shown;
+        if (on < 0) on = getenv("RECOMP_DPC_STATS") != NULL;
+        if (on && shown < 400) {
+            shown++;
+            fprintf(stderr, "  [TIMER] %llu ms set %08X due %lld ms period %ld dpc %08X"
+                    " routine %08X\n", (unsigned long long)GetTickCount64(), timer_va,
+                    delay_ms, period_ms, dpc_va,
+                    dpc_va ? BRIDGE_MEM32(dpc_va + 12) : 0u);
+        }
+    }
 
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {

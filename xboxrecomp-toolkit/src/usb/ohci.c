@@ -13,6 +13,8 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
+#include "usb_xblc.h"
+#include "usb_hub.h"
 #include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
 
 #include <stdio.h>
@@ -413,11 +415,22 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_CC_STALL    4u
 #define TD_CC_DATAUNDERRUN 9u
 #define TD_ROUNDING    (1u << 18)   /* bufferRounding: a short packet is fine */
+/* Not a condition code: the device NAKed, so the TD is left on its endpoint
+ * untouched, to be tried again on a later pass. */
+#define TD_NAK         0xFFFFu
 
 
-/* Per pad: each device on the bus has its own control pipe state. */
-static uint32_t g_setup_pending_[USB_GAMEPAD_MAX];
-static UsbSetup g_setup_[USB_GAMEPAD_MAX];
+/* The devices on the bus: pads 0..USB_GAMEPAD_MAX-1, then the Communicator
+ * (usb_xblc.c) when RECOMP_USB_XBLC plugs one in, then the controllers' hubs
+ * (usb_hub.c) in hub mode. */
+#define USB_DEV_XBLC  USB_GAMEPAD_MAX
+#define USB_DEV_HUB0  (USB_GAMEPAD_MAX + 1)
+#define USB_DEV_MAX   (USB_DEV_HUB0 + USB_HUB_MAX)
+#define USB_DEV_IS_HUB(d) ((d) >= USB_DEV_HUB0 && (d) < USB_DEV_MAX)
+
+/* Per device: each device on the bus has its own control pipe state. */
+static uint32_t g_setup_pending_[USB_DEV_MAX];
+static UsbSetup g_setup_[USB_DEV_MAX];
 #define g_setup_pending g_setup_pending_[pad]
 #define g_setup         g_setup_[pad]
 
@@ -430,15 +443,49 @@ static UsbSetup g_setup_[USB_GAMEPAD_MAX];
  * again, which is exactly the loop DDS9 sat in -- GET_DESCRIPTOR, SET_ADDRESS,
  * GET_DESCRIPTOR, forever. The answer is computed once per setup packet and
  * then consumed. */
-static uint8_t g_ctrl_buf_[USB_GAMEPAD_MAX][64];
-static int     g_ctrl_len_[USB_GAMEPAD_MAX] = {-1, -1, -1, -1};
-static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
+static uint8_t g_ctrl_buf_[USB_DEV_MAX][64];
+static int     g_ctrl_len_[USB_DEV_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+static int     g_ctrl_sent_[USB_DEV_MAX];
 #define g_ctrl_buf  g_ctrl_buf_[pad]
 #define g_ctrl_len  g_ctrl_len_[pad]
 #define g_ctrl_sent g_ctrl_sent_[pad]
 
 /* Pads plugged in so far, in port order. */
 static int s_plugged_pads;
+
+/* RECOMP_USB_XBLC: a Communicator, plugged in after every pad is configured.
+ * Dev switch; -1 when off.
+ *
+ *   RECOMP_USB_XBLC=hub  hub mode: every pad is behind a hub of its own, as
+ *                        a console controller is (usb_hub.c), and the
+ *                        headset goes in player 1's first expansion slot.
+ *                        This is the one that gives the headset to player 1.
+ *   RECOMP_USB_XBLC=1..4 no hubs: the headset on that root port, which must
+ *                        be one no pad is using. XAPI then counts it as that
+ *                        controller port's headset. */
+static int s_xblc_port = -1;
+static int s_xblc_plugged;
+static int s_hub_mode;
+static int s_hubs_plugged;
+
+/* Which device answers at address 0: the one most recently plugged in. Every
+ * device is plugged after the one before it has been given an address, so
+ * there is never more than one. -1 when none is waiting. */
+static int s_addr0_dev = -1;
+
+static uint8_t usb_dev_address(int dev)
+{
+    if (dev == USB_DEV_XBLC)  return usb_xblc_address();
+    if (USB_DEV_IS_HUB(dev))  return usb_hub_address(dev - USB_DEV_HUB0);
+    return usb_gamepad_address(dev);
+}
+
+static int usb_dev_plugged(int dev)
+{
+    if (dev == USB_DEV_XBLC)  return s_xblc_plugged;
+    if (USB_DEV_IS_HUB(dev))  return dev - USB_DEV_HUB0 < s_hubs_plugged;
+    return dev < s_plugged_pads;
+}
 
 /* RECOMP_USB_PLUG=boot: present the first pad from power-on (see ohci_reset). */
 static int s_plug_boot;
@@ -453,19 +500,33 @@ static unsigned plug_port(void)
     return port;
 }
 
-/* Which pad an endpoint descriptor talks to: by its function address, and
+/* Which device an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
- * is the plugged pad that has not been given one yet. Pads are plugged one
- * at a time, each after the previous is configured, so there is never more
- * than one at address 0. */
+ * is the device plugged in most recently (s_addr0_dev). Devices are plugged
+ * one at a time, each after the previous has its address, so there is never
+ * more than one at address 0. */
 static int ohci_pad_for(uint32_t ed0)
 {
     uint32_t fa = ed0 & 0x7Fu;
     int d;
-    for (d = 0; d < s_plugged_pads; d++)
-        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+    if (!fa)
+        return (s_addr0_dev >= 0 && usb_dev_plugged(s_addr0_dev)
+                && usb_dev_address(s_addr0_dev) == 0) ? s_addr0_dev : -1;
+    for (d = 0; d < USB_DEV_MAX; d++)
+        if (usb_dev_plugged(d) && usb_dev_address(d) == fa)
             return d;
     return -1;
+}
+
+/* A control request, to whichever device it is for. */
+static int usb_dev_control(int dev, const UsbSetup *setup, uint8_t *out,
+                           int max)
+{
+    if (dev == USB_DEV_XBLC)
+        return usb_xblc_control(setup, out, max);
+    if (USB_DEV_IS_HUB(dev))
+        return usb_hub_control(dev - USB_DEV_HUB0, setup, out, max);
+    return usb_gamepad_control(dev, setup, out, max);
 }
 
 /* Every address below came out of guest memory, so none of them are trusted.
@@ -609,12 +670,48 @@ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
  * page the title made read-only (XPhysicalProtect) would fault the OHCI
  * thread and take the process down. Drop such a write and say so once. */
 #if defined(_WIN32)
+/* The page's protection from the working set (QueryWorkingSetEx), which looks
+ * up that one page. VirtualQuery also works out how far the region runs, and
+ * on the guest's large mapped views that is a walk over thousands of page
+ * entries: about 3 ms a call on an i5-8250U, twice per pad report, most of a
+ * core for the OHCI thread (profiled on a test laptop, 2026-11-22). A page that is
+ * not resident is asked of VirtualQuery as before. */
+typedef struct {
+    PVOID VirtualAddress;
+    ULONG_PTR Flags;          /* bit 0 Valid, bits 1-3 ShareCount, bits 4-14 Win32Protection, 15 Shared */
+} OhciWsExInfo;
+typedef BOOL (WINAPI *OhciQueryWsEx)(HANDLE, PVOID, DWORD);
+static int page_protect_fast(const void *p, DWORD *protect)
+{
+    static OhciQueryWsEx query;
+    static int tried;
+    OhciWsExInfo w;
+    if (!tried) {
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        query = k ? (OhciQueryWsEx)(void *)GetProcAddress(k, "K32QueryWorkingSetEx") : NULL;
+        tried = 1;
+    }
+    if (!query)
+        return 0;
+    w.VirtualAddress = (PVOID)p;
+    w.Flags = 0;
+    if (!query(GetCurrentProcess(), &w, sizeof w) || !(w.Flags & 1))
+        return 0;
+    *protect = (DWORD)((w.Flags >> 4) & 0x7FF);
+    return 1;
+}
+
 static int host_writable(const void *p, DWORD *protect)
 {
     MEMORY_BASIC_INFORMATION mbi;
     *protect = 0;
     const DWORD ok = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE
                    | PAGE_EXECUTE_WRITECOPY;
+    if (page_protect_fast(p, protect)) {
+        if (*protect & (PAGE_GUARD | PAGE_NOACCESS))
+            return 0;
+        return (*protect & ok) != 0;
+    }
     if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
         return 0;
     *protect = mbi.Protect;
@@ -710,8 +807,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (!g_setup_pending)
                 return TD_CC_NOERROR;
             if (g_ctrl_len < 0) {
-                g_ctrl_len = usb_gamepad_control(pad, &g_setup, g_ctrl_buf,
-                                                 (int)sizeof g_ctrl_buf);
+                g_ctrl_len = usb_dev_control(pad, &g_setup, g_ctrl_buf,
+                                             (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
                     /* Worth saying out loud. A stall here halts the
                      * endpoint until the driver clears it, and a driver
@@ -743,6 +840,24 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                         hc->index, n, g_ctrl_sent, g_ctrl_len);
                 fflush(stderr);
             }
+        } else if (pad == USB_DEV_XBLC) {
+            /* The headset moves data on isochronous endpoints only, which
+             * never come through here (ohci_do_itd). */
+            moved = 0;
+        } else if (USB_DEV_IS_HUB(pad)) {
+            /* The hub's status-change endpoint. Nothing changed is a NAK:
+             * the descriptor stays queued and is asked again next pass, as
+             * a real hub's interrupt endpoint is polled until it has
+             * something to say. */
+            uint8_t map[4];
+            int n = usb_hub_status_change(pad - USB_DEV_HUB0, map,
+                                          (int)sizeof map);
+            if (n <= 0)
+                return TD_NAK;
+            if (n > len) n = len;
+            if (n > 0)
+                dma_write(hc, cbp, map, (uint32_t)n);
+            moved = n;
         } else {
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
@@ -765,7 +880,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
          * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
          * pad; RECOMP_RUMBLE=0 ignores it. */
-        if (len >= 6 && guest_ptr(cbp, 6u)
+        if (len >= 6 && pad < USB_GAMEPAD_MAX && guest_ptr(cbp, 6u)
             && (endpoint != 0 || (g_setup_pending && g_setup.bmRequestType == 0x21
                                   && g_setup.bRequest == 0x09))) {
             static int rumble = -1;
@@ -811,6 +926,172 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     return TD_CC_NOERROR;
 }
 
+/* ---- isochronous transfers -------------------------------------------- */
+/*
+ * An endpoint descriptor with Format (F, bit 15) set carries isochronous
+ * transfer descriptors, OHCI 1.0a section 4.3.2. Eight dwords:
+ *
+ *   +0   SF (starting frame) | DI<<21 | FC<<24 (frames - 1) | CC<<28
+ *   +4   BP0, the buffer's first page (bits 31:12)
+ *   +8   NextTD
+ *   +C   BE, the buffer's last byte
+ *   +10  Offset/PSW 0..7, sixteen bits each, two to a dword, low half first
+ *
+ * One packet per frame. Before a packet moves its halfword is an offset --
+ * bits 11:0 into a page, bit 12 choosing BP0's page or BE's -- with
+ * NotAccessed (0xE or 0xF) in the condition code bits 15:12; afterwards it is
+ * the packet status word, the condition code and, for IN, the byte count. A
+ * packet ends where the next one starts, and the last one at BE.
+ *
+ * The Communicator (usb_xblc.c) is the only device here that has these: its
+ * microphone on IN endpoint 5 and its earpiece on OUT endpoint 4.
+ *
+ * ponytail: packets are served in queue order, a frame's worth per elapsed
+ * millisecond (s_iso_frames), and the starting frame is not compared with the
+ * frame counter. What a voice device needs is the rate, and this controller's
+ * frame counter is coarse: the register and the HCCA copy are not even the
+ * same clock (ohci_read derives HcFmNumber from the read count). Honouring SF
+ * against that would drop packets as late or hold them as early for reasons
+ * that have nothing to do with the driver.
+ */
+#define ED_FORMAT_ISO  (1u << 15)
+#define ITD_CC_NOT_ACCESSED 0xEu
+
+/* Packets each isochronous endpoint may move this pass: the milliseconds
+ * since the last pass, set by the controller thread. Each endpoint gets the
+ * whole count -- every endpoint moves one packet a frame. A single shared
+ * count let the earpiece (OUT), first on the list, spend it all, and the
+ * microphone moved a dozen packets a second instead of a thousand. */
+static int s_iso_frames;
+
+/* Isochronous endpoints already serviced this pass. The periodic walk visits
+ * an endpoint from every HCCA slot that leads to it, and each visit must not
+ * spend the budget again. */
+static uint32_t s_iso_seen[8];
+static int      s_iso_nseen;
+
+static unsigned long s_n_iso_in, s_n_iso_out, s_n_iso_td;
+
+/* A packet's position in the buffer as one linear range: BP0's page first,
+ * BE's page after it. */
+static uint32_t itd_lin(uint32_t off)
+{
+    return ((off & 0x1000u) ? 0x1000u : 0u) + (off & 0xFFFu);
+}
+
+static uint32_t itd_addr(uint32_t lin, uint32_t bp0, uint32_t be)
+{
+    return (lin < 0x1000u) ? bp0 + lin : (be & ~0xFFFu) + (lin - 0x1000u);
+}
+
+static uint32_t itd_get16(uint32_t td, unsigned i)
+{
+    uint32_t d = rd32(td + 16u + (i / 2u) * 4u);
+    return (i & 1u) ? (d >> 16) : (d & 0xFFFFu);
+}
+
+static void itd_put16(uint32_t td, unsigned i, uint32_t v)
+{
+    uint32_t at = td + 16u + (i / 2u) * 4u;
+    uint32_t d = rd32(at);
+    if (i & 1u)
+        d = (d & 0x0000FFFFu) | ((v & 0xFFFFu) << 16);
+    else
+        d = (d & 0xFFFF0000u) | (v & 0xFFFFu);
+    wr32(at, d);
+}
+
+/* Move the packets of one isochronous TD that the budget allows. Returns 1
+ * when every packet has moved and the TD is ready to retire. */
+static int ohci_do_itd(OhciController *hc, uint32_t ed0, uint32_t td,
+                       int *budget)
+{
+    uint32_t info = rd32(td);
+    uint32_t bp0  = rd32(td + 4) & ~0xFFFu;
+    uint32_t be   = rd32(td + 12);
+    unsigned fc   = (info >> 24) & 7u;
+    unsigned dir  = (ed0 >> 11) & 3u;       /* 1 OUT, 2 IN */
+    unsigned ep   = (ed0 >> 7) & 0xFu;
+    int      dev  = ohci_pad_for(ed0);
+    uint32_t be_lin = (((be & ~0xFFFu) == bp0) ? 0u : 0x1000u) + (be & 0xFFFu);
+    unsigned i;
+
+    if (s_trace && dev == USB_DEV_XBLC) {
+        static unsigned shown;
+        if (shown++ < 40) {
+            fprintf(stderr, "  [ITD] ep%u %s td=%08X sf=%u fc=%u bp0=%08X be=%08X offs",
+                    ep, dir == 2u ? "IN" : "OUT", td, info & 0xFFFFu, fc + 1,
+                    bp0, be);
+            for (i = 0; i <= fc; i++)
+                fprintf(stderr, " %04X", itd_get16(td, i));
+            fprintf(stderr, "\n");
+        }
+    }
+
+    for (i = 0; i <= fc; i++) {
+        uint32_t off = itd_get16(td, i);
+        uint32_t start, end, psw;
+        int size;
+
+        if ((off >> 12) < ITD_CC_NOT_ACCESSED)
+            continue;                       /* moved on an earlier pass */
+        if (*budget <= 0)
+            return 0;
+        (*budget)--;
+
+        start = itd_lin(off);
+        end   = (i == fc) ? be_lin + 1u : itd_lin(itd_get16(td, i + 1u));
+        size  = (end > start) ? (int)(end - start) : 0;
+        if (size > 1023) size = 1023;
+        psw = (uint32_t)TD_CC_NOERROR << 12;
+
+        if (dev == USB_DEV_XBLC && dir == 2u && ep == 5u) {
+            uint8_t buf[64];
+            int n = usb_xblc_mic_frame(buf, size < (int)sizeof buf
+                                            ? size : (int)sizeof buf);
+            uint32_t first = (start < 0x1000u && start + (uint32_t)n > 0x1000u)
+                           ? 0x1000u - start : (uint32_t)n;
+            if (first)
+                dma_write(hc, itd_addr(start, bp0, be), buf, first);
+            if ((uint32_t)n > first)
+                dma_write(hc, itd_addr(0x1000u, bp0, be), buf + first,
+                          (uint32_t)n - first);
+            s_n_iso_in++;
+            /* A short IN packet is DATA UNDERRUN in its status word, as on
+             * the hardware; the device sends 32 bytes a frame at 16 kHz into
+             * 48-byte packets. */
+            psw = ((n < size ? (uint32_t)TD_CC_DATAUNDERRUN : TD_CC_NOERROR)
+                   << 12) | ((uint32_t)n & 0x7FFu);
+        } else if (dev == USB_DEV_XBLC && dir == 1u && ep == 4u) {
+            uint8_t buf[64];
+            int n = size < (int)sizeof buf ? size : (int)sizeof buf, k;
+            for (k = 0; k < n; k++) {
+                const uint8_t *p = guest_ptr(itd_addr(start + (uint32_t)k,
+                                                      bp0, be), 1u);
+                buf[k] = p ? *p : 0;
+            }
+            usb_xblc_speaker_frame(buf, n);
+            s_n_iso_out++;
+            /* An OUT packet's status word has a size of zero. */
+        }
+        itd_put16(td, i, psw);
+    }
+
+    (void)hc;
+    return 1;
+}
+
+static int iso_seen_this_pass(uint32_t ed)
+{
+    int i;
+    for (i = 0; i < s_iso_nseen; i++)
+        if (s_iso_seen[i] == ed)
+            return 1;
+    if (s_iso_nseen < (int)(sizeof s_iso_seen / sizeof s_iso_seen[0]))
+        s_iso_seen[s_iso_nseen++] = ed;
+    return 0;
+}
+
 /* Walk the control list once. Returns 1 if anything completed. */
 /* Walk one list of endpoint descriptors, moving whatever is queued on each.
  *
@@ -840,12 +1121,41 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
         if (ed0 & ED_SKIP) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
         if (head & ED_HEAD_HALT) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
 
+        if (ed0 & ED_FORMAT_ISO) {
+            /* IsochronousEnable, bit 3 of HcControl, and once a pass. */
+            if (!(hc->reg[HcControl / 4] & 0x08u) || iso_seen_this_pass(ed)) {
+                ed = rd32(ed + 12) & ED_PTR_MASK;
+                continue;
+            }
+            int budget = s_iso_frames;
+            while ((head & ED_PTR_MASK) != tail
+                && guest_ok(head & ED_PTR_MASK, 32) && ++tguard < 64) {
+                uint32_t td = head & ED_PTR_MASK;
+                uint32_t next = rd32(td + 8) & ED_PTR_MASK;
+
+                if (!ohci_do_itd(hc, ed0, td, &budget))
+                    break;                  /* budget spent: next pass */
+                wr32(td, (rd32(td) & 0x0FFFFFFFu)
+                         | ((uint32_t)TD_CC_NOERROR << 28));
+                wr32(td + 8, *done_head);
+                *done_head = td;
+                completed++;
+                s_n_iso_td++;
+                head = next | (head & ED_HEAD_TOGGLE);
+            }
+            wr32(ed + 8, head);
+            ed = rd32(ed + 12) & ED_PTR_MASK;
+            continue;
+        }
+
         while ((head & ED_PTR_MASK) != tail
             && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
             uint32_t td = head & ED_PTR_MASK;
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
             uint32_t cc = ohci_do_td(hc, ed0, td);
 
+            if (cc == TD_NAK)
+                break;                      /* left queued, nothing retired */
             if (s_trace) {
                 static unsigned nr;
                 if (nr++ < 60)
@@ -981,6 +1291,18 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                 }
             }
             fprintf(stderr, "\n");
+            if (s_xblc_plugged) {
+                unsigned long mic, under, spk;
+                unsigned rate;
+                usb_xblc_stats(&mic, &under, &spk, &rate);
+                fprintf(stderr, "  [OHCI%d] Communicator: addr %u %s, %u Hz; "
+                        "iso TDs %lu, in %lu out %lu; mic frames %lu "
+                        "(%lu short), earpiece frames %lu\n",
+                        hc->index, usb_xblc_address(),
+                        usb_xblc_configured() ? "configured" : "unconfigured",
+                        rate, s_n_iso_td, s_n_iso_in, s_n_iso_out, mic, under,
+                        spk);
+            }
             /* A raised IRQL that never drops holds every interrupt off until
              * the forced-delivery timeout, which looks like a slow pad. Name
              * who is holding it. */
@@ -1235,9 +1557,16 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * status, so a device that was always there is one that never
          * arrives. */
         if (!plugged && s_plug_boot) {
-            /* Present since power-on (ohci_reset): already arrived. */
+            /* Present since power-on (ohci_reset): already arrived. In hub
+             * mode what is on the port is the controller's hub. */
             plugged = 1;
-            s_plugged_pads = 1;
+            if (s_hub_mode) {
+                s_hubs_plugged = 1;
+                s_addr0_dev = USB_DEV_HUB0;
+            } else {
+                s_plugged_pads = 1;
+                s_addr0_dev = 0;
+            }
             first_port = plug_port();
             fprintf(stderr, "  [OHCI0] operational after %u ms; device present "
                             "since power-on on port %u\n", waited * 20, first_port + 1);
@@ -1251,18 +1580,70 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
-            s_plugged_pads = 1;
+            if (s_hub_mode) {
+                s_hubs_plugged = 1;
+                s_addr0_dev = USB_DEV_HUB0;
+            } else {
+                s_plugged_pads = 1;
+                s_addr0_dev = 0;
+            }
             first_port = port;
-            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port %u\n", waited * 20, port + 1);
+            fprintf(stderr, "  [OHCI0] operational after %u ms; %s "
+                            "arriving on port %u\n", waited * 20,
+                    s_hub_mode ? "controller hub 1" : "device", port + 1);
             fflush(stderr);
+        }
+
+        /* Hub mode: each controller is a hub with its pad on hub port 1, and
+         * the Communicator goes in player 1's first expansion slot (hub port
+         * 2). One device at a time, each once the one before it is
+         * configured: hub, its pad, the next hub, its pad, ... headset.
+         * A device behind the hub arrives as a connection change on the hub's
+         * port, which the driver reads from the hub's status endpoint, and
+         * only once the driver has powered that port. */
+        if (plugged && s_hub_mode && ++settle > 50) {
+            int k = s_hubs_plugged - 1;
+            if (s_plugged_pads < s_hubs_plugged) {
+                if (usb_hub_configured(k) && usb_hub_port_powered(k, 1)) {
+                    usb_hub_plug(k, 1);
+                    s_addr0_dev = s_plugged_pads;
+                    s_plugged_pads++;
+                    fprintf(stderr, "  [OHCI0] pad %d arriving on hub %d "
+                            "port 1\n", s_plugged_pads, k + 1);
+                    fflush(stderr);
+                    settle = 0;
+                }
+            } else if (s_hubs_plugged < s_npads
+                       && usb_gamepad_configured(s_plugged_pads - 1)) {
+                unsigned port = (first_port + (unsigned)s_hubs_plugged) % s_ndp;
+                hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                s_addr0_dev = USB_DEV_HUB0 + s_hubs_plugged;
+                s_hubs_plugged++;
+                fprintf(stderr, "  [OHCI0] controller hub %d arriving on "
+                        "port %u\n", s_hubs_plugged, port + 1);
+                fflush(stderr);
+                settle = 0;
+            } else if (s_xblc_port >= 0 && !s_xblc_plugged
+                       && s_plugged_pads >= s_npads
+                       && usb_gamepad_configured(s_plugged_pads - 1)
+                       && usb_hub_port_powered(0, 2)) {
+                usb_hub_plug(0, 2);
+                s_xblc_plugged = 1;
+                s_addr0_dev = USB_DEV_XBLC;
+                usb_xblc_start();
+                fprintf(stderr, "  [OHCI0] Communicator arriving in player 1's "
+                        "first expansion slot (hub 1 port 2)\n");
+                fflush(stderr);
+                settle = 0;
+            }
         }
 
         /* More pads, one at a time: each arrives after the previous one is
          * configured, on the next port, so the driver enumerates them in
          * turn and there is only ever one device at the default address.
          * RECOMP_USB_PADS sets how many (1-4). */
-        if (plugged && s_plugged_pads < s_npads
+        if (plugged && !s_hub_mode && s_plugged_pads < s_npads
             && usb_gamepad_configured(s_plugged_pads - 1)) {
             if (++settle > 50) {                 /* ~1 s after the last */
                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
@@ -1271,7 +1652,38 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
                         s_plugged_pads + 1, port + 1, 10);
                 fflush(stderr);
+                s_addr0_dev = s_plugged_pads;
                 s_plugged_pads++;
+                settle = 0;
+            }
+        }
+
+        /* The Communicator, once every pad is in and configured, on the
+         * root port RECOMP_USB_XBLC names -- if no pad is on it. */
+        if (plugged && !s_hub_mode && s_xblc_port >= 0 && !s_xblc_plugged
+            && s_plugged_pads >= s_npads
+            && usb_gamepad_configured(s_plugged_pads - 1)) {
+            if (++settle > 50) {
+                unsigned port = (unsigned)s_xblc_port;
+                int k, taken = 0;
+                for (k = 0; k < s_plugged_pads; k++)
+                    if ((first_port + (unsigned)k) % s_ndp == port)
+                        taken = 1;
+                if (taken) {
+                    fprintf(stderr, "  [OHCI0] Communicator not plugged: a pad "
+                            "is on root port %u (set RECOMP_USB_PADS lower)\n",
+                            port + 1);
+                    s_xblc_port = -1;
+                } else {
+                    hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+                    hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                    s_xblc_plugged = 1;
+                    s_addr0_dev = USB_DEV_XBLC;
+                    usb_xblc_start();
+                    fprintf(stderr, "  [OHCI0] Communicator arriving on root "
+                            "port %u\n", port + 1);
+                }
+                fflush(stderr);
                 settle = 0;
             }
         }
@@ -1321,6 +1733,31 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * and is what the controller is specified to do. */
         if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
             goto deliver;
+
+        /* Isochronous packets owed since the last walk: one per elapsed
+         * millisecond, which is one per USB frame. Measured, because Sleep
+         * is coarser than the tick it is asked for. Capped, so a long stall
+         * does not dump a burst of stale packets on the driver. */
+        {
+            static LARGE_INTEGER freq, last;
+            static double carry;
+            LARGE_INTEGER now;
+            double ms;
+
+            if (!freq.QuadPart)
+                QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&now);
+            ms = last.QuadPart
+               ? (double)(now.QuadPart - last.QuadPart) * 1000.0
+                     / (double)freq.QuadPart
+               : (double)OHCI_TICK_MS;
+            last = now;
+            carry += ms;
+            if (carry > 32.0) carry = 32.0;
+            s_iso_frames = (int)carry;
+            carry -= (double)s_iso_frames;
+            s_iso_nseen = 0;
+        }
 
         /* PeriodicListEnable, bit 2 of HcControl. */
         if (control & 0x04u) {
@@ -1500,6 +1937,31 @@ void xbox_OhciInit(void)
         }
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
+    }
+    {
+        /* RECOMP_USB_XBLC=hub: hubs, and a Communicator in player 1's slot.
+         * RECOMP_USB_XBLC=<1-4>: no hubs, a Communicator on that root port.
+         * RECOMP_USB_HUB=1: hubs alone, no Communicator. */
+        const char *xb = getenv("RECOMP_USB_XBLC");
+        const char *hb = getenv("RECOMP_USB_HUB");
+        int n = xb ? atoi(xb) : 0;
+        if (hb && *hb == '1')
+            s_hub_mode = 1;
+        if (xb && strcmp(xb, "hub") == 0) {
+            s_hub_mode = 1;
+            s_xblc_port = 0;
+            fprintf(stderr, "  OHCI: controllers as hubs, Communicator in "
+                            "player 1's first expansion slot (RECOMP_USB_XBLC=hub)\n");
+        } else if (s_hub_mode) {
+            fprintf(stderr, "  OHCI: controllers as hubs (RECOMP_USB_HUB)\n");
+        }
+        if (n >= 1 && n <= 4 && !s_hub_mode) {
+            s_xblc_port = n - 1;
+            if ((unsigned)n > s_ndp)
+                s_ndp = (unsigned)n;
+            fprintf(stderr, "  OHCI: Communicator on root port %d once the "
+                            "pads are in (RECOMP_USB_XBLC)\n", n);
+        }
     }
 #if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX)
     /* No decoder for this host's instructions, so a trapped access could not

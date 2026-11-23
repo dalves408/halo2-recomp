@@ -189,6 +189,59 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+/* RECOMP_APU_ROUTE also traces stream feeding: each SSL the title hands a
+ * voice (segments and their total samples), and each time a stream voice
+ * runs dry, stamped in ms. Capped at 4000 lines. */
+static int s_ssl_min_voice;
+static int ssl_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *m = getenv("RECOMP_APU_SSL_MIN_VOICE");
+        on = apu_env_on("RECOMP_APU_ROUTE");
+        s_ssl_min_voice = m ? atoi(m) : 0;
+    }
+    return on;
+}
+static unsigned s_ssl_lines;
+static void ssl_trace(MCPXAPUState *d, const char *what, int v, int ssl)
+{
+    unsigned samples = 0;
+    int base, count, i;
+    static uint16_t per_voice[MCPX_HW_MAX_VOICES];
+    if (!ssl_trace_on() || s_ssl_lines >= 8000 || v < s_ssl_min_voice
+        || v >= MCPX_HW_MAX_VOICES || per_voice[v] >= 3000) return;
+    per_voice[v]++;
+    s_ssl_lines++;
+    base = d->vp.ssl[v].base[ssl];
+    count = d->vp.ssl[v].count[ssl];
+    for (i = 0; i < count; i++) {
+        hwaddr a = d->regs[NV_PAPU_VPSSLADDR] + (hwaddr)(base + i) * 8;
+        samples += (ldl_le_phys(address_space_memory, a + 4) & 0xffff) + 1;
+    }
+    {
+        /* Loudness of the first segment's data as handed over (16-bit). */
+        int peak = 0;
+        uint32_t nz = 0;
+        if (count > 0) {
+            hwaddr a = d->regs[NV_PAPU_VPSSLADDR] + (hwaddr)base * 8;
+            uint32_t off = ldl_le_phys(address_space_memory, a);
+            uint32_t len = (ldl_le_phys(address_space_memory, a + 4) & 0xffff) + 1;
+            const int16_t *s = (const int16_t *)mcpx_apu_phys(off);
+            for (uint32_t k = 0; s && k < len && k < 4096; k++) {
+                int x = s[k] < 0 ? -s[k] : s[k];
+                if (x > peak) peak = x;
+                if (x > 8) nz++;
+            }
+            fprintf(stderr, "[APU-SSL] %lu ms v=%d data off=%08X peak=%d loud=%u/%u\n",
+                    (unsigned long)GetTickCount(), v, off, peak, nz, len);
+        }
+    }
+    fprintf(stderr, "[APU-SSL] %lu ms v=%d %s ssl=%d base=%d count=%d samples=%u"
+            " playing=%d/%d\n", (unsigned long)GetTickCount(), v, what, ssl, base,
+            count, samples, d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg);
+}
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -466,6 +519,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        ssl_trace(d, "set", current_voice, ssl);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -476,6 +530,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        ssl_trace(d, "set", current_voice, ssl);
         break;
     }
 
@@ -1238,6 +1293,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                   d->vp.ssl[v].ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
+            if (ssl_trace_on() && s_ssl_lines < 8000 && !s_starve_run[v] && (int)v >= s_ssl_min_voice) {
+                s_ssl_lines++;
+                fprintf(stderr, "[APU-SSL] %lu ms v=%u dry ssl=%d\n",
+                        (unsigned long)GetTickCount(), v, d->vp.ssl[v].ssl_index);
+            }
             starve_mark(v);
             return -1;
         }
@@ -1382,6 +1442,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                if (ssl_trace_on() && seg_len <= 400 && (int)v >= s_ssl_min_voice) {
+                    static unsigned done_lines;
+                    const int16_t *s = (const int16_t *)mcpx_apu_phys(segment_offset);
+                    int peak = 0;
+                    for (int k = 0; s && k < seg_len + 1; k++) {
+                        int x = s[k] < 0 ? -s[k] : s[k];
+                        if (x > peak) peak = x;
+                    }
+                    if (done_lines++ < 6000)
+                        fprintf(stderr, "[APU-SSL] %lu ms v=%u done off=%08X peak=%d\n",
+                                (unsigned long)GetTickCount(), v,
+                                (unsigned)segment_offset, peak);
+                }
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1629,6 +1702,33 @@ static void voice_process(MCPXAPUState *d,
         s_vstat[v].rate = rate;
         s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
         s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
+    }
+
+    /* RECOMP_APU_ROUTE: a line whenever a voice's format, bins or volumes
+     * change -- where each voice sends its sound. Capped at 600 lines. */
+    {
+        static int route_on = -1;
+        static unsigned route_lines;
+        static uint32_t route_key[MCPX_HW_MAX_VOICES];
+        if (route_on < 0) route_on = apu_env_on("RECOMP_APU_ROUTE");
+        if (route_on > 0 && route_lines < 600) {
+            uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+            uint32_t key = fmt * 2654435761u;
+            for (int i = 0; i < 8; i++)
+                key = (key ^ ((uint32_t)bin[i] << 12 ^ vol[i])) * 16777619u;
+            if (key != route_key[v]) {
+                route_key[v] = key;
+                route_lines++;
+                fprintf(stderr, "[APU-ROUTE] v=%u fmt=%08X mp=%d ea=%.2f rate=%.3f"
+                        " bins/vol %u:%03X %u:%03X %u:%03X %u:%03X %u:%03X %u:%03X"
+                        " %u:%03X %u:%03X hr=%u/%u\n",
+                        (unsigned)v, fmt, multipass, ea_value, rate,
+                        bin[0], vol[0], bin[1], vol[1], bin[2], vol[2], bin[3], vol[3],
+                        bin[4], vol[4], bin[5], vol[5], bin[6], vol[6], bin[7], vol[7],
+                        (unsigned)d->vp.submix_headroom[bin[0]],
+                        (unsigned)d->vp.submix_headroom[bin[1]]);
+            }
+        }
     }
 
     if (voice_should_mute(v)) { s_vwhy[v] = 4; return; }

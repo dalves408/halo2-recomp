@@ -4020,6 +4020,22 @@ class Lifter:
             return [f"fp_top() = recomp_fprem(fp_top(), fp_st1(), {int(m == 'fprem1')}); /* {m} */"]
         if m == "fscale":
             return ["fp_top() = recomp_fscale(fp_top(), fp_st1()); /* fscale */"]
+        if m == "fxtract":
+            # st0 -> exponent, then push the significand: afterwards st1 is the
+            # unbiased exponent and st0 the significand in [1, 2) with the
+            # source's sign. Zero gives st1 = -inf and st0 the zero; an
+            # infinity gives st1 = +inf and st0 the infinity; a NaN goes to
+            # both (Intel SDM, FXTRACT). It was left as a comment, so the push
+            # never happened: the XDK voice codec's _fLog2 (fld; fxtract;
+            # faddp; fld1; fsubp) returned garbage and left the x87 stack one
+            # deeper on every call, and every Halo 2 voice packet decoded as
+            # noise, on xemu too.
+            return ["{ double _v = fp_top(); int _e;"
+                    " if (_v == 0.0) { fp_top() = -INFINITY; fp_push(_v); }"
+                    " else if (isinf(_v)) { fp_top() = INFINITY; fp_push(_v); }"
+                    " else if (_v != _v) { fp_push(_v); }"
+                    " else { double _s = frexp(_v, &_e) * 2.0;"
+                    " fp_top() = (double)(_e - 1); fp_push(_s); } } /* fxtract */"]
         if m == "frndint":
             # Rounds under the guest's x87 RC bits, like FIST. rint() used the
             # host's rounding mode, which the guest's fldcw never reaches, so
