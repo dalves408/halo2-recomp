@@ -718,6 +718,7 @@ void halo2_install_root(char *buf, size_t n);
 typedef struct { char magic[8]; uint32_t key_size, reserved; } RcKeysHeader;
 static GpuRcKey *s_pre_keys;
 static volatile LONG s_pre_n, s_pre_next, s_pre_built, s_pre_done_threads;
+static volatile LONG s_pre_running, s_pre_done_keys, s_pre_background;
 static LONG s_pre_threads;
 static double s_pre_started;
 static CRITICAL_SECTION s_keylog_lock;
@@ -786,17 +787,26 @@ static DWORD WINAPI rc_prebuild_worker(LPVOID arg)
 {
     static const char name[] = "rc", entry[] = "ps_main", target[] = "ps_5_0";
     char *src = (char *)malloc(64 * 1024);
+    int idle;
     (void)arg;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    idle = s_pre_background;
+    SetThreadPriority(GetCurrentThread(),
+                      idle ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_NORMAL);
     while (src) {
         LONG i = InterlockedIncrement(&s_pre_next) - 1;
         size_t len;
         ID3DBlob *blob = NULL, *err = NULL;
         if (i >= s_pre_n)
             break;
+        if (!idle && s_pre_background) {     /* the player went on: give way to the game */
+            idle = 1;
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        }
         len = gpu_rc_hlsl(&s_pre_keys[i], src, 64 * 1024);
-        if (!len || gpu_pscache_has(src, len, name, entry, target, SHADER_COMPILE_FLAGS))
+        if (!len) {
+            InterlockedIncrement(&s_pre_done_keys);
             continue;
+        }
         if (SUCCEEDED(D3DCompile(src, len, name, NULL, NULL, entry, target,
                                  SHADER_COMPILE_FLAGS, 0, &blob, &err)) && blob) {
             gpu_pscache_store(src, len, name, entry, target, SHADER_COMPILE_FLAGS,
@@ -805,11 +815,14 @@ static DWORD WINAPI rc_prebuild_worker(LPVOID arg)
         }
         if (blob) ID3D10Blob_Release(blob);
         if (err) ID3D10Blob_Release(err);
+        InterlockedIncrement(&s_pre_done_keys);
     }
     free(src);
-    if (InterlockedIncrement(&s_pre_done_threads) == s_pre_threads)
+    if (InterlockedIncrement(&s_pre_done_threads) == s_pre_threads) {
+        InterlockedExchange(&s_pre_running, 0);
         fprintf(stderr, "[GPU-PSCACHE] prebuild done: %ld of %ld shaders compiled in %.1f s\n",
                 (long)s_pre_built, (long)s_pre_n, (qpc_ms() - s_pre_started) / 1000.0);
+    }
     return 0;
 }
 
@@ -894,6 +907,76 @@ static void rc_log_extra_keys(const wchar_t *mine_path, const wchar_t *seed_path
     free(seen);
 }
 
+/* Keeps only the listed shaders the disk cache does not have yet, then
+ * builds them. With RC_PREBUILD_PAUSE or more to build -- a first start, or
+ * the first after a release grew the starter list -- the overlay pauses the
+ * game behind a "PREPARING SHADERS" panel (overlay.c) and every core builds
+ * at normal priority; built in the background instead, two threads took a
+ * 2-core laptop's intro video from 30 to 26 fps for the whole build. A few
+ * build quietly on one idle-priority thread. A player who goes on from the
+ * panel sends the rest to idle priority (halo2_shader_build_background). */
+#define RC_PREBUILD_PAUSE 20
+static DWORD WINAPI rc_prebuild_scan(LPVOID arg)
+{
+    static const char name[] = "rc", entry[] = "ps_main", target[] = "ps_5_0";
+    char *src = (char *)malloc(64 * 1024);
+    LONG i, keep = 0;
+    int threads;
+    SYSTEM_INFO si;
+    (void)arg;
+    for (i = 0; src && i < s_pre_n; i++) {
+        size_t len = gpu_rc_hlsl(&s_pre_keys[i], src, 64 * 1024);
+        if (len && !gpu_pscache_has(src, len, name, entry, target, SHADER_COMPILE_FLAGS))
+            s_pre_keys[keep++] = s_pre_keys[i];
+    }
+    free(src);
+    GetSystemInfo(&si);
+    if (keep >= RC_PREBUILD_PAUSE) {
+        threads = (int)si.dwNumberOfProcessors;
+        if (threads > 8) threads = 8;
+    } else {
+        threads = 1;
+        InterlockedExchange(&s_pre_background, 1);
+    }
+    if (threads < 1) threads = 1;
+    fprintf(stderr, "[GPU-PSCACHE] %ld shaders to build (%ld already built), %d thread%s%s\n",
+            (long)keep, (long)(s_pre_n - keep), threads, threads == 1 ? "" : "s",
+            keep >= RC_PREBUILD_PAUSE ? ", game paused" : " in the background");
+    InterlockedExchange(&s_pre_n, keep);
+    if (!keep) {
+        InterlockedExchange(&s_pre_running, 0);
+        return 0;
+    }
+    s_pre_threads = threads;
+    for (i = 0; i < threads; i++) {
+        HANDLE t = CreateThread(NULL, 0, rc_prebuild_worker, NULL, 0, NULL);
+        if (t)
+            CloseHandle(t);
+        else
+            InterlockedDecrement(&s_pre_threads);
+    }
+    if (!s_pre_threads)
+        InterlockedExchange(&s_pre_running, 0);
+    return 0;
+}
+
+/* For the overlay's "PREPARING SHADERS" panel: 1 while shaders are being
+ * built and the game should wait for them (not once sent to the background);
+ * *done of *total built so far. */
+int halo2_shader_build_status(int *done, int *total)
+{
+    LONG n = s_pre_n, d = s_pre_done_keys;
+    if (done) *done = (int)(d < n ? d : n);
+    if (total) *total = (int)n;
+    return s_pre_running && !s_pre_background && n >= RC_PREBUILD_PAUSE;
+}
+
+/* The player went on: what is left builds at idle priority behind the game. */
+void halo2_shader_build_background(void)
+{
+    InterlockedExchange(&s_pre_background, 1);
+}
+
 static void rc_prebuild_start(void)
 {
     const wchar_t *dir = gpu_pscache_directory();
@@ -936,20 +1019,17 @@ static void rc_prebuild_start(void)
         free(keys);
         return;
     }
-    GetSystemInfo(&si);
-    threads = (int)si.dwNumberOfProcessors / 2;
-    if (threads < 1) threads = 1;
-    if (threads > 4) threads = 4;
+    (void)si; (void)threads; (void)i;
     s_pre_keys = keys;
     s_pre_n = n;
-    s_pre_threads = threads;
     s_pre_started = qpc_ms();
-    for (i = 0; i < threads; i++) {
-        HANDLE t = CreateThread(NULL, 0, rc_prebuild_worker, NULL, 0, NULL);
+    InterlockedExchange(&s_pre_running, 1);
+    {
+        HANDLE t = CreateThread(NULL, 0, rc_prebuild_scan, NULL, 0, NULL);
         if (t)
             CloseHandle(t);
         else
-            InterlockedDecrement(&s_pre_threads);
+            InterlockedExchange(&s_pre_running, 0);
     }
 }
 

@@ -4,7 +4,7 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.6** is out: get `Halo2-Recomp-Setup-1.0.6.exe` from
+**Version 1.0.7** is out: get `Halo2-Recomp-Setup-1.0.7.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
 [hi-res texture pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2) is a
 separate download (below).
@@ -157,7 +157,9 @@ The offline launcher has no network; the System Link launcher's internet router 
   itself, or `--iscc`).
 - **ZIP:** it writes the RecompLauncher ZIP (`scripts\recomplauncher_manifest.py`).
 - **Shader starter list:** `installer\shader_keys.bin`, when present, goes into the Setup and
-  the ZIP beside the game. Grow it from players' logs (and `data\shader-cache\keys.bin`
+  the ZIP beside the game. At the first start (or the first after a release adds 20 or more)
+  the game pauses behind a "PREPARING SHADERS" panel while every core builds them, then goes
+  on by itself; Esc, B or a click plays at once and builds the rest in the background. Grow it from players' logs (and `data\shader-cache\keys.bin`
   files) with `python halo2-native-tu15\scripts\merge_shader_keys.py <logs or .bin files>`.
   It is recorded in play, so like the title update patches it is shipped, never committed.
 

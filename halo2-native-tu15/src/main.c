@@ -547,6 +547,11 @@ static DWORD WINAPI halo2_fps_policy(LPVOID unused)
         setting = fps_setting();
         in_match = live_rule && nat_live_match_recent(10000);
         now = GetTickCount();
+        if (halo2_overlay_active()) {            /* F1 or the shader build: paused, not slow */
+            f0 = halo2_gpu_flip_count(); d0 = halo2_gpu_draw_count(); c0 = halo2_gpu_compile_ms(); t0 = now;
+            fps_apply(setting, in_match);
+            continue;
+        }
         if (setting != setting_was || in_match != in_match_was) {
             if (setting != setting_was) {
                 InterlockedExchange(&s_fps_auto_low, 0);

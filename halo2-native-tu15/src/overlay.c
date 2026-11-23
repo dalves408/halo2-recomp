@@ -34,7 +34,11 @@ extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
 enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
-enum { MODE_NONE, MODE_QUIT, MODE_SET };
+enum { MODE_NONE, MODE_QUIT, MODE_SET, MODE_BUILD };
+
+/* gpu/d3d11_backend.c: the first-start shader build (rc_prebuild_scan). */
+int halo2_shader_build_status(int *done, int *total);
+void halo2_shader_build_background(void);
 enum { PAGE_VIDEO, PAGE_CONTROLS };
 enum { M_AIM, M_SENS, M_INV };
 
@@ -267,6 +271,52 @@ static void close_overlay(void)
     pause_off();
     h2_mouse_overlay_changed();         /* mouse aim takes the pointer back */
     fprintf(stderr, "[OVERLAY] close\n");
+}
+
+static int s_build_seen, s_build_last = -1;
+static DWORD s_build_painted;
+
+static void open_build(void)
+{
+    pause_on();
+    InterlockedExchange(&s_listen, 0);
+    InterlockedExchange(&s_mode, MODE_BUILD);
+    pointer_to_menu();
+    layout_overlay(s_game);
+    fprintf(stderr, "[OVERLAY] preparing shaders\n");
+}
+
+static void skip_build(void)
+{
+    halo2_shader_build_background();
+    fprintf(stderr, "[OVERLAY] shaders: the player went on, the rest builds in the background\n");
+    close_overlay();
+}
+
+static void paint(void);
+
+/* The overlay timer: show the panel while the first-start build runs, repaint
+ * it when the count moves (at most 5 times a second: the build wants the
+ * CPU), and close it when the build is done. */
+static void build_tick(void)
+{
+    int done = 0, total = 0;
+    int running = halo2_shader_build_status(&done, &total);
+    if (s_mode == MODE_NONE && running && !s_build_seen && s_game) {
+        s_build_seen = 1;
+        open_build();
+    }
+    if (s_mode != MODE_BUILD)
+        return;
+    if (!running) {
+        close_overlay();
+        return;
+    }
+    if (done != s_build_last && GetTickCount() - s_build_painted >= 200) {
+        s_build_last = done;
+        s_build_painted = GetTickCount();
+        paint();
+    }
 }
 
 static void open_quit(void)
@@ -568,6 +618,57 @@ static void draw_quit(HDC hdc, int w, int h, RECT *box)
     ui_fonts_free(&f);
 }
 
+/* "PREPARING SHADERS": the game waits while the shaders it will need are
+ * built (a first start, or the first after a release added to the starter
+ * list). It closes by itself when they are done; Esc, B, Start, Enter or a
+ * click plays at once and leaves the rest to build in the background. */
+static void draw_build(HDC hdc, int w, int h, RECT *box)
+{
+    UiFonts f;
+    RECT band, msg, bar, fill;
+    float sc = (float)w / 960.0f;
+    int bw, bh, done = 0, total = 0;
+    char line[96];
+    HBRUSH b;
+
+    if ((float)h / 640.0f < sc) sc = (float)h / 640.0f;
+    halo2_shader_build_status(&done, &total);
+    ui_fonts_make(&f, sc);
+    bw = ui_px(&f, 560);
+    bh = ui_px(&f, 250);
+    SetRect(box, (w - bw) / 2, (h - bh) / 2, (w - bw) / 2 + bw, (h - bh) / 2 + bh);
+    ui_chamfer(hdc, box, ui_px(&f, 22), RGB(6, 24, 54), RGB(70, 140, 214));
+    SetRect(&band, box->left + ui_px(&f, 10), box->top + ui_px(&f, 10),
+            box->right - ui_px(&f, 10), box->top + ui_px(&f, 62));
+    ui_header(hdc, &f, &band, "PREPARING SHADERS", NULL, 0, 0, 0, 0, NULL);
+    SetRect(&msg, box->left + ui_px(&f, 24), band.bottom + ui_px(&f, 8),
+            box->right - ui_px(&f, 24), band.bottom + ui_px(&f, 44));
+    ui_text(hdc, f.body, RGB(242, 246, 251), &msg, "Building shaders so the game plays smoothly.",
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetRect(&bar, box->left + ui_px(&f, 40), msg.bottom + ui_px(&f, 10),
+            box->right - ui_px(&f, 40), msg.bottom + ui_px(&f, 34));
+    b = CreateSolidBrush(RGB(16, 44, 86));
+    FillRect(hdc, &bar, b);
+    DeleteObject(b);
+    fill = bar;
+    if (total > 0)
+        fill.right = bar.left + (int)((double)(bar.right - bar.left) * done / total);
+    if (fill.right > fill.left) {
+        b = CreateSolidBrush(RGB(130, 206, 255));
+        FillRect(hdc, &fill, b);
+        DeleteObject(b);
+    }
+    snprintf(line, sizeof line, "%d of %d", done, total);
+    SetRect(&msg, box->left, bar.bottom + ui_px(&f, 6), box->right, bar.bottom + ui_px(&f, 34));
+    ui_text(hdc, f.body, RGB(242, 246, 251), &msg, line, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetRect(&msg, box->left + ui_px(&f, 20), box->bottom - ui_px(&f, 50),
+            box->right - ui_px(&f, 20), box->bottom - ui_px(&f, 16));
+    ui_text(hdc, f.fine, RGB(150, 178, 210), &msg,
+            "First start only. Esc, B or a click: play now and build the rest in the background.",
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    ui_fonts_free(&f);
+}
+
 static void paint(void)
 {
     RECT cr;
@@ -587,7 +688,7 @@ static void paint(void)
         return;
     hdc = GetDC(s_hwnd);
     mem = CreateCompatibleDC(hdc);
-    if (s_mode == MODE_QUIT) {
+    if (s_mode == MODE_QUIT || s_mode == MODE_BUILD) {
         /* Per-pixel alpha: the panel solid, the game around it dimmed. */
         BITMAPINFO bi;
         unsigned int *px = NULL;
@@ -608,7 +709,10 @@ static void paint(void)
         }
         old = SelectObject(mem, bm);
         memset(px, 0, (size_t)w * h * 4);
-        draw_quit(mem, w, h, &box);
+        if (s_mode == MODE_BUILD)
+            draw_build(mem, w, h, &box);
+        else
+            draw_quit(mem, w, h, &box);
         GdiFlush();
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
@@ -669,6 +773,11 @@ static void move_row(int dir)
 static void on_key(WPARAM w)
 {
     int mode = (int)s_mode;
+    if (mode == MODE_BUILD) {
+        if (w == VK_ESCAPE || w == VK_RETURN || w == VK_SPACE)
+            skip_build();
+        return;
+    }
     if (w == VK_ESCAPE) {
         if (mode == MODE_NONE)
             open_quit();
@@ -785,7 +894,7 @@ static void poll_pad(void)
      * button is up, so the START still held does not act in the menu; the
      * game never sees that START (overrides/xinput_device.c hides START
      * while BACK is held). */
-    if ((b & 0x0020) && (press & 0x0010) && !s_listen && mode != MODE_QUIT) {
+    if ((b & 0x0020) && (press & 0x0010) && !s_listen && mode != MODE_QUIT && mode != MODE_BUILD) {
         if (mode == MODE_SET)
             close_overlay();
         else
@@ -843,6 +952,11 @@ static int on_mouse(UINT m, WPARAM w, LPARAM l)
 
     if (mode == MODE_NONE || s_listen)
         return 0;
+    if (mode == MODE_BUILD) {
+        if (left)
+            skip_build();
+        return m != WM_SETCURSOR;
+    }
     if (m == WM_SETCURSOR) {
         if (LOWORD(l) != HTCLIENT)
             return 0;
@@ -984,11 +1098,12 @@ static LRESULT CALLBACK overlay_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             layout_overlay(s_game);
         if (s_listen)
             poll_listen_mouse();
+        build_tick();
         poll_pad();
 #ifdef RECOMP_DEBUG_TOOLS
         fps_tick();
 #endif
-        if (s_mode != MODE_NONE)
+        if (s_mode != MODE_NONE && s_mode != MODE_BUILD)
             paint();
         return 0;
     }
