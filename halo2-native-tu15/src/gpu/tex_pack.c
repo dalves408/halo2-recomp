@@ -107,11 +107,15 @@ static int parse_name(const char *name, uint64_t *hash, uint32_t *w, uint32_t *h
     return 1;
 }
 
-/* Textures the game keeps even when the pack has them: the zoom overlays
- * (ui\hud\bitmaps\new_hud\scope_masks -- battle rifle, sniper, beam rifle,
- * carbine, binoculars). They are thin line art drawn at their own size;
- * upscaled, the lines go thick and the dotted rim is lost. Matched on the
- * tag name the pack's file names end with. */
+/* The zoom overlays (ui\hud\bitmaps\new_hud\scope_masks -- battle rifle,
+ * sniper, beam rifle, carbine, binoculars) are thin line art drawn at their
+ * own size. The first pack's BC7 versions came from a photo upscaler: the
+ * lines went thick and opaque and the dotted rim was lost, so those files are
+ * skipped and the game's own textures used. The remade versions
+ * (scripts\remake_alpha.py: alpha rebuilt so a 4x box
+ * downsample gives the original back) are uncompressed R8G8B8A8 and load
+ * normally; pack_remade() tells them apart. Matched on the tag name the
+ * pack's file names end with. */
 static int pack_skip(const char *name)
 {
     static const char *const skip[] = { "_scope_mask_", "_binoculars_elite", "_binoculars_human" };
@@ -125,6 +129,20 @@ static int pack_skip(const char *name)
         if (strstr(low, skip[i]))
             return 1;
     return 0;
+}
+
+/* 1 when a DDS is uncompressed R8G8B8A8 with a DX10 header (the remade overlays). */
+static int pack_remade(const char *path)
+{
+    unsigned char h[148];
+    FILE *f = fopen(path, "rb");
+    size_t got;
+    if (!f)
+        return 0;
+    got = fread(h, 1, sizeof h, f);
+    fclose(f);
+    return got == sizeof h && !memcmp(h, "DDS ", 4) && !memcmp(h + 84, "DX10", 4) &&
+           (h[128] | h[129] << 8) == 28 /* DXGI_FORMAT_R8G8B8A8_UNORM */;
 }
 
 static void scan_dir(const char *dir, int depth)
@@ -155,7 +173,7 @@ static void scan_dir(const char *dir, int depth)
             continue;
         if (!parse_name(fd.cFileName, &hash, &w, &h))
             continue;
-        if (pack_skip(fd.cFileName))
+        if (pack_skip(fd.cFileName) && !pack_remade(full))
             continue;
         if (s_nfiles == s_capfiles) {
             int cap = s_capfiles ? s_capfiles * 2 : 1024;

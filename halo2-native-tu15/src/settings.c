@@ -71,6 +71,7 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->mouse_aim = 0;
     s->mouse_sens = 100;
     s->mouse_invert = 0;
+    s->frame_rate = 0;     /* Auto */
 }
 
 static int clamp_sens(int v) { return v < 10 ? 10 : (v > 500 ? 500 : v); }
@@ -141,6 +142,8 @@ int halo2_settings_load(Halo2Settings *s)
     s->mouse_aim = cfg_get_input("mouse_aim", 0, path) != 0;
     s->mouse_sens = clamp_sens(cfg_get_input("mouse_sens", 100, path));
     s->mouse_invert = cfg_get_input("mouse_invert", 0, path) != 0;
+    s->frame_rate = cfg_get("frame_rate", 0, path);
+    if (s->frame_rate < 0 || s->frame_rate > 2) s->frame_rate = 0;
     return 1;
 }
 
@@ -176,6 +179,7 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("msaa", clamp_msaa(s->msaa), path);
     cfg_put("widescreen", s->widescreen >= 0 && s->widescreen <= 3 ? s->widescreen : 2, path);
     cfg_put("hires_textures", s->hires_textures ? 1 : 0, path);
+    cfg_put("frame_rate", s->frame_rate >= 0 && s->frame_rate <= 2 ? s->frame_rate : 0, path);
     cfg_put_in("input", "mouse_aim", s->mouse_aim ? 1 : 0, path);
     cfg_put_in("input", "mouse_sens", clamp_sens(s->mouse_sens), path);
     cfg_put_in("input", "mouse_invert", s->mouse_invert ? 1 : 0, path);
@@ -301,10 +305,11 @@ void halo2_settings_boot(void)
     widescreen_boot(s_cur.widescreen);
     s_loaded = 1;
     fprintf(stderr,
-            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires_textures=%d;"
-            " mouse aim=%d sens=%d%% invert=%d\n",
+            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires_textures=%d"
+            " frame_rate=%s; mouse aim=%d sens=%d%% invert=%d\n",
             s_cur.resolution_scale, s_cur.fullscreen, s_cur.vsync,
             s_cur.anisotropy, s_cur.fxaa, s_cur.msaa, s_cur.hires_textures,
+            s_cur.frame_rate == 1 ? "60" : s_cur.frame_rate == 2 ? "30" : "auto",
             s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert);
 }
 
@@ -378,6 +383,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     t.mouse_aim = t.mouse_aim ? 1 : 0;
     t.mouse_sens = clamp_sens(t.mouse_sens);
     t.mouse_invert = t.mouse_invert ? 1 : 0;
+    if (t.frame_rate < 0 || t.frame_rate > 2) t.frame_rate = 0;
     pending_init();
     EnterCriticalSection(&s_pending_lock);
     s_cur = t;

@@ -270,14 +270,26 @@ static inline void hrtf_filter_process(HrtfFilter *f,
             int di = (int)d;
             float dfrac = d - di;
             float acc = 0.0f;
-            for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
-                float s = buf[idx1];
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
-                    s = s * (1 - dfrac) + buf[idx2] * dfrac;
+            /* The same sums in the same order as xemu's, with the ring
+             * index wrapped by a compare instead of two divisions a tap
+             * and the fractional-delay test made once per sample: the HRTF
+             * was 40% of the APU thread on an i5-8250U (2026-11-22). */
+            int idx1 = f->buf_pos - di;
+            if (idx1 < 0) idx1 += HRTF_BUFLEN;
+            if (dfrac > 0.0f) {
+                float w0 = 1 - dfrac;
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    int idx2 = idx1 - 1;
+                    if (idx2 < 0) idx2 += HRTF_BUFLEN;
+                    float s = buf[idx1] * w0 + buf[idx2] * dfrac;
+                    acc += coeff[k] * s;
+                    idx1 = idx2;
                 }
-                acc += coeff[k] * s;
+            } else {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    acc += coeff[k] * buf[idx1];
+                    if (--idx1 < 0) idx1 += HRTF_BUFLEN;
+                }
             }
             out[n][ch] = acc;
         }

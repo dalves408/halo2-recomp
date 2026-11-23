@@ -73,6 +73,8 @@ Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\third_party\SDL3-3.4.20\LICENSE.txt"; DestDir: "{app}"; DestName: "SDL3-LICENSE.txt"; Flags: ignoreversion skipifsourcedoesntexist
 ; the default keyboard and mouse layout (a player's own changes are in data\keymap.ini)
 Source: "..\keymap.ini"; DestDir: "{app}"; Flags: ignoreversion
+; the shader starter list, recorded in play: built in the background at the first start (shipped, never committed)
+Source: "shader_keys.bin"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\halo2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 ; title update 1.5, made from the disc (scripts/convert_tu_patches.py); beside the importer
@@ -95,7 +97,7 @@ Name: "{autodesktop}\Halo 2 Recomp"; Filename: "{app}\halo2_recomp.exe"; Working
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 #ifdef HasTextures
-Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download)"; Flags: unchecked; Check: TexturePackNeedsInstall
+Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download; only a small update if an earlier pack is installed)"; Flags: unchecked; Check: TexturePackNeedsInstall
 #endif
 
 [Run]
@@ -388,8 +390,7 @@ begin
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
-      if TextureAllPartsLocal then S := S + NewLine + NewLine + 'Hi-res texture pack: Setup will check and use the texture archive beside it.'
-      else S := S + NewLine + NewLine + 'Hi-res texture pack: Setup will download it (about {#TextureDownloadBytes / 1000000} MB).';
+      S := S + NewLine + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
 #endif
     Result := S;
   end else
@@ -401,8 +402,7 @@ begin
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
-      if TextureAllPartsLocal then S := S + NewLine + 'Hi-res texture pack: Setup will check and use the texture archive beside it.'
-      else S := S + NewLine + 'Hi-res texture pack: Setup will download it (about {#TextureDownloadBytes / 1000000} MB).';
+      S := S + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
 #endif
     Result := S;
   end;

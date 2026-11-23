@@ -43,7 +43,11 @@ SolidCompression=yes
 
 [Messages]
 WelcomeLabel1=Halo 2 Recomp Hi-Res Textures
+#ifdef TexturePatchFrom
+WelcomeLabel2=Add the hi-res texture pack revision {#TextureVersion} ({#TextureFileCount} textures, upscaled 4x) to Halo 2 Recomp.%n%nIf texture pack revision {#TexturePatchFrom} is already installed, Setup downloads only a small update (about {#TexturePatchBytes / 1000000 + 1} MB) and replaces the changed textures. Otherwise it uses the texture-*.bin files beside this EXE, or downloads the full pack ({#TexturePartCount} parts, about {#TextureDownloadBytes / 1000000} MB in all). An interrupted download resumes when you run Setup again.%n%nRequires Halo 2 Recomp 1.0.0 or newer.
+#else
 WelcomeLabel2=Add the hi-res texture pack ({#TextureFileCount} textures, upscaled 4x) to Halo 2 Recomp.%n%nSetup uses the texture-*.bin files beside this EXE if they are there; otherwise it downloads them ({#TexturePartCount} parts, about {#TextureDownloadBytes / 1000000} MB in all). An interrupted download resumes when you run Setup again.%n%nRequires Halo 2 Recomp 1.0.0 or newer.
+#endif
 SelectDirLabel3=Choose your installed Halo 2 Recomp folder (the one with halo2_recomp.exe).
 ButtonInstall=&Extract
 ReadyLabel1=Ready to extract the hi-res texture pack.
@@ -143,10 +147,8 @@ begin
   Result := MemoDirInfo;
   if not TexturePackNeedsInstall then
     Result := Result + NewLine + NewLine + 'This hi-res texture pack is already installed. No download or extraction is needed.'
-  else if TextureAllPartsLocal then
-    Result := Result + NewLine + NewLine + 'Setup will check and use the texture archives beside it.'
   else
-    Result := Result + NewLine + NewLine + 'Setup will download the texture archives ({#TexturePartCount} parts, about {#TextureDownloadBytes / 1000000} MB).';
+    Result := Result + NewLine + NewLine + TextureDownloadPlanText;
 end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);

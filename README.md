@@ -4,9 +4,9 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.4** is out: get `Halo2-Recomp-Setup-1.0.4.exe` from
+**Version 1.0.7** is out: get `Halo2-Recomp-Setup-1.0.7.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
-[hi-res texture pack](https://github.com/dalves408/halo2-recomp/releases/tag/textures-1) is a
+[hi-res texture pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2) is a
 separate download (below).
 
 **No game content is in this repository.** You need your own retail Halo 2 disc. The
@@ -51,14 +51,17 @@ difference between the disc's executables and the update's.
 `config.exe` beside the game (Start menu: Halo 2 Recomp Settings) and F1 in the game edit
 the same `data\settings.ini` and `data\keymap.ini`:
 
-- **VIDEO:** render scale, fullscreen, VSync, anisotropic filtering, FXAA, MSAA,
-  widescreen, and hi-res textures on or off (both at the next start; "Not installed" when
-  there is no texture pack).
+- **VIDEO:** render scale, fullscreen, VSync, frame rate, anisotropic filtering, FXAA, MSAA,
+  widescreen, and hi-res textures on or off ("Not installed" when there is no texture
+  pack; in the F1 menu it applies at once from 1.0.5).
+- **Frame rate** (from 1.0.6): **Auto** (the default) plays at 60 fps and switches to 30 for the
+  rest of the session when the PC cannot hold 60 in play (an even 30 looks better than an
+  uneven 40-50); **60** or **30** fixes it. Xbox Live matches run at 30 whatever it says.
 - **CONTROLS:** every action with up to three keys or mouse buttons, plus mouse aim,
   sensitivity and invert (below).
 - The F1 menu works with the keyboard, a controller or the mouse: click a tab, a row or its
   arrows, the wheel moves between rows, right click steps a setting back or clears a
-  binding.
+  binding. On a controller, **hold Back and press Start** to open or close it.
 - F11 or Alt+Enter switches fullscreen in the game and keeps the choice. Esc asks to quit.
 - **Updates:** the F1 menu and `config.exe` check this repository's latest release (at most
   once every two hours) and show an UPDATE banner when there is a newer one. Choosing it
@@ -81,7 +84,11 @@ The game writes one log per run, keeping the last three and stopping routine lin
 - a `[BUILD]` line (version, symbol id, Windows, CPU, GPU, memory);
 - `[VIDEO]` lines when it starts and when a setting changes;
 - a `[FREEZE]` report with every thread's call stack when no frame comes for 10 seconds;
-- a `[CRASH]` report for a fatal error.
+- a `[CRASH]` report for a fatal error;
+- `[SHADER-KEY]` lines (from 1.0.6): the shaders your PC has built that the release's starter
+  list does not have yet. They hold only the game's own shader settings, no names, paths
+  or hardware details, and they let the next release build them in the background at the
+  first start instead of mid-level (`scripts/merge_shader_keys.py`).
 
 Your Windows user name is blanked out. The `.pdb` files stay with the developer:
 `scripts/symbolize_log.py` turns the offsets in a report into function names.
@@ -149,6 +156,12 @@ The offline launcher has no network; the System Link launcher's internet router 
   makes the icon) and compiles `installer\halo2.iss` with Inno Setup 6.6 or newer (found by
   itself, or `--iscc`).
 - **ZIP:** it writes the RecompLauncher ZIP (`scripts\recomplauncher_manifest.py`).
+- **Shader starter list:** `installer\shader_keys.bin`, when present, goes into the Setup and
+  the ZIP beside the game. At the first start (or the first after a release adds 20 or more)
+  the game pauses behind a "PREPARING SHADERS" panel while every core builds them, then goes
+  on by itself; Esc, B or a click plays at once and builds the rest in the background. Grow it from players' logs (and `data\shader-cache\keys.bin`
+  files) with `python halo2-native-tu15\scripts\merge_shader_keys.py <logs or .bin files>`.
+  It is recorded in play, so like the title update patches it is shipped, never committed.
 
 Everything lands in `installer\Output` with `.sha256` files. `installer\manifest.h`
 (sizes and hashes only) comes from `installer\gen_manifest.py <game folder> <disc image>`.
@@ -233,21 +246,37 @@ copies off.
 
 ## Hi-res textures
 
-**For players:** the [Hi-Res Texture Pack](https://github.com/dalves408/halo2-recomp/releases/tag/textures-1)
-has 4,645 of the game's textures upscaled 4x, as BC7 with mipmaps.
+**For players:** the [Hi-Res Texture Pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2)
+has 4,645 of the game's textures upscaled 4x, with mipmaps. Most are BC7. The scope and
+binocular overlays and the Metropolis water masks are uncompressed, and their transparency
+is exact: scaled back down, they match the originals.
 
-- **Install:** run `Halo2-Recomp-HiRes-Textures-1-Setup.exe` from that release, or tick the
-  texture pack task in the game's Setup (1.0.1 and newer). Either one downloads the four
-  `texture-0N.bin` parts (3.87 GB), checks each one's size and SHA-256 and extracts them into
-  `<game folder>\textures` (6.4 GB). An interrupted download resumes; `.bin` parts placed
-  beside the Setup are used instead of downloading.
-- **On or off:** Hi-res textures in the F1 menu or `config.exe` (VIDEO), at the next start.
-  1.0.0 has no switch: it loads the folder whenever it is there.
+- **Install or update:** run `Halo2-Recomp-HiRes-Textures-2-Setup.exe` from that release, or
+  tick the texture pack task in the game's Setup (1.0.5 offers v2).
+  - **Texture pack v1 already installed:** Setup downloads only the update
+    (`texture-update-1-to-2.bin`, 2.7 MB) and replaces the 34 changed textures, each checked
+    first.
+  - **Otherwise:** Setup downloads the four `texture-0N.bin` parts (3.87 GB), checks each one's
+    size and SHA-256 and extracts them into `<game folder>\textures` (6.4 GB).
+  - An interrupted download resumes. `.bin` files placed beside the Setup are used instead of
+    downloading.
+- **On or off:** Hi-res textures in the F1 menu (at once, from 1.0.5) or `config.exe` (VIDEO,
+  at the next start). 1.0.0 has no switch: it loads the folder whenever it is there.
 - **Building the release:** `python scripts\build_texture_pack.py --revision <n>` packs a
   folder of DDS files into the `.bin` parts (each under 2 GB, checked by extracting them
   again) and writes their pins to `installer\texture_payload.iss`. `build_installer.py` then
   builds the addon, `installer\halo2_textures.iss`. The parts and the addon go on a
   `textures-<n>` release that is not marked latest, so the game's update check never sees it.
+- **Revision 2:**
+  `build_texture_pack.py --revision 2 --overlay <remade dds> --patch-from 1`
+  - It lays the remade files over the source.
+  - It also builds the update from revision 1, after checking the rebuilt revision 1 file list
+    against its pinned SHA-256.
+  - It writes `installer\texture_patch_files.iss`, so Setup recognises a revision 1 folder,
+    including one whose update was interrupted.
+  - `scripts\remake_alpha.py` rebuilt those textures on a CUDA GPU. Each 4x4 block of the result
+    averages to the original texel's alpha. Alpha 0 and 255 stay exact. Edges are cleaned up
+    with total-variation smoothing.
 
 **Making a pack:** put DDS replacements in `halo2-native-tu15\textures\`. Name each one
 `<hash16>_<W>x<H>_<anything>.dds`, keeping the extracted texture's name. A file can be
@@ -279,7 +308,9 @@ Recent rendering fixes, each on by default with a switch to turn it off:
 | W-buffer depth stored as on the hardware (patchy fog, depth-correct floors) | `RECOMP_GPU_WBUFFER=0` |
 | Depth buffer read as a colour texture (patchy fog), only while that memory is still the depth buffer (the loading screen reuses it) | `RECOMP_GPU_DEPTH_ARGB=0` |
 | Perspective-correct colour and fog interpolation | `RECOMP_GPU_AFFINE_COLOR=1` |
-| 60 FPS frame target | `RECOMP_HALO2_SINGLE_VBLANK=0` |
+| 60 FPS frame target (the frame rate setting; this forces 30) | `RECOMP_HALO2_SINGLE_VBLANK=0` |
+| Visibility tests answered when the GPU has them, not by waiting at each one (1.0.6: about 18% faster on integrated graphics) | `RECOMP_GPU_ZPASS=sync` |
+| Vertex batches with scattered indices or unaligned layouts repacked for the GPU instead of converted on the CPU (1.0.6) | `RECOMP_GPU_VSH_PACK=0` |
 
 Known issue: the HUD is missing from DEL debug screenshots (development builds) when MSAA
 is on.

@@ -77,3 +77,6 @@ halo2-native-tu15/installer/wizard_*.png
 halo2-native-tu15/out/
 halo2-native-tu15/scripts/test_release.py
 __pycache__/
+
+# The shader starter list (recorded in play, scripts/merge_shader_keys.py): shipped in the release Setup and ZIP, never committed
+shader_keys.bin
