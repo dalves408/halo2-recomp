@@ -3615,36 +3615,157 @@ static void kernel_vblank_raise(void)
  * edge, 0 when vblanks are off. */
 #define VBLANK_RESTART_NS 100000000ull
 
-static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
+
+/* ---- the vblank locked to the screen's refresh -------------------------------
+ *
+ * The schedule below is the title's frame clock. On its own it runs at
+ * exactly 60.000 Hz on the host's counter; the screen never does (59.94,
+ * 60.02 ...), so the title's flips slowly drift past the presenter's vsync,
+ * and while one lands next to it frames are shown twice and skipped in turn:
+ * a few seconds of judder about once a minute (measured on a 60 Hz laptop,
+ * 2026-11-23, with the D3D11 presenter).
+ *
+ * The presenter (fb_present.c) notes each real vsync (its vsync-waiting
+ * Present returning) and each flip it is handed. While the screen runs at a
+ * steady rate near 60 Hz (vblank_rate_followed) and the notes are fresh, the
+ * schedule takes the screen's measured period, and moves each vblank by at most 0.2 ms so the flips land
+ * in the middle of a refresh, as far as they can be from the instant the
+ * presenter takes the newest frame. Anything else -- another refresh rate,
+ * the GDI path, a hidden window, a pause -- leaves the fixed 60 Hz schedule.
+ * RECOMP_VBLANK_LOCK=0 keeps the fixed schedule always. */
+static volatile LONG64 s_disp_vsync_ns;     /* the last real vsync the presenter saw */
+static volatile LONG64 s_disp_period_ns;    /* the screen's refresh period (averaged), 0 unknown */
+static volatile LONG64 s_disp_phase_err;    /* flips' place in the refresh - 1/2, millionths (averaged) */
+static volatile LONG s_disp_good;           /* refresh intervals in a row that looked steady */
+static LONG s_disp_samples;                 /* intervals in the period average (up to 256) */
+
+void xbox_DisplayVsyncNote(uint64_t now_ns)
 {
-    return t0_ns + n * 1000000000ull / 60u;
+    uint64_t last = (uint64_t)s_disp_vsync_ns, d;
+    LONG64 p;
+    s_disp_vsync_ns = (LONG64)now_ns;
+    if (!last || now_ns <= last)
+        return;
+    d = now_ns - last;
+    p = s_disp_period_ns;
+    /* The presenter notes each vsync after Present returns, so single intervals
+     * jitter by a millisecond or two (measured on a 60 Hz laptop, 2026-11-23:
+     * 15.3-18.3 ms; a tight 57-63 Hz window kept resetting the lock, 127 drops
+     * in two minutes). Any steady rate from 48 to 250 Hz is followed: an
+     * interval within 15% of the average counts, a missed vsync (about two
+     * periods) is skipped, and anything else starts the average again. */
+    if (d < 4000000ull || d > 21000000ull) {
+        if (!(p > 0 && d > (uint64_t)(p * 17 / 10) && d < (uint64_t)(p * 23 / 10)))
+            InterlockedExchange(&s_disp_good, 0);
+        return;
+    }
+    if (p > 0 && (d < (uint64_t)(p * 85 / 100) || d > (uint64_t)(p * 115 / 100))) {
+        InterlockedExchange(&s_disp_good, 0);
+        s_disp_period_ns = (LONG64)d;           /* another rate: measure it afresh */
+        s_disp_samples = 1;
+        return;
+    }
+    /* A long average: single intervals jitter by +-1.5 ms, and over 64 of them
+     * the estimate of a 60.0 Hz screen wandered to 59.4-59.5 Hz on a test laptop.
+     * The plain mean of the intervals so far (the first one alone is no
+     * estimate), then a running average over 256. */
+    if (s_disp_samples < 256)
+        s_disp_samples++;
+    p = (p && s_disp_samples > 1) ? p + ((LONG64)d - p) / s_disp_samples : (LONG64)d;
+    s_disp_period_ns = p;
+    if (s_disp_good < 1000000)
+        InterlockedIncrement(&s_disp_good);
 }
 
+void xbox_DisplayFlipNote(uint64_t now_ns)
+{
+    uint64_t v = (uint64_t)s_disp_vsync_ns;
+    LONG64 p = s_disp_period_ns, e = s_disp_phase_err, err;
+    if (!v || p <= 0 || now_ns < v || now_ns - v > 4ull * (uint64_t)p)
+        return;
+    err = (LONG64)(((now_ns - v) % (uint64_t)p) * 1000000ull / (uint64_t)p) - 500000;
+    s_disp_phase_err = e + (err - e) / 16;
+}
+
+static int vblank_lock_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VBLANK_LOCK");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Only a screen near 60 Hz is followed. Halo 2 counts its world time in
+ * vblanks (two to an update): a 72 Hz schedule on a 144 Hz screen ran the
+ * world at 36 updates a second, 20% fast (2026-11-23). Other rates
+ * keep the fixed 60 Hz schedule until the title's clock is taken off the
+ * vblank count.
+ *
+ * For the same reason the followed rate is held to 59.4-60.6 Hz: a player's
+ * world runs at their screen's speed, so this keeps it within 1% of real time
+ * (the Xbox itself ran at 59.94 Hz on NTSC) and keeps hosts and clients of a
+ * System Link or Insignia game in step. Real 60 Hz panels measure 59.79-60.1
+ * Hz on three test PCs; anything further off keeps the exact
+ * fixed 60 Hz schedule. */
+#define VBLANK_FOLLOW_MIN_NS (1e9 / 60.6)
+#define VBLANK_FOLLOW_MAX_NS (1e9 / 59.4)
+static int vblank_rate_followed(double period_ns)
+{
+    return period_ns > VBLANK_FOLLOW_MIN_NS && period_ns < VBLANK_FOLLOW_MAX_NS;
+}
+
+/* The next vblank interval in ns: the screen's when locked, else 1/60 s. */
+static double vblank_interval_ns(uint64_t now_ns)
+{
+    static int locked_was = -1;
+    int locked = vblank_lock_enabled() && s_disp_good >= 120 && s_disp_samples >= 120 && s_disp_period_ns > 0 &&
+                 vblank_rate_followed((double)s_disp_period_ns) &&
+                 now_ns >= (uint64_t)s_disp_vsync_ns &&
+                 now_ns - (uint64_t)s_disp_vsync_ns < 100000000ull;
+    double period = 1000000000.0 / 60.0;
+    if (locked) {
+        double p = (double)s_disp_period_ns;
+        double corr = -((double)s_disp_phase_err / 1000000.0) * p * 0.02;
+        if (corr > 200000.0) corr = 200000.0;
+        if (corr < -200000.0) corr = -200000.0;
+        period = p + corr;
+    }
+    if (locked != locked_was) {
+        if (locked)
+            fprintf(stderr, "  [VBLANK] locked to the screen's refresh (%.3f Hz)\n",
+                    1e9 / (double)s_disp_period_ns);
+        else if (locked_was > 0)
+            fprintf(stderr, "  [VBLANK] screen refresh not followed (%s); fixed 60 Hz\n",
+                    vblank_lock_enabled() ? "no steady 60 Hz vsync from the presenter" : "RECOMP_VBLANK_LOCK=0");
+        locked_was = locked;
+    }
+    return period;
+}
+
+/* The due time is kept as a running sum in ns (a double: exact to well under
+ * a nanosecond for days), so the interval can follow the screen. */
 static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
 {
-    static uint64_t t0_ns, count;
+    static double due;
     static int started;
-    uint64_t due;
 
     *next_due_ns = 0;
     if (kernel_vblank_mode() != XBOX_VBLANK_PACED)
         return 0;
     if (!started) {
         started = 1;
-        t0_ns = now_ns;
-        count = 0;
+        due = (double)now_ns;
     }
-    due = vblank_due(t0_ns, count);
-    if (now_ns < due) {
-        *next_due_ns = due;
+    if ((double)now_ns < due) {
+        *next_due_ns = (uint64_t)due;
         return 0;
     }
-    if (now_ns - due > VBLANK_RESTART_NS) {
-        t0_ns = now_ns;
-        count = 0;
-    }
-    count++;
-    *next_due_ns = vblank_due(t0_ns, count);
+    if ((double)now_ns - due > (double)VBLANK_RESTART_NS)
+        due = (double)now_ns;
+    due += vblank_interval_ns(now_ns);
+    *next_due_ns = (uint64_t)due;
     kernel_vblank_count(kernel_clock_ms());
     kernel_vblank_raise();
     return 1;

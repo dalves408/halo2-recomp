@@ -156,3 +156,62 @@ patch(p, "void sub_0019337D(void)\n{\n",
       "    extern int g_halo2_unlock_levels;   /* test switch (hand hook, src/main.c) */\n"
       "    if (g_halo2_unlock_levels) { eax = 0x7FFF; esp += 4; return; }\n",
       "extern int g_halo2_unlock_levels;")
+
+# 11. Camera interpolation (src/h2_interp.c): the main loop sub_0012DF60 (1.0 0x12b450) draws the
+#     frame with sub_00229C50 (1.0 0x223240) on both of its paths. The hooks around each call put a
+#     blended camera position into the per-player view records for the draw and the game's own
+#     position back after it.
+p = find("PUSH32(esp, 0x0012E16Eu); RECOMP_ABI_CALL(0x00229C50u, sub_00229C50);")
+patch(p, '#include <math.h>\n', '#include <math.h>\n\nvoid h2_interp_render_begin(void);\nvoid h2_interp_render_end(void);\n',
+      'void h2_interp_render_begin(void);')
+for ret in ("0x0012E16Eu", "0x0012E18Cu"):
+    call = f"    PUSH32(esp, {ret}); RECOMP_ABI_CALL(0x00229C50u, sub_00229C50); /* call 0x00229C50 */\n"
+    patch(p, call, "    h2_interp_render_begin();   /* camera interpolation (hand hook) */\n" + call +
+          "    h2_interp_render_end();\n", f"h2_interp_render_begin();   /* camera interpolation (hand hook) */\n    PUSH32(esp, {ret})")
+
+# 11b. Interpolation, after the world update: sub_0013AA50 runs the due 30 Hz ticks; the hook after
+#      it runs before the per-frame update (sub_0013A9B0) that places the camera.
+patch(p, 'void h2_interp_render_end(void);\n', 'void h2_interp_render_end(void);\nvoid h2_interp_world_updated(void);\n',
+      'void h2_interp_world_updated(void);')
+call = "    PUSH32(esp, 0x0012E147u); RECOMP_ABI_CALL(0x0013AA50u, sub_0013AA50); /* call 0x0013AA50 */\n"
+patch(p, call, call + "    h2_interp_world_updated();   /* interpolation (hand hook) */\n",
+      "h2_interp_world_updated();   /* interpolation (hand hook) */")
+
+# 13. Interpolation, the main view: sub_0002B9F0 renders the main view from the camera at eax (and a
+#     second copy from its second argument). The hook at its entry blends that camera for a
+#     cutscene (src/h2_interp.c).
+p13 = find("void sub_0002B9F0(void)\n")
+patch(p13, "loc_0002B9F0: ;\n", "loc_0002B9F0: ;\n    h2_interp_view_render(eax, MEM32(esp + 8));   /* interpolation (hand hook) */\n",
+      "h2_interp_view_render(eax, MEM32(esp + 8));")
+patch(p13, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_interp_view_render(uint32_t camera, uint32_t camera2);\n",
+      "void h2_interp_view_render(uint32_t camera, uint32_t camera2);")
+
+# 12. Camera interpolation, the copies: every render pass copies a view (0x1D dwords) into the
+#     render camera 0x4C65C0 with rep movsd, then builds its view matrix (0x4C6634) from it. The
+#     hook after each copy moves the camera to the frame's blended position (src/h2_interp.c); the
+#     view record itself is filled inside the draw, after the hooks of patch 11 run.
+copy_head = "    edi = 0x4C65C0;\n    { uint64_t _n = (uint64_t)ecx * 4u;\n"
+copy_tail = "    ecx = 0; } /* rep movsd */\n"
+hook = "    h2_interp_camera_copied();   /* camera interpolation (hand hook) */\n"
+for path in sorted(gen.glob("recomp_*.c")):
+    s = path.read_text(encoding="utf-8")
+    if copy_head not in s:
+        continue
+    out, pos, n = [], 0, 0
+    while True:
+        i = s.find(copy_head, pos)
+        if i < 0:
+            out.append(s[pos:]); break
+        j = s.index(copy_tail, i) + len(copy_tail)
+        out.append(s[pos:j])
+        if not s.startswith(hook, j):
+            out.append(hook); n += 1
+        pos = j
+    if n:
+        s = "".join(out)
+        if "void h2_interp_camera_copied(void);" not in s:
+            s = s.replace("#include <math.h>\n", "#include <math.h>\n\nvoid h2_interp_camera_copied(void);\n", 1)
+        path.write_text(s, encoding="utf-8")
+        print(f"{path.name}: patched (camera copy hook x{n})")
+    else:
+        print(f"{path.name}: already patched (camera copy hook)")

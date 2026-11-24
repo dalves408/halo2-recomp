@@ -77,6 +77,7 @@ set(GAME_SOURCES
     src/h2_account.c
     src/h2_frame.c
     src/h2_mouse.c
+    src/h2_interp.c
     src/keybinds.c
     src/halo_ui.c
     src/update_check.c

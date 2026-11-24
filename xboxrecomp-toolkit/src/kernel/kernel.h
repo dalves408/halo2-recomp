@@ -1322,6 +1322,11 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
  * one field per vblank, so its low bit is the field parity that the field pin
  * (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
+/* The presenter's notes for the vblank lock (kernel_bridge.c): a real vsync
+ * (its vsync-waiting Present returned) and a flip it was handed, on
+ * xbox_HostNowNs's clock. */
+void xbox_DisplayVsyncNote(uint64_t now_ns);
+void xbox_DisplayFlipNote(uint64_t now_ns);
 
 /* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
  * in templates/runtime/recomp_types.h for generated code. */

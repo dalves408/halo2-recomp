@@ -21,6 +21,8 @@
  * --prepare is the RecompLauncher "prepare" step: no window, progress as "progress <0..1> <text>" lines, exit 0 only
  * when <dest_dir> holds a complete, verified copy. The files go to a staging folder beside <dest_dir> that is swapped
  * in at the end, so a failed run never leaves a half-written game folder (an existing one is kept until then).
+ * A folder that already holds every file is kept, with no copy (RecompLauncher runs this again for every new
+ * release; see sdk_prepare).
  *
  * Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image, 4 not the supported Halo 2 disc, 5 files missing
  * or damaged, 6 cannot write, 7 title update 1.5 not found or not the right one (and no patch to make it). */
@@ -59,10 +61,12 @@ static size_t g_retail_n[2];
 static void keep_retail(int k, unsigned char *b, size_t n);
 static unsigned char *read_all(const WCHAR *path, size_t *n);
 
+static const char *g_progress_text = "Copying game files";
 static void progress(void)
 {
     if (g_sdk)
-        printf("progress %.4f Copying game files\n", 0.05 + 0.9 * (double)g_done / (double)(g_total ? g_total : 1));
+        printf("progress %.4f %s\n", 0.05 + 0.9 * (double)g_done / (double)(g_total ? g_total : 1),
+               g_progress_text);
     else
         printf("PROGRESS %llu %llu\n", g_done, g_total);
     fflush(stdout);
@@ -562,6 +566,10 @@ static int patch_update(void)
     return have_update();
 }
 
+static void manifest_id(char out[65]);
+static void stamp_remove(const WCHAR *dir);
+static void stamp_write(const WCHAR *dir, const char *id);
+
 static int run_import(const WCHAR *source, const WCHAR *destination, const WCHAR *update, const WCHAR *existing)
 {
     DWORD attr;
@@ -580,6 +588,7 @@ static int run_import(const WCHAR *source, const WCHAR *destination, const WCHAR
         printf("ERROR Could not write to the install folder.\n");
         return 6;
     }
+    stamp_remove(g_dest);               /* the folder is about to change */
     r = (attr & FILE_ATTRIBUTE_DIRECTORY) ? import_folder(source) : import_image(source);
     if (r) return r;
     r = find_update(source, update, existing);
@@ -595,6 +604,12 @@ static int run_import(const WCHAR *source, const WCHAR *destination, const WCHAR
         printf("ERROR Title update 1.5 could not be made from the disc's files (or, given with --update, is not the "
                "right one).\n");
         return 7;
+    }
+    {   /* every file copied and checked: Setup's install is stamped too (see stamp_write) */
+        char id[65];
+        manifest_id(id);
+        if (id[0])
+            stamp_write(g_dest, id);
     }
     printf("OK %d files\n", MANIFEST_COUNT);
     return 0;
@@ -614,10 +629,140 @@ static void remove_tree(const WCHAR *dir)
     SHFileOperationW(&op);
 }
 
+/* ---- prepare again on every release --------------------------------------------------------------------------
+ * RecompLauncher runs the setup step again whenever a new release is installed. The game files are the same for every
+ * release (the disc's files at title update 1.5, pinned in manifest.h), so a folder that already holds them is kept:
+ *  - the stamp a complete run or install left (<dest_dir>\.halo2-prepared: the manifest's own SHA-256, and each
+ *    file's size and last-write time then) with every file unchanged: done at once ("Already built");
+ *  - no stamp (folders from 1.0.8 and before, or a stamp from another manifest): every file is read and checked
+ *    against its pinned SHA-256, which is reading, not copying; all good: stamped and done;
+ *  - anything missing, a different size or a different hash: the full import from the player's copy, as before.
+ * The stamp is written only after the folder is complete, so a run cut short never looks finished. */
+#define PREPARED_STAMP L".halo2-prepared"
+
+static void manifest_id(char out[65])
+{
+    unsigned char h[32];
+    Sha s;
+    int i;
+    out[0] = 0;
+    if (!sha_begin(&s)) return;
+    for (i = 0; i < MANIFEST_COUNT; i++) {
+        BCryptHashData(s.h, (PUCHAR)MANIFEST[i].path, (ULONG)strlen(MANIFEST[i].path) + 1, 0);
+        BCryptHashData(s.h, (PUCHAR)&MANIFEST[i].size, sizeof MANIFEST[i].size, 0);
+        BCryptHashData(s.h, (PUCHAR)MANIFEST[i].sha256, 32, 0);
+    }
+    sha_end(&s, h);
+    for (i = 0; i < 32; i++)
+        sprintf_s(out + i * 2, 3, "%02x", h[i]);
+}
+
+static void entry_path(const WCHAR *dir, int i, WCHAR *out)
+{
+    WCHAR rel[MAX_PATH];
+    rel_w(MANIFEST[i].path, rel);
+    swprintf_s(out, MAX_PATH, L"%s\\%s", dir, rel);
+}
+
+/* The stamp: "H2PREP2 <manifest id>", then one line per manifest file, in order: its size and last-write time
+ * (FILETIME) as they were when the folder was complete. A later check is one attribute lookup per file: a file
+ * missing, of another size or written since (a mod, another program, an interrupted copy over it) fails it. Silent
+ * disk damage that changes no write time is not seen; running Setup again (Repair) checks every hash. */
+static int file_stat(const WCHAR *path, unsigned long long *size, unsigned long long *mtime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a) || (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return 0;
+    *size = ((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    *mtime = ((unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+    return 1;
+}
+
+static int stamp_matches(const WCHAR *dir, const char *id)
+{
+    WCHAR path[MAX_PATH];
+    char line[160];
+    FILE *f;
+    int i, ok = 1;
+    swprintf_s(path, MAX_PATH, L"%s\\%s", dir, PREPARED_STAMP);
+    if (_wfopen_s(&f, path, L"rb") || !f) return 0;
+    if (!fgets(line, sizeof line, f) || strncmp(line, "H2PREP2 ", 8) || strncmp(line + 8, id, 64)) ok = 0;
+    for (i = 0; ok && i < MANIFEST_COUNT; i++) {
+        unsigned long long want_size, want_time, size, time;
+        entry_path(dir, i, path);
+        if (!fgets(line, sizeof line, f) || sscanf_s(line, "%llu %llu", &want_size, &want_time) != 2 ||
+            !file_stat(path, &size, &time) || size != want_size || size != MANIFEST[i].size || time != want_time)
+            ok = 0;
+    }
+    fclose(f);
+    return ok;
+}
+
+static void stamp_remove(const WCHAR *dir)
+{
+    WCHAR path[MAX_PATH];
+    swprintf_s(path, MAX_PATH, L"%s\\%s", dir, PREPARED_STAMP);
+    DeleteFileW(path);
+}
+
+/* Written last, and only for a complete folder: a run cut short never looks finished. */
+static void stamp_write(const WCHAR *dir, const char *id)
+{
+    WCHAR path[MAX_PATH], tmp[MAX_PATH];
+    FILE *f;
+    int i, ok = 1;
+    swprintf_s(path, MAX_PATH, L"%s\\%s", dir, PREPARED_STAMP);
+    swprintf_s(tmp, MAX_PATH, L"%s.tmp", path);
+    if (_wfopen_s(&f, tmp, L"wb") || !f) return;
+    fprintf(f, "H2PREP2 %.64s\n", id);
+    for (i = 0; i < MANIFEST_COUNT; i++) {
+        unsigned long long size, time;
+        WCHAR file[MAX_PATH];
+        entry_path(dir, i, file);
+        if (!file_stat(file, &size, &time)) { ok = 0; break; }
+        fprintf(f, "%llu %llu\n", size, time);
+    }
+    if (fclose(f)) ok = 0;
+    if (!ok || !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp);
+}
+
+/* Every file there and matching its pinned size and SHA-256. */
+static int folder_complete(const WCHAR *dir)
+{
+    int i;
+    g_done = 0;
+    g_total = 0;
+    for (i = 0; i < MANIFEST_COUNT; i++)
+        g_total += MANIFEST[i].size;
+    g_progress_text = "Checking the game files you already have";
+    for (i = 0; i < MANIFEST_COUNT; i++) {
+        WCHAR path[MAX_PATH];
+        HANDLE f;
+        LARGE_INTEGER sz;
+        int ok = 0;
+        entry_path(dir, i, path);
+        f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            if (GetFileSizeEx(f, &sz) && (unsigned long long)sz.QuadPart == MANIFEST[i].size)
+                ok = copy_checked(f, MANIFEST[i].size, MANIFEST[i].sha256, NULL, 1) == 1;
+            CloseHandle(f);
+        }
+        if (!ok) {
+            g_progress_text = "Copying game files";
+            g_done = g_total = 0;
+            return 0;
+        }
+    }
+    g_progress_text = "Copying game files";
+    g_done = g_total = 0;
+    return 1;
+}
+
 static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
 {
     WCHAR dest[MAX_PATH], stage[MAX_PATH], backup[MAX_PATH], parent[MAX_PATH], *sl;
     DWORD n = GetFullPathNameW(destination, MAX_PATH, dest, NULL), attr;
+    char id[65];
     int r, had_old = 0;
 
     g_sdk = 1;
@@ -627,10 +772,25 @@ static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
     swprintf_s(backup, MAX_PATH, L"%s.old-%lu", dest, (unsigned long)GetCurrentProcessId());
     wcscpy_s(parent, MAX_PATH, dest);
     if ((sl = wcsrchr(parent, L'\\')) != NULL) { *sl = 0; SHCreateDirectoryExW(NULL, parent, NULL); }
+    attr = GetFileAttributesW(dest);
+    manifest_id(id);
+    if (id[0] && attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        if (stamp_matches(dest, id)) {
+            puts("progress 1 Already built");
+            fflush(stdout);
+            return 0;
+        }
+        if (folder_complete(dest)) {
+            stamp_write(dest, id);
+            puts("progress 1 Game files are ready (already in place)");
+            fflush(stdout);
+            return 0;
+        }
+    }
     puts("progress 0.02 Checking your Xbox game source");
     fflush(stdout);
     remove_tree(stage);
-    attr = GetFileAttributesW(dest);
     r = run_import(source, stage, NULL, attr != INVALID_FILE_ATTRIBUTES ? dest : NULL);
     if (r) { remove_tree(stage); return r; }
     if (attr != INVALID_FILE_ATTRIBUTES) {
@@ -647,6 +807,8 @@ static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
         return 6;
     }
     if (had_old) remove_tree(backup);
+    if (id[0])
+        stamp_write(dest, id);
     puts("progress 1 Game files are ready");
     fflush(stdout);
     return 0;

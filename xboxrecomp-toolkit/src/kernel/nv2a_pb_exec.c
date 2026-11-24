@@ -6471,6 +6471,71 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         RPZ_END(RPZ_PRESENT, rpz_present);
         {
+            /* Test: RECOMP_FLIP_HASH=<file> (and RECOMP_FLIP_TICK_VA=<hex>, a
+             * title's tick counter): while the file exists, one line per flip
+             * with the flip number, the counter and a hash of the frame's
+             * pixels. Nothing is written to disk but the log, so the title
+             * keeps its frame rate: frames of one tick with different hashes
+             * show motion between ticks. */
+            static const char *flag = (const char *)-1;
+            static uint32_t tick_va;
+            static unsigned poll;
+            static int on;
+            if (flag == (const char *)-1) {
+                const char *t = getenv("RECOMP_FLIP_TICK_VA");
+                flag = getenv("RECOMP_FLIP_HASH");
+                tick_va = t ? (uint32_t)strtoul(t, NULL, 16) : 0;
+            }
+            if (flag && (poll++ & 7) == 0)
+                on = GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+            if (flag && on) {
+                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                int drawn = s_gpu.drawn_offset != 0;
+                uint32_t off = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+                uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
+                uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
+                uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
+                uint32_t w = drawn ? s_gpu.drawn_w : s_gpu.clip_w;
+                uint32_t h = drawn ? s_gpu.drawn_h : s_gpu.clip_h;
+                uint32_t bpp = drawn ? s_gpu.drawn_bpp : surface_bpp();
+                uint64_t hash = 1469598103934665603ull;
+                uint32_t base, y, x, tick = 0;
+                static uint8_t thumb[2][48][64];
+                static int tcur;
+                double change = 0, change_lr = 0;
+                if (off && w && h && (bpp == 2 || bpp == 4) && pitch) {
+                    base = dma_resolve(off);
+                    if (guest_span_ok(base, (cy + h) * pitch)) {
+                        for (y = 0; y < h; y += 2) {
+                            const uint32_t *row = (const uint32_t *)(mem + base + (size_t)(cy + y) * pitch
+                                                                     + (size_t)cx * bpp);
+                            for (x = 0; x < w * bpp / 4; x += 2)
+                                hash = (hash ^ row[x]) * 1099511628211ull;
+                        }
+                        if (bpp == 4) {    /* a 64x48 grey thumbnail; change = mean difference from the last one */
+                            int ty, tx;
+                            tcur ^= 1;
+                            for (ty = 0; ty < 48; ty++)
+                                for (tx = 0; tx < 64; tx++) {
+                                    const uint8_t *px = mem + base + (size_t)(cy + ty * h / 48) * pitch
+                                                        + (size_t)(cx + tx * w / 64) * 4;
+                                    thumb[tcur][ty][tx] = (uint8_t)((px[0] + 2 * px[1] + px[2]) >> 2);
+                                    change += abs((int)thumb[tcur][ty][tx] - (int)thumb[tcur ^ 1][ty][tx]);
+                                    if (tx >= 32 && ty >= 24)    /* the lower right quarter (a first-person gun) */
+                                        change_lr += abs((int)thumb[tcur][ty][tx] - (int)thumb[tcur ^ 1][ty][tx]);
+                                }
+                            change /= 64.0 * 48.0;
+                            change_lr /= 32.0 * 24.0;
+                        }
+                    }
+                }
+                if (tick_va)
+                    tick = *(volatile const uint32_t *)(mem + tick_va);
+                fprintf(stderr, "[FLIPHASH] %u %u %016llx %.2f %.2f\n", s_gpu.flips, tick,
+                        (unsigned long long)hash, change, change_lr);
+            }
+        }
+        {
             /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
              * report -- a consecutive sequence, which is what a headless
              * recording (frames -> ffmpeg) needs. "1" dumps from boot; any
@@ -6895,6 +6960,7 @@ void nv2a_pb_exec_report(void)
                     s_gpu.flips, 10);
         last_flips = s_gpu.flips;
         last_ms = now;
+        rpz_usage_report();     /* [USAGE]: CPU and GPU use */
     }
     flip_hold_report();
     nv2a_census_write();

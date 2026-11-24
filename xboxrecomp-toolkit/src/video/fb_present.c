@@ -47,6 +47,7 @@
 #include "pvideo_scanout.h"
 #include "../nv2a/nv2a_mmio_hook.h"
 #include "../kernel/kernel.h"
+#include "../platform/host_time.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -245,6 +246,10 @@ void xbox_FramebufferWindowSetAA(uint32_t sy)
 }
 
 /* Called by the pushbuffer executor when the title flips. */
+/* RECOMP_PACE_LOG: the spacing of the title's own frames (flips), shortest and
+ * longest since the window loop's last line. */
+static volatile LONGLONG s_pub_last, s_pub_gap_min = 0x7FFFFFFFFFFFFFFFLL, s_pub_gap_max;
+
 static void fb_publish(uint32_t fb_va, uint32_t pitch, const RecompPresentTag *tag)
 {
     const uint8_t *src;
@@ -254,6 +259,17 @@ static void fb_publish(uint32_t fb_va, uint32_t pitch, const RecompPresentTag *t
 
     if (!s_fb_running || !fb_va || !pitch)
         return;
+    {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        if (s_pub_last) {
+            LONGLONG g = q.QuadPart - s_pub_last;
+            if (g < s_pub_gap_min) s_pub_gap_min = g;
+            if (g > s_pub_gap_max) s_pub_gap_max = g;
+        }
+        s_pub_last = q.QuadPart;
+    }
+    xbox_DisplayFlipNote(xbox_HostNowNs());     /* the vblank lock (kernel_bridge.c) */
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
     bpp = pitch / s_fb_width;
@@ -839,6 +855,55 @@ static void fb_capture_missing_input(int pinned)
         fb_capture_fail("cannot record missing presenter input");
 }
 
+/* The loop's own pace when nothing waited for the display: the next show at
+ * a fixed 60 Hz schedule (16.667 ms after the last one was due), not "show,
+ * then sleep 16 ms". With the sleep after a 9 ms GDI blit at 1080p the loop ran
+ * at about 40 Hz and dropped a third of a 60 fps title's frames. A schedule
+ * that falls more than a frame behind starts again from now rather than
+ * showing frames in a burst. Waits on a high-resolution timer where Windows
+ * has one (10 1803+), else Sleep. */
+static LONGLONG s_pace_next, s_pace_period, s_pace_freq;
+static HANDLE s_pace_timer;
+static int s_pace_timer_tried;
+
+static void fb_pace_reset(void)
+{
+    s_pace_next = 0;
+}
+
+static void fb_pace_60(void)
+{
+    LARGE_INTEGER now;
+    LONGLONG wait;
+    if (!s_pace_period) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_pace_freq = f.QuadPart;
+        s_pace_period = f.QuadPart / 60;
+    }
+    if (!s_pace_timer_tried) {
+        s_pace_timer_tried = 1;
+        s_pace_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                              TIMER_ALL_ACCESS);
+    }
+    QueryPerformanceCounter(&now);
+    if (!s_pace_next || now.QuadPart > s_pace_next + s_pace_period)
+        s_pace_next = now.QuadPart;
+    s_pace_next += s_pace_period;
+    wait = s_pace_next - now.QuadPart;
+    if (wait <= 0)
+        return;
+    if (s_pace_timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(wait * 10000000LL / s_pace_freq);     /* relative, 100 ns units */
+        if (due.QuadPart < 0 && SetWaitableTimer(s_pace_timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(s_pace_timer, 50);
+            return;
+        }
+    }
+    Sleep((DWORD)(wait * 1000 / s_pace_freq));
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -1049,8 +1114,62 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 t0 = now; f0 = f;
             }
         }
+        {   /* Test: RECOMP_PACE_LOG=1 logs, once a second, how the title's
+             * frames reached this window: shows, new frames, repeats (the same
+             * frame shown again), skips (frames never shown) and the longest
+             * gap between shows. Two clocks (the title's 60 Hz flips and this
+             * loop's pace) drifting apart show up as repeats and skips. */
+            static int pace = -1;
+            static uint64_t last_id, s_last_qpc;
+            static unsigned shows, fresh, repeats, skipped;
+            static double gap_max, gap_min = 1e9, qpc_ms;
+            static DWORD p0;
+            if (pace < 0) {
+                const char *e = getenv("RECOMP_PACE_LOG");
+                LARGE_INTEGER f;
+                pace = e && e[0] == '1';
+                QueryPerformanceFrequency(&f);
+                qpc_ms = 1000.0 / (double)f.QuadPart;
+            }
+            if (pace && frame_id) {
+                LARGE_INTEGER q;
+                DWORD now = GetTickCount();
+                QueryPerformanceCounter(&q);
+                if (s_last_qpc) {
+                    double g = (double)(q.QuadPart - (LONGLONG)s_last_qpc) * qpc_ms;
+                    if (g > gap_max) gap_max = g;
+                    if (g < gap_min) gap_min = g;
+                }
+                s_last_qpc = (uint64_t)q.QuadPart;
+                shows++;
+                if (frame_id == last_id) repeats++;
+                else {
+                    fresh++;
+                    if (last_id && frame_id > last_id + 1) skipped += (unsigned)(frame_id - last_id - 1);
+                }
+                last_id = frame_id;
+                if (!p0) p0 = now;
+                if (now - p0 >= 1000) {
+                    fprintf(stderr, "[PACE] %lu ms: %u shows (%s), %u new frames, %u repeats, %u skipped;"
+                                    " gap %.1f-%.1f ms; title's frames %.1f-%.1f ms apart\n",
+                            (unsigned long)(now - p0), shows, paced ? "vsync" : "timer", fresh, repeats,
+                            skipped, gap_min, gap_max,
+                            s_pub_gap_max ? (double)s_pub_gap_min * qpc_ms : 0.0,
+                            (double)s_pub_gap_max * qpc_ms);
+                    s_pub_gap_min = 0x7FFFFFFFFFFFFFFFLL;
+                    s_pub_gap_max = 0;
+                    shows = fresh = repeats = skipped = 0;
+                    gap_max = 0; gap_min = 1e9;
+                    p0 = now;
+                }
+            }
+        }
         if (!paced)
-            Sleep(16);                  /* D3D11's Present waited for vsync */
+            fb_pace_60();               /* GDI, or D3D11 with vsync off */
+        else {
+            fb_pace_reset();            /* D3D11's Present waited for vsync */
+            xbox_DisplayVsyncNote(xbox_HostNowNs());
+        }
     }
 
     recomp_display_awake_shutdown(&s_display_awake);

@@ -48,6 +48,11 @@ void rpz_count(RpzZone z, uint64_t n);   /* count only */
 void rpz_init_main_thread(void);
 /* Called by the ack thread once at its start. */
 void rpz_register_ack_thread(void);
+/* A file read of the title: bytes read, QPC ticks it took, the host handle
+ * (named in the log only when the read was slow). */
+void rpz_disk_read(uint64_t bytes, uint64_t ticks, void *handle);
+/* [USAGE] line for the log: CPU and GPU use since the last call (every 10 s). */
+void rpz_usage_report(void);
 /* One line per presented frame. draws = draws since the previous flip. */
 void rpz_flip(uint32_t draws);
 /* RECOMP_PERF_AB=<file>: while the file exists, optimisations whose bit is

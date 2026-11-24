@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "recomp_perf.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -499,7 +500,31 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS nt_read_file(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset);
+
+/* Every read is timed for the log's disk figures (rpz_disk_read): two clock
+ * reads a call. The reads are synchronous on the calling game thread, so this
+ * is how long the game waited on the drive. */
 NTSTATUS __stdcall xbox_NtReadFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    LARGE_INTEGER t0, t1;
+    NTSTATUS st;
+    QueryPerformanceCounter(&t0);
+    st = nt_read_file(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length,
+                      ByteOffset);
+    QueryPerformanceCounter(&t1);
+    rpz_disk_read(IoStatusBlock && st == STATUS_SUCCESS ? IoStatusBlock->Information : 0,
+                  (uint64_t)(t1.QuadPart - t0.QuadPart), FileHandle);
+    return st;
+}
+
+static NTSTATUS nt_read_file(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)

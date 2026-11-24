@@ -282,6 +282,13 @@ static void boot_env(const Halo2Settings *s)
     env_if_unset("RECOMP_GPU_SCALE", buf);
     env_if_unset("RECOMP_FULLSCREEN", s->fullscreen ? "1" : "0");
     env_if_unset("RECOMP_PRESENT_VSYNC", s->vsync ? "1" : "0");
+    /* Frames reach the screen through the D3D11 presenter (gpu_present.c):
+     * vsync-paced and, above 1x or with FXAA, straight from the GPU. The GDI
+     * window path showed about 40 of 60 frames a second on a 1080p laptop
+     * (a 16 ms sleep after each 9 ms blit), which read as hitching. GDI stays
+     * the fallback when the presenter cannot start; RECOMP_D3D_PRESENT=0
+     * forces it (development builds). */
+    env_if_unset("RECOMP_D3D_PRESENT", "1");
     /* Ini anisotropy=1 means off (same as NHL). Env 0 is off; 1 still means
      * legacy "on" (8x) for older launchers. */
     snprintf(buf, sizeof buf, "%d", clamp_aniso(s->anisotropy) == 1 ? 0 : clamp_aniso(s->anisotropy));
