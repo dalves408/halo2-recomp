@@ -34,6 +34,7 @@
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
 #include "recomp_perf.h"
+#include "recomp_clip.h"            /* RECOMP_CLIP test clips */
 #include "platform/host_time.h"   /* xbox_HostNowNs */
 #if !defined(_WIN32)
 #include <pthread.h>              /* the raster worker pool */
@@ -6533,6 +6534,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     tick = *(volatile const uint32_t *)(mem + tick_va);
                 fprintf(stderr, "[FLIPHASH] %u %u %016llx %.2f %.2f\n", s_gpu.flips, tick,
                         (unsigned long long)hash, change, change_lr);
+            }
+        }
+        {
+            /* Test: RECOMP_CLIP=1 keeps the last seconds of frames; Delete saves
+             * them as a clip (recomp_clip.c). */
+            static int clip = -1;
+            if (clip < 0) {
+                const char *e = getenv("RECOMP_CLIP");
+                clip = e && e[0] == '1';
+            }
+            if (clip) {
+                int drawn = s_gpu.drawn_offset != 0;
+                uint32_t off = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+                uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
+                uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
+                uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
+                uint32_t w = drawn ? s_gpu.drawn_w : s_gpu.clip_w;
+                uint32_t h = drawn ? s_gpu.drawn_h : s_gpu.clip_h;
+                uint32_t bpp = drawn ? s_gpu.drawn_bpp : surface_bpp();
+                if (off && w && h && (bpp == 2 || bpp == 4) && pitch) {
+                    uint32_t base = dma_resolve(off);
+                    if (guest_span_ok(base, (cy + h) * pitch))
+                        rclip_on_flip((const uint8_t *)xbox_GetMemoryOffset(), base, pitch, cx, cy, w, h, bpp,
+                                      s_gpu.flips, 0);
+                }
             }
         }
         {

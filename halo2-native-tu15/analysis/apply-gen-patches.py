@@ -215,3 +215,14 @@ for path in sorted(gen.glob("recomp_*.c")):
         print(f"{path.name}: patched (camera copy hook x{n})")
     else:
         print(f"{path.name}: already patched (camera copy hook)")
+
+# 14. Interpolation, the first-person model: inside the main view, sub_0003D2B0 has sub_00168DED
+#     build the local player's first-person node sets (up to 4 x (12-byte header + 64 nodes) at
+#     0x4CE3F8, count to 0x4CE3F4) from the view's camera. Their animation steps at 30 Hz; the hook
+#     after the build blends them in the camera's space (src/h2_interp.c).
+p14 = find("void sub_0003D2B0(void)\n")
+patch(p14, "loc_0003D35F: ;\n    MEM32(0x4CE3F4) = eax;\n",
+      "loc_0003D35F: ;\n    MEM32(0x4CE3F4) = eax;\n    h2_interp_first_person(0x4CE3F8, eax);   /* interpolation (hand hook) */\n",
+      "h2_interp_first_person(0x4CE3F8, eax);")
+patch(p14, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_interp_first_person(uint32_t sets, uint32_t count);\n",
+      "void h2_interp_first_person(uint32_t sets, uint32_t count);")

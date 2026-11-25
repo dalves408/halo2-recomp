@@ -32,9 +32,10 @@ static void pending_init(void)
     s_pending_inited = 1;
 }
 
+/* resolution_scale: 0 = Native (the output's own resolution), 1..5 = 640x480 times n */
 static int clamp_scale(int v)
 {
-    if (v < 1) return 1;
+    if (v < 0) return 1;
     if (v > 5) return 5;
     return v;
 }
@@ -278,7 +279,10 @@ static void boot_env(const Halo2Settings *s)
 {
     char buf[16];
 
-    snprintf(buf, sizeof buf, "%d", clamp_scale(s->resolution_scale));
+    if (clamp_scale(s->resolution_scale) == 0)
+        snprintf(buf, sizeof buf, "native");
+    else
+        snprintf(buf, sizeof buf, "%d", clamp_scale(s->resolution_scale));
     env_if_unset("RECOMP_GPU_SCALE", buf);
     env_if_unset("RECOMP_FULLSCREEN", s->fullscreen ? "1" : "0");
     env_if_unset("RECOMP_PRESENT_VSYNC", s->vsync ? "1" : "0");
@@ -346,9 +350,14 @@ void halo2_gpu_apply_live(const Halo2Settings *s)
     aniso = clamp_aniso(s->anisotropy);
     msaa = clamp_msaa(s->msaa);
 
-    snprintf(buf, sizeof buf, "%d", scale);
-    _putenv_s("RECOMP_GPU_SCALE", buf);
-    gpu_scale_set_integer(scale);
+    if (scale == 0) {
+        _putenv_s("RECOMP_GPU_SCALE", "native");
+        gpu_scale_set_native();
+    } else {
+        snprintf(buf, sizeof buf, "%d", scale);
+        _putenv_s("RECOMP_GPU_SCALE", buf);
+        gpu_scale_set_integer(scale);
+    }
 
     _putenv_s("RECOMP_FULLSCREEN", s->fullscreen ? "1" : "0");
     xbox_FramebufferWindowSetFullscreen(s->fullscreen ? 1 : 0);

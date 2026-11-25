@@ -209,7 +209,8 @@ const char gpu_vsh_gs_hlsl[] =
     "      float2 n = v[j].p.xy * iw;\n"
     "      c[j] = float4((n.x * 0.5 + 0.5) * viewinfo.x, (0.5 - n.y * 0.5) * viewinfo.y, v[j].p.w, 0.0);\n"
     "    }\n"
-    "    c[0].w = zinfo.z > 0.5 ? zinfo.x : 0.0;\n"
+    /* -1: ZCLAMP_EN, the pixel shader clamps to [0, zeta max] instead of dropping */
+    "    c[0].w = zinfo.z > 0.5 ? zinfo.x : -1.0;\n"
     "    c[1].w = zinfo.z > 0.5 ? zinfo.y : viewinfo.z;\n"
     "    c[2].w = 1.0;\n"
     "    [unroll] for (int k2 = 0; k2 < 3; k2++) { v[k2].tA = c[0]; v[k2].tB = c[1]; v[k2].tC = c[2]; }\n"

@@ -714,6 +714,25 @@ int gpu_scale_integer(void)
     return n;
 }
 
+/* Live switch to native resolution (settings menu "Native"): the picture
+ * renders at the output's own height, the window or the screen, and
+ * follows it; the next present picks the size up (apply_native_output). */
+int gpu_scale_set_native(void)
+{
+    if (!s_configured)
+        return 1;                       /* boot: halo2_settings_boot set the env var */
+    if (s_native && !s_fixed_output)
+        return 1;
+    s_native = 1;
+    s_requested = 1;
+    s_fixed_output = 0;
+    s_output_width = 0;                 /* forces the next output update */
+    s_output_height = 0;
+    ++s_revision;
+    fprintf(stderr, "[GPU-SCALE] live scale set to native (follows the output picture)\n");
+    return 1;
+}
+
 int gpu_scale_set_integer(int scale)
 {
     float s;

@@ -39,6 +39,7 @@ set(KERNEL_SOURCES
     nv2a_census.c
     nv2a_gpu_audit.c
     recomp_perf.c
+    recomp_clip.c
     nvnet.c
     nvnet_link.c
     console_id.c

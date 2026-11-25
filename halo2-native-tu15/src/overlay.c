@@ -444,7 +444,10 @@ static int hires_installed(void)
 static void item_text(int item, char *out, size_t n)
 {
     switch (item) {
-    case IT_SCALE: snprintf(out, n, "%dx", clamp_to(s_edit.resolution_scale, 1, 5)); break;
+    case IT_SCALE:
+        if (clamp_to(s_edit.resolution_scale, 0, 5) == 0) snprintf(out, n, "Native");
+        else snprintf(out, n, "%dx", clamp_to(s_edit.resolution_scale, 0, 5));
+        break;
     case IT_FS: snprintf(out, n, "%s", OFFON[s_edit.fullscreen ? 1 : 0]); break;
     case IT_VSYNC: snprintf(out, n, "%s", OFFON[s_edit.vsync ? 1 : 0]); break;
     case IT_FPS: {
@@ -499,7 +502,7 @@ static void nudge(int item, int dir)
         return;
     }
     switch (item) {
-    case IT_SCALE: s_edit.resolution_scale = clamp_to(s_edit.resolution_scale + dir, 1, 5); break;
+    case IT_SCALE: s_edit.resolution_scale = clamp_to(s_edit.resolution_scale + dir, 0, 5); break;
     case IT_FS: s_edit.fullscreen = !s_edit.fullscreen; break;
     case IT_VSYNC: s_edit.vsync = !s_edit.vsync; break;
     case IT_FPS: s_edit.frame_rate = (clamp_to(s_edit.frame_rate, 0, 2) + dir + 3) % 3; break;   /* Auto, 60, 30 */
@@ -832,6 +835,22 @@ static void move_row(int dir)
 static void on_key(WPARAM w)
 {
     int mode = (int)s_mode;
+#ifdef RECOMP_DEBUG_TOOLS
+    if (w == VK_F8 && mode != MODE_BUILD) {
+        /* Debug builds only. F8: hi-res textures off/on while playing, to compare the
+         * pack against the original textures in place (not saved: the menu setting stays) */
+        Halo2Settings t;
+        if (!hires_installed())
+            return;
+        halo2_settings_copy(&t);
+        t.hires_textures = !t.hires_textures;
+        halo2_settings_apply(&t, 0);
+        if (mode == MODE_SET)
+            s_edit.hires_textures = t.hires_textures;
+        fprintf(stderr, "[OVERLAY] F8: hi-res textures %s\n", t.hires_textures ? "on" : "off");
+        return;
+    }
+#endif
     if (mode == MODE_BUILD) {
         if (w == VK_ESCAPE || w == VK_RETURN || w == VK_SPACE)
             skip_build();
@@ -1120,6 +1139,12 @@ static LRESULT CALLBACK subclass_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (s_hwnd) paint();
         return 0;
     }
+#ifdef RECOMP_DEBUG_TOOLS
+    if (down && w == VK_F8) {                   /* debug builds: hi-res textures off/on (on_key) */
+        on_key(w);
+        return 0;
+    }
+#endif
     if (down && (w == VK_F1 || w == VK_ESCAPE)) {
         on_key(w);
         if (s_hwnd) paint();

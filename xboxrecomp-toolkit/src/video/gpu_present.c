@@ -50,6 +50,55 @@ static ID3D11Texture2D          *s_shared_texture;
 static ID3D11ShaderResourceView *s_shared_srv;
 static IDXGIKeyedMutex          *s_shared_mutex;
 static uint32_t                  s_shared_width, s_shared_height;
+/* The last GPU frame, copied out of the shared texture. Shown again when the
+ * window loop repeats a frame (the title below 60 fps, the loop at 60 Hz):
+ * with no new shared frame the repeat went out as the 640x480 CPU copy, and
+ * those blurry repeats between sharp frames were the menu flicker at 4x-5x
+ * (a test laptop, 2026-11-25). */
+static ID3D11Texture2D          *s_keep_tex;
+static ID3D11ShaderResourceView *s_keep_srv;
+static uint32_t                  s_keep_w, s_keep_h;
+static uint64_t                  s_keep_id;
+
+static void release_keep(void)
+{
+    if (s_keep_srv) ID3D11ShaderResourceView_Release(s_keep_srv);
+    if (s_keep_tex) ID3D11Texture2D_Release(s_keep_tex);
+    s_keep_srv = NULL;
+    s_keep_tex = NULL;
+    s_keep_w = s_keep_h = 0;
+    s_keep_id = 0;
+}
+
+/* Copies the held shared frame into s_keep_tex (made to match). 0 if it cannot. */
+static int keep_shared_copy(ID3D11Texture2D *src, uint64_t frame_id)
+{
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D_GetDesc(src, &td);
+    if (!s_keep_tex || s_keep_w != td.Width || s_keep_h != td.Height) {
+        HRESULT hr;
+        release_keep();
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        hr = ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_keep_tex);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_keep_tex,
+                                                       NULL, &s_keep_srv);
+        if (FAILED(hr)) {
+            release_keep();
+            return 0;
+        }
+        s_keep_w = td.Width;
+        s_keep_h = td.Height;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_keep_tex, (ID3D11Resource *)src);
+    s_keep_id = frame_id;
+    return 1;
+}
 
 #ifdef RECOMP_PRESENT_TESTING
 static const char *s_present_test_stage;
@@ -488,6 +537,20 @@ static int gpu_present_frame_impl(const uint32_t *pixels, int allow_shared,
             present_fatal(trace->shared_release, "shared frame release");
         return 0;
     }
+    if (frame && held && keep_shared_copy(s_shared_texture, frame_id)) {
+        ID3D11DeviceContext_Flush(s_ctx);
+        hr = IDXGIKeyedMutex_ReleaseSync(s_shared_mutex, 0);
+        hr = present_test_result("shared-release", hr);
+        present_check_device(hr, "releasing copied shared frame");
+        if (hr != S_OK)
+            present_fatal(hr, "shared frame release");
+        held = 0;
+        frame = s_keep_srv;
+    } else if (!frame && allow_shared && s_keep_srv && frame_id && frame_id == s_keep_id) {
+        frame = s_keep_srv;                       /* a repeat: the last GPU frame again */
+        frame_width = s_keep_w;
+        frame_height = s_keep_h;
+    }
     if (!frame) {
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
                                               pixels, s_w * 4, 0);
@@ -519,6 +582,21 @@ static int gpu_present_frame_impl(const uint32_t *pixels, int allow_shared,
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &frame);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_samp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    /* Hand the shared frame back as soon as its draw is queued, not after
+     * Present: Present waits for the vblank (up to 16 ms), and a frame the
+     * title finished in that time found the texture still held and went out
+     * as the 640x480 CPU copy instead -- every other frame blurry at 3x and
+     * above (about 40 fps on a 60 Hz screen, 2026-11-25). The keyed mutex
+     * orders the GPU work, so the draw still reads this frame. */
+    if (held) {
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        ID3D11DeviceContext_Flush(s_ctx);
+        hr = IDXGIKeyedMutex_ReleaseSync(s_shared_mutex, 0);
+        hr = present_test_result("shared-release", hr);
+        present_check_device(hr, "releasing presented shared frame");
+        if (hr != S_OK)
+            present_fatal(hr, "shared frame release");
+    }
     /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
      * the caller keeps its own 16 ms sleep instead of spinning a core. */
     present_hr = IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0);
@@ -536,13 +614,6 @@ static int gpu_present_frame_impl(const uint32_t *pixels, int allow_shared,
         if (present_hr == S_OK && !logged++) {
             fprintf(stderr, "  [D3D] shared GPU frame presented\n");
         }
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
-        ID3D11DeviceContext_Flush(s_ctx);
-        hr = IDXGIKeyedMutex_ReleaseSync(s_shared_mutex, 0);
-        hr = present_test_result("shared-release", hr);
-        present_check_device(hr, "releasing presented shared frame");
-        if (hr != S_OK)
-            present_fatal(hr, "shared frame release");
     }
     return present_hr == S_OK && s_vsync;
 }
@@ -569,6 +640,7 @@ void gpu_present_shutdown(void)
     s_pending_width = s_pending_height = 0;
     ReleaseSRWLockExclusive(&s_shared_lock);
     release_shared_resources();
+    release_keep();
     if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
     if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
     if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }

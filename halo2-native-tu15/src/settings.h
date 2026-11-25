@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 typedef struct Halo2Settings {
-    int resolution_scale; /* 1..5 */
+    int resolution_scale; /* 0 = Native, 1..5 */
     int fullscreen;       /* 0/1 */
     int vsync;            /* 0/1 */
     int anisotropy;       /* 1=off, or 2/4/8/16 */

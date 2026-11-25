@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_clip.h"   /* g_rclip_vblank_locked */
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "console_id.h"
@@ -3732,6 +3733,7 @@ static double vblank_interval_ns(uint64_t now_ns)
         if (corr < -200000.0) corr = -200000.0;
         period = p + corr;
     }
+    g_rclip_vblank_locked = locked;
     if (locked != locked_was) {
         if (locked)
             fprintf(stderr, "  [VBLANK] locked to the screen's refresh (%.3f Hz)\n",

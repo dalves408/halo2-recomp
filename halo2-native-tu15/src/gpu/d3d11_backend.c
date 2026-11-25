@@ -4357,11 +4357,14 @@ static void rtdump_surface(Surf *s, const char *why)
         PUT32(22, td.Height); h[26] = 1; h[28] = 24; PUT32(34, row * td.Height);
 #undef PUT32
         fwrite(h, 1, 54, f);
+        int dump_alpha = getenv("RECOMP_RTLOG_ALPHA") != NULL;   /* test: write the alpha channel as grey */
         line = (uint8_t *)calloc(1, row);
         for (y = td.Height; line && y-- > 0;) {
             const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
             for (x = 0; x < td.Width; x++) {
-                if (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+                if (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM && dump_alpha) {
+                    line[x * 3] = line[x * 3 + 1] = line[x * 3 + 2] = src[x * 4 + 3];   /* test: alpha as grey */
+                } else if (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
                     line[x * 3] = src[x * 4]; line[x * 3 + 1] = src[x * 4 + 1]; line[x * 3 + 2] = src[x * 4 + 2];
                 } else {
                     uint16_t v = (uint16_t)(src[x * 2] | src[x * 2 + 1] << 8);
@@ -4755,10 +4758,39 @@ static void maybe_test_live_settings(void)
     halo2_settings_apply(&t, 0);
 }
 
+/* RECOMP_TEST_LIVE_SCALE=0,2,0 (test switch): applies each listed resolution
+ * scale in turn (0 = Native), one every 3000 draws (the first at
+ * RECOMP_TEST_LIVE_SCALE_AT, default 3000), as the settings menu would. */
+static void maybe_test_live_scale(void)
+{
+    static const char *list;
+    static int init;
+    static unsigned next = 3000u;
+    Halo2Settings t;
+    if (!init) {
+        init = 1;
+        list = getenv("RECOMP_TEST_LIVE_SCALE");
+        if (list && !*list) list = NULL;
+        if (getenv("RECOMP_TEST_LIVE_SCALE_AT"))       /* first switch at this draw count */
+            next = (unsigned)strtoul(getenv("RECOMP_TEST_LIVE_SCALE_AT"), NULL, 10);
+    }
+    if (!list || s_gen < next)
+        return;
+    next = s_gen + 3000u;
+    halo2_settings_copy(&t);
+    t.resolution_scale = atoi(list);
+    fprintf(stderr, "[SETTINGS] test live scale -> %d (gen=%u)\n", t.resolution_scale, s_gen);
+    fflush(stderr);
+    halo2_settings_apply(&t, 0);
+    list = strchr(list, ',');
+    if (list) ++list;
+}
+
 static void pump_live_settings(void)
 {
     halo2_settings_pump();
     maybe_test_live_settings();
+    maybe_test_live_scale();
     halo2_settings_pump();
 }
 
@@ -5592,7 +5624,7 @@ static void retire_stale_non_rt_overlap(Surf *s)
     }
 }
 
-static int d3d_readback(uint32_t color_va);
+static int d3d_readback_ex(uint32_t color_va, int present);
 
 /* A texture that lies wholly inside a small GPU-newer color target that is
  * not its exact alias: the target's row is padded wider than the texture
@@ -5609,7 +5641,11 @@ static int pull_small_overlap(Surf *s, uint64_t start, uint64_t end)
         return 0;
     if (start < lo || end > hi)
         return 0;
-    return d3d_readback(s->va);
+    {   /* test: RECOMP_GPU_SMALL_READBACK_OLD=1, the readback as before 2026-11-24 (presented, may go async) */
+        static int old = -1;
+        if (old < 0) old = getenv("RECOMP_GPU_SMALL_READBACK_OLD") != NULL;
+        return d3d_readback_ex(s->va, old);
+    }
 }
 
 static int color_texture_alias(const Nv2aTexture *t, int cube,
@@ -5832,6 +5868,138 @@ static ID3D11ShaderResourceView *tex_stale_view(const Nv2aTexture *t, int cube,
 
 static const char *s_tex_fail;
 static int s_texture_soft_reject;
+
+/* ---- crisp text
+ *
+ * Halo 2 draws all its text from one glyph cache, a 256x256 LIN_A4R4G4B4 texture
+ * the game fills with each font's small glyph bitmaps (made for 480p). Drawn at
+ * 1080p they were enlarged with bilinear filtering: blurry letters with the
+ * glyphs' stair steps under the blur. Whenever the game changes the cache, this
+ * builds a 4x copy: alpha enlarged with a smooth (Catmull-Rom) filter, then its
+ * edges steepened around half coverage, which is how distance-field text keeps
+ * curves clean and sharp at any size; colour enlarged bilinearly. It is drawn in
+ * place of the cache (lod_extra 2, like a texture-pack replacement), with mips.
+ * RECOMP_GPU_SHARP_TEXT=0 turns it off. */
+static int sharp_text_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_SHARP_TEXT");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Cubic B-spline: smooths across the glyphs' one-texel stair steps (an interpolating
+ * filter would keep them), so the steepened edge follows the letter's curve. */
+static float bspline(float p0, float p1, float p2, float p3, float t)
+{
+    float t2 = t * t, t3 = t2 * t;
+    return (p0 * (1 - t) * (1 - t) * (1 - t) + p1 * (3 * t3 - 6 * t2 + 4) +
+            p2 * (-3 * t3 + 3 * t2 + 3 * t + 1) + p3 * t3) / 6.0f;
+}
+
+static int sharp_text_build(const uint8_t *src, uint32_t pitch, ID3D11Texture2D **otex,
+                            ID3D11ShaderResourceView **osrv, unsigned *olevels)
+{
+    enum { N = 256, S = 4, M = N * S };
+    const float steep = 4.5f;                   /* edge width about a quarter of a source texel */
+    float *a, *r, *g, *b;
+    uint8_t *out;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    int x, y, i, j;
+    if (pitch < N * 2)
+        return 0;
+    a = (float *)malloc(sizeof(float) * N * N * 4);
+    out = (uint8_t *)malloc((size_t)M * M * 4);
+    if (!a || !out) {
+        free(a); free(out);
+        return 0;
+    }
+    r = a + N * N; g = r + N * N; b = g + N * N;
+    for (y = 0; y < N; y++)
+        for (x = 0; x < N; x++) {
+            const uint8_t *p = src + (size_t)y * pitch + (size_t)x * 2;
+            unsigned v = p[0] | p[1] << 8;
+            a[y * N + x] = (float)(v >> 12) / 15.0f;
+            r[y * N + x] = (float)((v >> 8) & 15) / 15.0f;
+            g[y * N + x] = (float)((v >> 4) & 15) / 15.0f;
+            b[y * N + x] = (float)(v & 15) / 15.0f;
+        }
+    for (y = 0; y < M; y++) {
+        float sy = (y + 0.5f) / S - 0.5f;
+        int y0 = (int)floorf(sy);
+        float ty = sy - y0;
+        int ys[4];
+        for (j = 0; j < 4; j++) {
+            int v = y0 - 1 + j;
+            ys[j] = v < 0 ? 0 : v >= N ? N - 1 : v;
+        }
+        for (x = 0; x < M; x++) {
+            float sx = (x + 0.5f) / S - 0.5f;
+            int x0 = (int)floorf(sx);
+            float tx = sx - x0, col[4], al, cr, cg, cb;
+            int xs[4], xa, xb, ya, yb;
+            uint8_t *o = out + ((size_t)y * M + x) * 4;
+            for (i = 0; i < 4; i++) {
+                int v = x0 - 1 + i;
+                xs[i] = v < 0 ? 0 : v >= N ? N - 1 : v;
+            }
+            for (j = 0; j < 4; j++)
+                col[j] = bspline(a[ys[j] * N + xs[0]], a[ys[j] * N + xs[1]], a[ys[j] * N + xs[2]],
+                                 a[ys[j] * N + xs[3]], tx);
+            al = bspline(col[0], col[1], col[2], col[3], ty);
+            al = (al - 0.5f) * steep + 0.5f;
+            al = al < 0.0f ? 0.0f : al > 1.0f ? 1.0f : al;
+            xa = xs[1]; xb = xs[2]; ya = ys[1]; yb = ys[2];
+#define BIL(c) ((c[ya * N + xa] * (1 - tx) + c[ya * N + xb] * tx) * (1 - ty) + \
+                (c[yb * N + xa] * (1 - tx) + c[yb * N + xb] * tx) * ty)
+            cr = BIL(r); cg = BIL(g); cb = BIL(b);
+#undef BIL
+            o[0] = (uint8_t)(cr * 255.0f + 0.5f);
+            o[1] = (uint8_t)(cg * 255.0f + 0.5f);
+            o[2] = (uint8_t)(cb * 255.0f + 0.5f);
+            o[3] = (uint8_t)(al * 255.0f + 0.5f);
+        }
+    }
+    free(a);
+    memset(&td, 0, sizeof td);
+    td.Width = td.Height = M;
+    td.MipLevels = 0;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex))) {
+        free(out);
+        return 0;
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)tex, 0, NULL, out, M * 4, 0);
+    free(out);
+    memset(&sd, 0, sizeof sd);
+    sd.Format = td.Format;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = (UINT)-1;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, &sd, &srv))) {
+        ID3D11Texture2D_Release(tex);
+        return 0;
+    }
+    ID3D11DeviceContext_GenerateMips(s_ctx, srv);
+    {
+        static unsigned builds;
+        if (++builds <= 3 || builds % 100 == 0)
+            fprintf(stderr, "[GPU-D3D11] crisp text: glyph cache rebuilt at 1024x1024 (%u times)\n", builds);
+    }
+    *otex = tex;
+    *osrv = srv;
+    *olevels = 11;                              /* 1024 down to 1 */
+    return 1;
+}
 
 /* The view a stage samples, and the size its texel-space coordinates are
  * divided by (*tw, *th). */
@@ -6308,13 +6476,36 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
         e->wide_kind = wide_kind_of(hash_bytes(snapshot + layout.subresource[0][0].offset,
                                                layout.subresource[0][0].size));
     s_tex_wide_kind = e->wide_kind;
-    if (texpack_enabled() && layout.subresource[0][0].size) {
+    if (t->color == 0x1D && t->width == 256 && t->height == 256 && cube == 0 &&
+        layout.subresource[0][0].size >= 256u * 512u && sharp_text_enabled()) {
+        /* Halo 2's glyph cache (LIN_A4R4G4B4 256x256): a crisp 4x copy (sharp_text_build) */
+        const GpuTextureSubresource *s0 = &layout.subresource[0][0];
+        ID3D11Texture2D *ftex;
+        ID3D11ShaderResourceView *fsrv;
+        unsigned flevels;
+        if (sharp_text_build(snapshot + s0->offset, s0->size / 256u, &ftex, &fsrv, &flevels)) {
+            e->orig_tex = e->tex;
+            e->orig_srv = e->srv;
+            e->orig_levels = e->uploaded_levels ? e->uploaded_levels : 1;
+            e->tex = ftex;
+            e->srv = fsrv;
+            e->hires = 1;
+            e->lod_extra = 2;
+            e->view_levels = flevels;
+            s_st.tex_hires++;
+        }
+    }
+    if (texpack_enabled() && layout.subresource[0][0].size && !e->hires) {
         const GpuTextureSubresource *s0 = &layout.subresource[0][0];
         ID3D11Texture2D *ptex;
         ID3D11ShaderResourceView *psrv;
         unsigned plevels, pextra;
-        if (texpack_lookup(s_dev, hash_bytes(snapshot + s0->offset, s0->size), t->width,
+        uint64_t phash = hash_bytes(snapshot + s0->offset, s0->size);
+        if (texpack_lookup(s_dev, phash, t->width,
                            t->height, cube, &ptex, &psrv, &plevels, &pextra)) {
+            if (getenv("RECOMP_TEX_PACK_LOG"))      /* which pack file (named by this hash) a guest texture became */
+                fprintf(stderr, "[TEXPACK] hit tex %08X %ux%u hash %016llx\n", t->offset, t->width, t->height,
+                        (unsigned long long)phash);
             e->orig_tex = e->tex;
             e->orig_srv = e->srv;
             e->orig_levels = e->uploaded_levels ? e->uploaded_levels : 1;
@@ -8209,6 +8400,28 @@ static int d3d_submit_vertex_draw(const Nv2aSurface *s, const Nv2aXVsBatch *b)
                     r->stencil_ref, r->blend_enable, r->blend_src, r->blend_dst, r->color_mask,
                     b->xb.clip_plane_mode,
                     tx[0], tx[1], tx[2], tx[3]);
+            {   /* RECOMP_RTLOG_STEP=<n>: also save a full-size target before every n-th draw on it
+                 * (what the frame looked like up to there; the label is the frame's draw number) */
+                static int step = -1;
+                static unsigned from;   /* RECOMP_RTLOG_STEP_FROM: start at this draw */
+                static uint32_t step_gen;
+                static unsigned drawn;
+                if (step < 0) {
+                    const char *e = getenv("RECOMP_RTLOG_STEP");
+                    step = e ? atoi(e) : 0;
+                    e = getenv("RECOMP_RTLOG_STEP_FROM");
+                    from = e ? (unsigned)atoi(e) : 0;
+                }
+                if (step_gen != s_gen) { step_gen = s_gen; drawn = 0; }
+                if (step > 0 && s_cur && s_cur->w >= 640) {
+                    if (drawn >= from && (drawn - from) % (unsigned)step == 0) {
+                        char why[16];
+                        snprintf(why, sizeof why, "d%04u", drawn);
+                        rtdump_surface(s_cur, why);
+                    }
+                    drawn++;
+                }
+            }
         }
         if (s_kvalid && kgen_ok && b->consts_gen == kgen
                 && !memcmp(vsinfo, s_kshadow.vsinfo, sizeof vsinfo)
@@ -9287,7 +9500,11 @@ static void publish_shared_present(Surf *sf)
     }
     if (candidate.texture)
         install_shared_present(&candidate);
-    hr = IDXGIKeyedMutex_AcquireSync(s_present_mutex, 0, 0);
+    /* Wait (up to a refresh) for the presenter to take the previous frame
+     * rather than give up at once: a frame that gives up goes out as the
+     * 640x480 CPU copy, and at 3x+ those blurry frames between sharp ones
+     * read as menu flicker (a test laptop, 2026-11-25). */
+    hr = IDXGIKeyedMutex_AcquireSync(s_present_mutex, 0, 20);
     if (scale_test_failure("shared-producer-acquire"))
         hr = E_FAIL;
     if (scale_test_failure("shared-producer-loss"))
@@ -10285,7 +10502,13 @@ static uint32_t arbdbg_sum(uint32_t va, uint32_t pitch, uint32_t h)
     for (i = 0; i < 64; ++i) x = x * 31 + p[i * 2];
     return x;
 }
-static int d3d_readback(uint32_t color_va)
+/* Put a colour surface's pixels in guest memory. present: it is the frame the
+ * title flipped, so it also goes to the screen (the shared GPU frame), is the
+ * last presented surface, and may be read back asynchronously. Every other
+ * readback (a small render target the title samples as a texture) only copies:
+ * presenting it showed a cutscene's 320x240 blur target on every other frame,
+ * stretched past the letterbox (Arbiter intro on a GTX 1650, 2026-11-24). */
+static int d3d_readback_ex(uint32_t color_va, int present)
 {
     Surf *sf = find_surf(color_va);
     ID3D11Texture2D *source;
@@ -10301,14 +10524,19 @@ static int d3d_readback(uint32_t color_va)
     if (!sf || !s_dev)
         return 0;
     gpu_work_begin();
-    s_last_presented = sf;
-    update_native_output(sf);
+    if (present) {
+        s_last_presented = sf;
+        update_native_output(sf);
+    }
     counting = query_suspend_clear();
     if (!sync_guest_surface(sf, 1))
         goto done;
-    publish_shared_present(sf);
+    if (present)
+        publish_shared_present(sf);
+    else
+        s_shared_ok = 0;                            /* no async readback: the title reads it now */
 #ifdef RECOMP_DEBUG_TOOLS
-    if (halo2_screenshot_enabled()) {
+    if (present && halo2_screenshot_enabled()) {
         if (!s_shared_ok)
             halo2_screenshot_try_copy(s_dev, s_ctx, sf->tex, sf->pw, sf->ph, surf_format(sf->bpp));
         halo2_screenshot_finalize(s_ctx);
@@ -10452,7 +10680,7 @@ static int d3d_flip_readback(uint32_t color_va)
         rtdump_surface(find_surf(color_va), "flip");
     }
     int tracked = find_surf(color_va) != NULL;
-    int ok = d3d_readback(color_va);
+    int ok = d3d_readback_ex(color_va, 1);
     rla_complete();         /* queued relayout bytes: the GPU is past them by now */
     if (tracked && !ok) {
         fprintf(stderr, "[GPU-D3D11] cannot make tracked color surface %08X guest-visible;"
@@ -10518,7 +10746,7 @@ int bruteforce_d3d11_test_shared_busy(int busy)
 
 int bruteforce_d3d11_test_readback(uint32_t color_va)
 {
-    return d3d_readback(color_va);
+    return d3d_readback_ex(color_va, 1);
 }
 
 int bruteforce_d3d11_test_pipeline(uint32_t color_va, uint32_t depth_va,

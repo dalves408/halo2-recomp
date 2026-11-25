@@ -276,7 +276,11 @@ size_t gpu_rc_hlsl(const GpuRcKey *k, char *out, size_t cap)
             "    float inv = sum != 0.0 && isfinite(1.0 / sum) ? 1.0 / sum : 0.0;\n"
             "    wz = i.tA.z + b1 * inv * (i.tB.z - i.tA.z) + b2 * inv * (i.tC.z - i.tA.z);\n"
             "    if (!(wz > 0.0)) wz = 3.402823e38;\n"
-            "    if (wz < i.tA.w || i.tB.w < wz) discard;\n"
+            /* ZCLAMP_EN (tA.w < 0): the NV2A clamps depth outside the clip range to it
+             * and draws the pixel. Halo 2's sky dome lies beyond the far plane and was
+             * dropped, leaving the gas giant's sky brown or black (2026-11-24). */
+            "    if (i.tA.w < 0.0) wz = clamp(wz, 0.0, i.tB.w);\n"
+            "    else if (wz < i.tA.w || i.tB.w < wz) discard;\n"
             "  }\n"
             "  od = (wz - depth.x) * depth.y;\n"
             "  if (depth.w > 0.0) od -= depth.w + max(abs(ddx(od)), abs(ddy(od)));\n"
