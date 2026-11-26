@@ -237,6 +237,16 @@ def main():
         define('TexturePatchFileCount', len(patch['files']))
         define('TextureBaseManifestSHA256', f'"{patch["base_manifest_sha256"]}"')
         define('TextureBaseFileCount', patch['base_files'])
+    # Earlier official revisions' manifests: a folder holding one of them is ours, so Setup deletes it after
+    # installing this revision instead of keeping it as an unknown backup (a full revision 3 had no update
+    # from 2, and a 6 GB revision 2 folder would have stayed beside it).
+    older = []
+    for r in range(1, args.revision):
+        pj = ROOT / 'out' / 'texture-release' / f'revision-{r}' / 'texture-payload.json'
+        if pj.exists():
+            older.append(json.loads(pj.read_text(encoding='utf-8'))['manifest_sha256'])
+    if older:
+        define('TextureOlderManifests', '"' + ';'.join(older) + '"')
     (ROOT / 'installer' / 'texture_payload.iss').write_text('\n'.join(lines) + '\n', encoding='ascii', newline='\n')
     write_patch_files_iss(patch)
     print(json.dumps(info, indent=2))

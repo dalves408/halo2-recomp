@@ -540,6 +540,11 @@ begin
   if not FileExists(PackDir + '\manifest.txt') then Exit;
   try
     Result := CompareText(GetSHA256OfFile(PackDir + '\manifest.txt'), '{#TextureManifestSHA256}') = 0;
+#ifdef TextureOlderManifests
+    { an earlier official revision is ours too: deleted once the new one is in place }
+    if not Result then
+      Result := Pos(Lowercase(GetSHA256OfFile(PackDir + '\manifest.txt')), Lowercase('{#TextureOlderManifests}')) > 0;
+#endif
 #ifdef TexturePatchFrom
     { a damaged copy of the revision the update starts from is ours too }
     if not Result then
