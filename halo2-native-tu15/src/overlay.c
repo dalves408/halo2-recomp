@@ -34,7 +34,7 @@ extern volatile int g_audio_muted;
 extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
-enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_SMOOTH, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
 enum { MODE_NONE, MODE_QUIT, MODE_SET, MODE_BUILD };
 
 /* gpu/d3d11_backend.c: the first-start shader build (rc_prebuild_scan). */
@@ -44,7 +44,7 @@ enum { PAGE_VIDEO, PAGE_CONTROLS };
 enum { M_AIM, M_SENS, M_INV };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
-    "Render scale", "Fullscreen", "VSync", "Frame rate", "Anisotropic filter", "FXAA", "MSAA",
+    "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "FXAA", "MSAA",
     "Widescreen (at next start)", "Hi-res textures", "Close menu", "Quit game"
 };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
@@ -459,6 +459,7 @@ static void item_text(int item, char *out, size_t n)
             snprintf(out, n, "Auto (%d fps)", now);
         break;
     }
+    case IT_SMOOTH: snprintf(out, n, "%s", OFFON[s_edit.smooth_motion ? 1 : 0]); break;
     case IT_ANISO: snprintf(out, n, "%s", ANISO_TXT[aniso_ix(s_edit.anisotropy)]); break;
     case IT_FXAA: snprintf(out, n, "%s", OFFON[s_edit.fxaa ? 1 : 0]); break;
     case IT_MSAA: snprintf(out, n, "%s", MSAA_TXT[msaa_ix(s_edit.msaa)]); break;
@@ -506,6 +507,7 @@ static void nudge(int item, int dir)
     case IT_FS: s_edit.fullscreen = !s_edit.fullscreen; break;
     case IT_VSYNC: s_edit.vsync = !s_edit.vsync; break;
     case IT_FPS: s_edit.frame_rate = (clamp_to(s_edit.frame_rate, 0, 2) + dir + 3) % 3; break;   /* Auto, 60, 30 */
+    case IT_SMOOTH: s_edit.smooth_motion = !s_edit.smooth_motion; break;   /* live, from the next frame */
     case IT_ANISO:
         v = aniso_ix(s_edit.anisotropy) + dir;
         s_edit.anisotropy = ANISO_VAL[clamp_to(v, 0, 4)];
@@ -583,7 +585,7 @@ static void draw_settings(HDC hdc, int w, int h)
     if ((float)h / 640.0f < sc) sc = (float)h / 640.0f;
     ui_fonts_make(&f, sc);
     bw = ui_px(&f, 960);
-    bh = ui_px(&f, 640);
+    bh = ui_px(&f, 680);   /* 640 + the Smooth motion row */
     x = (w - bw) / 2;
     y = (h - bh) / 2;
     SetRect(&all, 0, 0, w, h);

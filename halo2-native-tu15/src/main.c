@@ -312,8 +312,8 @@ static void halo2_write_crash_report(PEXCEPTION_POINTERS ep)
         }
         s = halo2_settings_get();
         if (s)
-            fprintf(f, "Settings scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d\n",
-                    s->resolution_scale, s->fullscreen, s->vsync,
+            fprintf(f, "Settings scale=%s fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d\n",
+                    halo2_scale_name(s->resolution_scale), s->fullscreen, s->vsync,
                     s->anisotropy, s->fxaa, s->msaa);
         if (halo2_settings_last_apply() && halo2_settings_last_apply()[0])
             fprintf(f, "Last live apply: %s\n", halo2_settings_last_apply());

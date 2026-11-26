@@ -77,6 +77,10 @@ void h2_release_startup(void)
         return;
 #ifdef H2_RELEASE
     drop_developer_switches();
+    /* Player logs without the high-volume debug lines (draw counter, per-pass GPU detail,
+     * kernel call summaries): a 1.0.8 log was 4,000 "draw #" lines of 6,400. fps, usage,
+     * settings and errors stay. */
+    _putenv_s("RECOMP_LOG_VERBOSE", "0");
 #endif
     halo2_install_root(root, sizeof root);
     SetCurrentDirectoryA(root);

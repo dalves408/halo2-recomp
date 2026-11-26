@@ -41,6 +41,9 @@ int  gpu_present_output_size(uint32_t *width, uint32_t *height);
 /* The shape the picture is shown at (width / height): 4:3 by default; a
  * title rendering widescreen sets 16:9 or 16:10. */
 void  gpu_present_set_picture_aspect(float aspect);
+/* Zoom the picture vertically by z (1 = none), centred: a letterboxed 4:3 cutscene shown at the
+ * widescreen shape fills the width with its bars outside the window (Halo 2 settings.c). */
+void  gpu_present_set_vzoom(float z);
 float gpu_present_picture_aspect(void);
 uint64_t xbox_FramebufferWindowNextFrameId(void);
 int  gpu_present_submit_shared(HANDLE handle, uint32_t width, uint32_t height,

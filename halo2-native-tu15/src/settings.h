@@ -17,6 +17,7 @@ typedef struct Halo2Settings {
     int mouse_sens;       /* percent, 10..500 */
     int mouse_invert;     /* 0/1: mouse up looks down */
     int frame_rate;       /* 0 Auto (60, or 30 when the PC can't hold 60), 1 60 fps, 2 30 fps; live */
+    int smooth_motion;    /* 0/1: smooth motion, the in-between frames for the game's 30 Hz updates (h2_interp.c); default on; live */
 } Halo2Settings;
 
 /* The frame rate the game targets now (main.c): 60 or 30. With the Auto
@@ -42,6 +43,15 @@ float halo2_widescreen_aspect(int mode);
 /* In Xbox Live: the 4:3 view stretched across (anamorphic), so a wide screen
  * sees no more than 4:3 does; off again: the full widescreen view. */
 void halo2_widescreen_live(int live);
+/* While a cutscene shows its letterbox bars: the game's own 4:3 view, zoomed so the picture
+ * between the bars fills the widescreen width (the bars fall outside the window). */
+void halo2_cutscene_view(float amount);   /* the letterbox amount, 0..1 */
+
+/* Smooth motion on or off (h2_interp.c); takes effect at the next frame. */
+void h2_interp_set_enabled(int on);
+
+/* The render scale for logs: "native", "1x" .. "5x". */
+const char *halo2_scale_name(int scale);
 
 void halo2_settings_defaults(Halo2Settings *s);
 void halo2_settings_ini_path(char *buf, size_t n);

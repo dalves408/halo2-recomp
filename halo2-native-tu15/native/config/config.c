@@ -15,7 +15,8 @@
 #include "update_check.h"
 #include "version.h"
 
-static const char *const SCALE_TXT[] = { "1x", "2x", "3x", "4x", "5x" };
+/* resolution_scale 0 = Native (the window's own resolution, as in the F1 menu), 1..5 = times 640x480 */
+static const char *const SCALE_TXT[] = { "Native", "1x", "2x", "3x", "4x", "5x" };
 static const char *const OFFON[] = { "Off", "On" };
 static const char *const ANISO_TXT[] = { "Off", "2x", "4x", "8x", "16x" };
 static const int ANISO_VAL[] = { 1, 2, 4, 8, 16 };
@@ -29,13 +30,13 @@ static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 5
 
 /* The settings as indexes into the lists above. */
 static const char *const FPS_TXT[] = { "Auto", "60 fps", "30 fps" };
-enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_HIRES, V_COUNT };
+enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_SMOOTH, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_HIRES, V_COUNT };
 static const char *const V_LABEL[V_COUNT] = {
-    "Render scale", "Fullscreen", "VSync", "Frame rate", "Anisotropic filter", "FXAA", "MSAA",
+    "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "FXAA", "MSAA",
     "Widescreen (at next start)", "Hi-res textures (at next start)",
 };
-static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT, OFFON };
-static const int V_N[V_COUNT] = { 5, 2, 2, 3, 5, 2, 4, 4, 2 };
+static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, OFFON, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT, OFFON };
+static const int V_N[V_COUNT] = { 6, 2, 2, 3, 2, 5, 2, 4, 4, 2 };
 static int s_v[V_COUNT];
 enum { M_AIM, M_SENS, M_INV };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -50,7 +51,7 @@ enum { B_RESET, B_SAVE, B_CANCEL, B_COUNT };
 static const char *const B_TXT[B_COUNT] = { "RESET DEFAULTS", "SAVE", "CANCEL" };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
 #define BASE_W 960
-#define BASE_H 640
+#define BASE_H 680   /* 640 + the Smooth motion row */
 static float s_scale = 1.0f;
 static int s_page = PAGE_CONTROLS;
 static int s_sel_row = -1, s_sel_col = -1, s_listen;
@@ -117,10 +118,11 @@ static void load_all(int defaults)
     int on;
     ini_path(path, sizeof path);
     on = !defaults && path[0];
-    s_v[V_SCALE] = clampi(on ? (int)GetPrivateProfileIntA("display", "resolution_scale", 1, path) : 1, 1, 5) - 1;
+    s_v[V_SCALE] = clampi(on ? (int)GetPrivateProfileIntA("display", "resolution_scale", 1, path) : 1, 0, 5);
     s_v[V_FS] = on && GetPrivateProfileIntA("display", "fullscreen", 0, path) != 0;
     s_v[V_VSYNC] = on ? GetPrivateProfileIntA("display", "vsync", 1, path) != 0 : 1;
     s_v[V_FPS] = clampi(on ? (int)GetPrivateProfileIntA("display", "frame_rate", 0, path) : 0, 0, 2);
+    s_v[V_SMOOTH] = on ? GetPrivateProfileIntA("display", "smooth_motion", 1, path) != 0 : 1;
     s_v[V_ANISO] = index_of(ANISO_VAL, 5, on ? (int)GetPrivateProfileIntA("display", "anisotropy", 1, path) : 1);
     s_v[V_FXAA] = on && GetPrivateProfileIntA("display", "fxaa", 0, path) != 0;
     s_v[V_MSAA] = index_of(MSAA_VAL, 4, on ? (int)GetPrivateProfileIntA("display", "msaa", 1, path) : 1);
@@ -143,12 +145,13 @@ static int save_all(HWND owner)
     }
     snprintf(dir, sizeof dir, "%s", path);
     if ((slash = strrchr(dir, '\\')) != NULL) { *slash = 0; CreateDirectoryA(dir, NULL); }
-    snprintf(buf, sizeof buf, "%d", s_v[V_SCALE] + 1);
+    snprintf(buf, sizeof buf, "%d", s_v[V_SCALE]);
     WritePrivateProfileStringA("display", "resolution_scale", buf, path);
     WritePrivateProfileStringA("display", "fullscreen", s_v[V_FS] ? "1" : "0", path);
     WritePrivateProfileStringA("display", "vsync", s_v[V_VSYNC] ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", s_v[V_FPS]);
     WritePrivateProfileStringA("display", "frame_rate", buf, path);
+    WritePrivateProfileStringA("display", "smooth_motion", s_v[V_SMOOTH] ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", ANISO_VAL[s_v[V_ANISO]]);
     WritePrivateProfileStringA("display", "anisotropy", buf, path);
     WritePrivateProfileStringA("display", "fxaa", s_v[V_FXAA] ? "1" : "0", path);
@@ -238,6 +241,7 @@ static void draw(HDC dc, int w, int h)
         SetRect(&note, px(212), px(130) + V_COUNT * px(40) + px(16), px(760), h - px(80));
         ui_text(dc, f.fine, RGB(150, 178, 210), &note,
                 "Frame rate Auto plays at 60 fps and drops to 30 if this PC can't keep up.\n"
+                "Smooth motion draws in-between frames so the game's 30 updates a second move at 60.\n"
                 "Also in the game's F1 menu; a running game takes changes made here at its next\n"
                 "start. Saved in the data folder. Halo 2 Native version " H2N_VERSION ".",
                 DT_LEFT | DT_WORDBREAK);

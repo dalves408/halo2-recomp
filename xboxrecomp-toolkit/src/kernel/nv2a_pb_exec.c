@@ -5021,6 +5021,18 @@ static void frame_trace_flip(void)
     }
 }
 
+/* RECOMP_LOG_VERBOSE=0 (Halo 2 release builds set it, h2_release.c): no high-volume debug
+ * lines in the log -- a player log was 4,000 "draw #" lines out of 6,400 (2026-11-25). */
+static int log_verbose(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_LOG_VERBOSE");
+        v = !(e && e[0] == '0');
+    }
+    return v;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -5029,7 +5041,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && log_verbose())
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -7003,6 +7015,10 @@ void nv2a_pb_exec_report(void)
         nv2a_frame_stats_take_report(&s_frame_stats, &flips, &distinct, &unknown);
         fprintf(stderr, "[GPU] frames since last report: %u flips, %u distinct,"
                         " %u unknown\n", flips, distinct, unknown);
+    }
+    if (!log_verbose()) {      /* the per-pass detail below is for development logs */
+        fflush(stderr);
+        return;
     }
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",

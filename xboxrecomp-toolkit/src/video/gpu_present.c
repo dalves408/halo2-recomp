@@ -313,6 +313,13 @@ int gpu_present_shared_ready(uint32_t width, uint32_t height)
  * says so with gpu_present_set_picture_aspect. */
 static volatile float s_picture_aspect = 4.0f / 3.0f;
 
+static float s_vzoom = 1.0f;
+
+void gpu_present_set_vzoom(float z)
+{
+    s_vzoom = z >= 1.0f && z <= 2.0f ? z : 1.0f;
+}
+
 void gpu_present_set_picture_aspect(float aspect)
 {
     if (aspect >= 1.0f && aspect <= 4.0f)
@@ -569,7 +576,7 @@ static int gpu_present_frame_impl(const uint32_t *pixels, int allow_shared,
         (void)sx; (void)sy;
         if (!picture_size(s_bw, s_bh, &pw, &ph)) { pw = s_bw; ph = s_bh; }
         vp.Width = (float)pw;
-        vp.Height = (float)ph;
+        vp.Height = (float)ph * s_vzoom;   /* a cutscene's bars zoomed out of the window */
     }
     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;

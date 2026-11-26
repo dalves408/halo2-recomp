@@ -57,6 +57,12 @@ static int clamp_msaa(int v)
     return 1;
 }
 
+const char *halo2_scale_name(int scale)
+{
+    static const char *const names[] = { "native", "1x", "2x", "3x", "4x", "5x" };
+    return scale >= 0 && scale <= 5 ? names[scale] : "?";
+}
+
 void halo2_settings_defaults(Halo2Settings *s)
 {
     if (!s)
@@ -73,6 +79,7 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->mouse_sens = 100;
     s->mouse_invert = 0;
     s->frame_rate = 0;     /* Auto */
+    s->smooth_motion = 1;  /* on */
 }
 
 static int clamp_sens(int v) { return v < 10 ? 10 : (v > 500 ? 500 : v); }
@@ -145,6 +152,7 @@ int halo2_settings_load(Halo2Settings *s)
     s->mouse_invert = cfg_get_input("mouse_invert", 0, path) != 0;
     s->frame_rate = cfg_get("frame_rate", 0, path);
     if (s->frame_rate < 0 || s->frame_rate > 2) s->frame_rate = 0;
+    s->smooth_motion = cfg_get("smooth_motion", 1, path) != 0;
     return 1;
 }
 
@@ -181,6 +189,7 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("widescreen", s->widescreen >= 0 && s->widescreen <= 3 ? s->widescreen : 2, path);
     cfg_put("hires_textures", s->hires_textures ? 1 : 0, path);
     cfg_put("frame_rate", s->frame_rate >= 0 && s->frame_rate <= 2 ? s->frame_rate : 0, path);
+    cfg_put("smooth_motion", s->smooth_motion ? 1 : 0, path);
     cfg_put_in("input", "mouse_aim", s->mouse_aim ? 1 : 0, path);
     cfg_put_in("input", "mouse_sens", clamp_sens(s->mouse_sens), path);
     cfg_put_in("input", "mouse_invert", s->mouse_invert ? 1 : 0, path);
@@ -217,6 +226,53 @@ static float s_squeeze_full = 1.0f;          /* the 2D squeeze outside Xbox Live
  * squeezed, so the game's 4:3 picture is stretched across the same wide
  * screen -- what Halo 2's own Xbox widescreen mode shows. Both values are
  * read every frame, so this switches at once in either direction. */
+/* Cutscenes in widescreen (the user's choice, 2026-11-25): Halo 2 letterboxes its cutscenes
+ * inside the 4:3 picture, two bars of 12.5% (retail 0x13ccf0), which leaves exactly 16:9 between
+ * them. Widening the camera showed what the shots were never framed for -- a planet cut off at
+ * the old 4:3 edge in The Heretic. So while the bars show, the camera keeps the game's 4:3 view
+ * and the 2D layer is not squeezed (the 4:3 picture across the wide surface), and the presenter
+ * zooms it vertically by the same widening: the picture keeps its shape, the bars fall outside
+ * the window (16:10: most of them). RECOMP_HALO2_CUTSCENE_FILL=0 keeps the widened view (test). */
+static int s_ws_live;
+static float s_cut_amount;                   /* letterbox amount 0..1 (0 = none) */
+
+static void widescreen_apply(void)
+{
+    /* The view follows the bars: as they slide in or out, the camera widens from 4:3 to the
+     * full widening g and the zoom W/g keeps the picture's shape, so the crop eases back to the
+     * widescreen view with the bars instead of waiting for them to be gone (user, 2026-11-25). */
+    float a = s_ws_live ? 0.0f : s_cut_amount;
+    float g = 1.0f + (s_wide_fov_full - 1.0f) * (1.0f - a);
+    if (s_wide_fov_full <= 1.0f)
+        return;                               /* playing at 4:3: nothing to change */
+    g_h2_wide_fov = s_ws_live ? 1.0f : g;
+    /* the 2D layer as the picture (no squeeze while cropped); the bars stay just outside the window */
+    halo2_gpu_set_ui_squeeze(s_ws_live || a > 0.0f ? 1.0f : s_squeeze_full);
+    gpu_present_set_vzoom(s_ws_live ? 1.0f : s_wide_fov_full / g);
+}
+
+void halo2_cutscene_view(float amount)
+{
+    static int fill_rule = -1, was_on;
+    int on;
+    if (fill_rule < 0)
+        fill_rule = !(getenv("RECOMP_HALO2_CUTSCENE_FILL") && getenv("RECOMP_HALO2_CUTSCENE_FILL")[0] == '0');
+    if (!fill_rule || !(amount > 0.01f))
+        amount = 0.0f;                        /* also NaN */
+    if (amount > 1.0f)
+        amount = 1.0f;
+    if (amount == s_cut_amount)
+        return;
+    s_cut_amount = amount;
+    widescreen_apply();
+    on = amount > 0.0f;
+    if (on == was_on)
+        return;
+    was_on = on;
+    if (s_wide_fov_full > 1.0f)
+        fprintf(stderr, "[SETTINGS] cutscene %s\n", on ? "letterbox: 4:3 view zoomed to the width" : "over: widescreen view");
+}
+
 void halo2_widescreen_live(int live)
 {
     static int cur = -1;
@@ -226,8 +282,8 @@ void halo2_widescreen_live(int live)
     cur = live;
     if (s_wide_fov_full <= 1.0f)
         return;                               /* playing at 4:3: nothing to change */
-    g_h2_wide_fov = live ? 1.0f : s_wide_fov_full;
-    halo2_gpu_set_ui_squeeze(live ? 1.0f : s_squeeze_full);
+    s_ws_live = live;
+    widescreen_apply();
     fprintf(stderr, "[SETTINGS] widescreen: %s\n",
             live ? "Xbox Live, 4:3 view stretched across (anamorphic)" : "full widescreen view");
 }
@@ -313,14 +369,15 @@ void halo2_settings_boot(void)
     pending_init();
     halo2_settings_load(&s_cur);
     boot_env(&s_cur);
+    h2_interp_set_enabled(s_cur.smooth_motion);   /* RECOMP_HALO2_INTERP=0/1 overrides it (test builds) */
     widescreen_boot(s_cur.widescreen);
     s_loaded = 1;
     fprintf(stderr,
-            "[SETTINGS] display scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires_textures=%d"
-            " frame_rate=%s; mouse aim=%d sens=%d%% invert=%d\n",
-            s_cur.resolution_scale, s_cur.fullscreen, s_cur.vsync,
+            "[SETTINGS] display scale=%s fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires_textures=%d"
+            " frame_rate=%s smooth_motion=%d; mouse aim=%d sens=%d%% invert=%d\n",
+            halo2_scale_name(s_cur.resolution_scale), s_cur.fullscreen, s_cur.vsync,
             s_cur.anisotropy, s_cur.fxaa, s_cur.msaa, s_cur.hires_textures,
-            s_cur.frame_rate == 1 ? "60" : s_cur.frame_rate == 2 ? "30" : "auto",
+            s_cur.frame_rate == 1 ? "60" : s_cur.frame_rate == 2 ? "30" : "auto", s_cur.smooth_motion,
             s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert);
 }
 
@@ -400,6 +457,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     t.mouse_sens = clamp_sens(t.mouse_sens);
     t.mouse_invert = t.mouse_invert ? 1 : 0;
     if (t.frame_rate < 0 || t.frame_rate > 2) t.frame_rate = 0;
+    t.smooth_motion = t.smooth_motion ? 1 : 0;
     pending_init();
     EnterCriticalSection(&s_pending_lock);
     s_cur = t;
@@ -408,6 +466,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     InterlockedExchange(&s_pending_live, 1);
     LeaveCriticalSection(&s_pending_lock);
     h2_mouse_apply();                    /* mouse settings take effect at once */
+    h2_interp_set_enabled(t.smooth_motion);   /* smooth motion: from the next frame */
     if (save) {
         int ok = halo2_settings_save(&s_cur);
         h2_diag_video("changed in the F1 menu");
@@ -438,9 +497,9 @@ void halo2_settings_pump(void)
     LeaveCriticalSection(&s_pending_lock);
 
     snprintf(s_last_apply, sizeof s_last_apply,
-             "scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires=%d",
-             t.resolution_scale, t.fullscreen, t.vsync,
-             t.anisotropy, t.fxaa, t.msaa, t.hires_textures);
+             "scale=%s fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires=%d smooth_motion=%d",
+             halo2_scale_name(t.resolution_scale), t.fullscreen, t.vsync,
+             t.anisotropy, t.fxaa, t.msaa, t.hires_textures, t.smooth_motion);
     fprintf(stderr, "[SETTINGS] live apply %s\n", s_last_apply);
     fflush(stderr);
     halo2_gpu_apply_live(&t);

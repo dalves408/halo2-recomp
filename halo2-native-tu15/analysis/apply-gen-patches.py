@@ -226,3 +226,14 @@ patch(p14, "loc_0003D35F: ;\n    MEM32(0x4CE3F4) = eax;\n",
       "h2_interp_first_person(0x4CE3F8, eax);")
 patch(p14, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_interp_first_person(uint32_t sets, uint32_t count);\n",
       "void h2_interp_first_person(uint32_t sets, uint32_t count);")
+
+# 15. Re-poses between ticks: inside the main view, sub_0002B970 (retail 0x2b990) sets up the view's
+#     visible objects and re-poses some cutscene characters itself, mostly on frames with no new
+#     tick, which the Xbox (one draw a tick) never showed. Hooks around the call put changed node
+#     blocks back on such frames (src/h2_interp.c, h2_interp_view_objects).
+p15 = find("void sub_0002B9F0(void)\n")
+call15 = "    PUSH32(esp, 0x0002BC57u); RECOMP_ABI_CALL(0x0002B970u, sub_0002B970); /* call 0x0002B970 */\n"
+patch(p15, call15, "    h2_interp_view_objects(0);   /* re-pose guard (hand hook) */\n" + call15 +
+      "    h2_interp_view_objects(1);   /* re-pose guard (hand hook) */\n", "h2_interp_view_objects(0);")
+patch(p15, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_interp_view_objects(int after);\n",
+      "void h2_interp_view_objects(int after);")

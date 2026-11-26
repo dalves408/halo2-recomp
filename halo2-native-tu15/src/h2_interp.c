@@ -56,6 +56,7 @@
 #include <stdio.h>
 
 #include "gen/recomp_types.h"
+#include "settings.h"   /* halo2_cutscene_view */
 #include "kernel/recomp_clip.h"   /* g_rclip_note: one line per frame for test clips */
 
 #define GAME_TICK_COUNTER 0x4F2C5Cu
@@ -72,6 +73,10 @@
 #define GUEST_HIGH_END    0x84000000u
 #define DATA_ARRAY_SIG    0x64407440u   /* 'd@t@' at header +0x2C */
 #define RENDER_CAMERA     0x4C65C0u   /* position first; copied from a view per render pass */
+#define TAG_INSTANCES     0x4F0414u   /* -> the tag table: 16 bytes a tag (group, index, data, size); retail 0x4E3B44 */
+#define DEF_MODEL         0x38u       /* object definition: the model tag's index */
+#define MODEL_GRAPH       0x14u       /* model: the animation graph tag's index */
+#define GRAPH_NODES       0x0Cu       /* animation graph: node count, then nodes (0x20 bytes each, parent index at +8) */
 
 /* One tracked object: its position (3 floats) then its nodes (13 floats each). */
 typedef struct {
@@ -89,6 +94,10 @@ typedef struct {
     uint32_t *node_seen;        /* per node: the frame it last changed */
     uint8_t *node_run;          /* per node: changes on consecutive frames in a row (2+: the game moves it every frame) */
     uint8_t *node_kept;         /* per node: updates left that the game rebuilt it during the frame (left alone meanwhile) */
+    uint8_t *carry;             /* per game-moved node: 1 + the blended node it rides with (0: not chosen yet) */
+    uint8_t *parent;            /* per node: 1 + its skeleton parent from the animation graph (0: none or unknown) */
+    uint32_t upd_frame;         /* the frame the last update was seen */
+    uint32_t upd_tick;          /* the game's tick counter at the last update */
 } Obj;
 
 /* A node the game moves every frame itself (a cutscene character's head and
@@ -97,6 +106,45 @@ typedef struct {
 static int s_no_live;   /* test: RECOMP_HALO2_INTERP_NOLIVE=1 treats every node as updated with the world */
 static int s_fp_rule;        /* first-person blend; RECOMP_HALO2_INTERP_FP=0 turns it off (test) */
 static int s_cam_cut_rule;   /* the held-still / big-step camera cut rule; RECOMP_HALO2_INTERP_CAMCUT=0 turns it off (test) */
+static int s_cam_minor_rule; /* a tiny change between updates is no update; RECOMP_HALO2_INTERP_CAMMINOR=0 turns it off (test) */
+static int s_every_rule;     /* a few nodes changing the frame after an update are the game's own; RECOMP_HALO2_INTERP_EVERYRULE=0 turns it off (test) */
+static unsigned s_dbg_every_kept;   /* times that rule kept an object's update timing */
+static int s_tick_rule;      /* one update per game tick; RECOMP_HALO2_INTERP_TICKRULE=0 turns it off (test) */
+static unsigned s_dbg_same_tick;    /* second poses within one tick taken without restarting the blend */
+/* The game's tick counter: its value, and the host time and frame it changed. An
+ * update is timed from its tick, not from the frame it is first seen on: bodies
+ * were seen one frame late at times (2026-11-25, Outskirts Pelican marines), and
+ * timed from then they moved unevenly. RECOMP_HALO2_INTERP_TICKTIME=0 times from
+ * the frame seen (test). */
+static uint32_t s_tick_val, s_tick_frame;
+static double s_tick_time;
+static int s_ticktime_rule;
+static int s_midframe_rule;         /* most nodes changed during the frame: an update, not rebuilt nodes */
+static int s_noise_rule;            /* a node changed only by float noise has not moved */
+static int s_livepos_rule;          /* every-frame nodes: the game's axes, the blend's position (no carry) */
+static int s_trackonly;             /* test: RECOMP_HALO2_INTERP_TRACKONLY=1 watches, writes nothing */
+static int s_camslot_rule;          /* a view keeps the slot of the nearest camera; RECOMP_HALO2_INTERP_CAMSLOT=0 off */
+static int s_camtick_rule;          /* a camera change with a new tick keeps blending; RECOMP_HALO2_INTERP_CAMTICK=0 off */
+/* Test switches read in per-object / per-frame code, read once (interp_enabled): a getenv()
+ * for every object every frame cost time in normal play. NULL when unset. */
+static const char *s_env_livelog;
+static const char *s_env_everylog;
+static const char *s_env_snaplog;
+static const char *s_env_livewhole;
+static const char *s_env_livecarry;
+static const char *s_env_carrylog;
+static const char *s_env_skelcarry;
+static const char *s_env_carrysticky;
+static const char *s_env_carrypos;
+static const char *s_env_objlog;
+static const char *s_env_camlog;
+static const char *s_env_probe_late;
+static const char *s_env_skellog;
+static void phase_probe(char where);
+static void interp_switch_pending(void);
+static unsigned s_dbg_noise;
+static unsigned s_dbg_midframe;
+static unsigned s_dbg_late_seen;    /* updates seen later than the frame after their tick */
 /* Also a node the game rebuilds during the frame, after the blend (a talking
  * Brute's jaw, 2026-11-24): blended, it showed the game's pose on update frames
  * and the half-step-behind blend between them, and the jaw flapped. */
@@ -119,21 +167,60 @@ static float s_lift, s_lift_on;   /* lift test: amount; amount while its flag fi
 static int s_lift_mode = 1;       /* the flag file's first digit: 1 nodes, 2 position, 4 bounding centres, +8 odd frames only */
 static float s_centre_z[MAX_OBJECTS][3];
 
+/* The player's setting (smooth_motion in settings.ini, F1 menu, Config.exe):
+ * on by default. RECOMP_HALO2_INTERP=0/1 overrides it (test builds; release
+ * builds drop RECOMP_* variables). A change takes effect at the start of the
+ * next frame's update hook, never mid-frame: the frame before has already put
+ * the game's own values back. */
+static int s_setting = 1;
+static int s_override = -1;             /* RECOMP_HALO2_INTERP: -1 none, 0 off, 1 on */
+static volatile LONG s_want = -1;       /* a switch waiting for the next frame */
+
+void h2_interp_set_enabled(int on)
+{
+    s_setting = on ? 1 : 0;
+    InterlockedExchange(&s_want, s_setting);
+}
+
 static int interp_enabled(void)
 {
     if (s_on < 0) {
         const char *e = getenv("RECOMP_HALO2_INTERP");
         LARGE_INTEGER f;
-        s_on = e && e[0] == '1';
+        s_override = e && *e ? (e[0] == '1') : -1;
+        s_on = s_override >= 0 ? s_override : s_setting;
         s_no_live = getenv("RECOMP_HALO2_INTERP_NOLIVE") != NULL;
         s_fp_rule = !(getenv("RECOMP_HALO2_INTERP_FP") && getenv("RECOMP_HALO2_INTERP_FP")[0] == '0');
         s_cam_cut_rule = !(getenv("RECOMP_HALO2_INTERP_CAMCUT") && getenv("RECOMP_HALO2_INTERP_CAMCUT")[0] == '0');
+        s_cam_minor_rule = !(getenv("RECOMP_HALO2_INTERP_CAMMINOR") && getenv("RECOMP_HALO2_INTERP_CAMMINOR")[0] == '0');
+        s_every_rule = !(getenv("RECOMP_HALO2_INTERP_EVERYRULE") && getenv("RECOMP_HALO2_INTERP_EVERYRULE")[0] == '0');
+        s_tick_rule = !(getenv("RECOMP_HALO2_INTERP_TICKRULE") && getenv("RECOMP_HALO2_INTERP_TICKRULE")[0] == '0');
+        s_ticktime_rule = getenv("RECOMP_HALO2_INTERP_TICKTIME") && getenv("RECOMP_HALO2_INTERP_TICKTIME")[0] == '1';   /* measured worse, 2026-11-25: off */
+        s_midframe_rule = !(getenv("RECOMP_HALO2_INTERP_MIDFRAME") && getenv("RECOMP_HALO2_INTERP_MIDFRAME")[0] == '0');
+        s_noise_rule = !(getenv("RECOMP_HALO2_INTERP_NOISE") && getenv("RECOMP_HALO2_INTERP_NOISE")[0] == '0');
+        s_livepos_rule = !(getenv("RECOMP_HALO2_INTERP_LIVEPOS") && getenv("RECOMP_HALO2_INTERP_LIVEPOS")[0] == '0');
+        s_trackonly = getenv("RECOMP_HALO2_INTERP_TRACKONLY") && getenv("RECOMP_HALO2_INTERP_TRACKONLY")[0] == '1';
+        s_camslot_rule = !(getenv("RECOMP_HALO2_INTERP_CAMSLOT") && getenv("RECOMP_HALO2_INTERP_CAMSLOT")[0] == '0');
+        s_camtick_rule = !(getenv("RECOMP_HALO2_INTERP_CAMTICK") && getenv("RECOMP_HALO2_INTERP_CAMTICK")[0] == '0');
+        s_env_livelog = getenv("RECOMP_HALO2_INTERP_LIVELOG");
+        s_env_everylog = getenv("RECOMP_HALO2_INTERP_EVERYLOG");
+        s_env_snaplog = getenv("RECOMP_HALO2_INTERP_SNAPLOG");
+        s_env_livewhole = getenv("RECOMP_HALO2_INTERP_LIVEWHOLE");
+        s_env_livecarry = getenv("RECOMP_HALO2_INTERP_LIVECARRY");
+        s_env_carrylog = getenv("RECOMP_HALO2_INTERP_CARRYLOG");
+        s_env_skelcarry = getenv("RECOMP_HALO2_INTERP_SKELCARRY");
+        s_env_carrysticky = getenv("RECOMP_HALO2_INTERP_CARRYSTICKY");
+        s_env_carrypos = getenv("RECOMP_HALO2_INTERP_CARRYPOS");
+        s_env_objlog = getenv("RECOMP_HALO2_INTERP_OBJLOG");
+        s_env_camlog = getenv("RECOMP_HALO2_INTERP_CAMLOG");
+        s_env_probe_late = getenv("RECOMP_HALO2_INTERP_PROBE_LATE");
+        s_env_skellog = getenv("RECOMP_HALO2_INTERP_SKELLOG");
         QueryPerformanceFrequency(&f);
         s_qpc_scale = 1.0 / (double)f.QuadPart;
         if (s_on && getenv("RECOMP_HALO2_INTERP_LIFT"))
             s_lift = (float)atof(getenv("RECOMP_HALO2_INTERP_LIFT"));
-        if (s_on)
-            fprintf(stderr, "[INTERP] object interpolation on (test)%s\n", s_lift ? ", lift test" : "");
+        fprintf(stderr, "[INTERP] smooth motion %s (%s)%s\n", s_on ? "on" : "off",
+                s_override >= 0 ? "RECOMP_HALO2_INTERP" : "setting", s_lift ? ", lift test" : "");
     }
     return s_on;
 }
@@ -219,6 +306,8 @@ static void obj_forget(Obj *o)
     o->node_seen = NULL;
     o->node_run = NULL;
     o->node_kept = NULL;
+    o->carry = NULL;
+    o->parent = NULL;
     o->handle = 0;
     o->moved = 0;
 }
@@ -277,6 +366,69 @@ static int looks_like_object(uint32_t data, uint32_t off, uint32_t nodes)
 
 static float s_raw[3 + MAX_NODES * NODE_FLOATS];
 
+/* Test (RECOMP_HALO2_INTERP_DRAWLOG=1): where a skeletal object's first and middle
+ * nodes are drawn this frame, to measure how evenly characters move. */
+static void draw_log(uint32_t index, uint32_t nodes, const float *s, float alpha, int live, int run, int kept)
+{
+    static int on = -1;
+    static unsigned logged;
+    if (on < 0)
+        on = getenv("RECOMP_HALO2_INTERP_DRAWLOG") != NULL;
+    if (!on || nodes < 20 || logged++ >= 400000u)
+        return;
+    fprintf(stderr, "[DRAW] %u %u %.4f %.4f %.4f %.4f %.4f %.4f a %.2f live %d run %d kept %d dt %.1f\n", s_frame, index,
+            s[3 + 10], s[3 + 11], s[3 + 12],
+            s[3 + (nodes / 2) * NODE_FLOATS + 10], s[3 + (nodes / 2) * NODE_FLOATS + 11], s[3 + (nodes / 2) * NODE_FLOATS + 12],
+            alpha, live, run, kept, s_frame_dt * 1000.0);
+}
+
+/* Test log helper: is node p an ancestor of node j in the skeleton read from the tags? */
+static int carry_is_ancestor(const Obj *o, uint32_t j, uint32_t p, uint32_t nodes)
+{
+    uint32_t up = j, hops = 0;
+    while (o->parent[up] && hops++ < nodes) {
+        up = o->parent[up] - 1u;
+        if (up == p)
+            return 1;
+    }
+    return 0;
+}
+
+/* A tag's data, or 0. */
+static uint32_t tag_data(uint32_t index)
+{
+    uint32_t table = MEM32(TAG_INSTANCES), e, d;
+    if (index == 0xFFFFFFFFu || table < 0x10000u || table >= GUEST_HIGH_END)
+        return 0;
+    e = table + (index & 0xFFFFu) * 16u;
+    if (e + 16u > GUEST_HIGH_END || MEM32(e + 4) != index)
+        return 0;
+    d = MEM32(e + 8);
+    return d >= 0x10000u && d < GUEST_HIGH_END ? d : 0;
+}
+
+/* Each node's skeleton parent, from the object's animation graph (the game
+ * builds a node from its parent's matrix, 2026-11-25). Left 0 when the graph
+ * cannot be read or does not have the object's node count. */
+static void read_parents(Obj *o, uint32_t data, uint32_t nodes)
+{
+    uint32_t def = tag_data(MEM32(data)), model, graph, list, j;
+    static int logged;
+    model = def ? tag_data(MEM32(def + DEF_MODEL)) : 0;
+    graph = model ? tag_data(MEM32(model + MODEL_GRAPH)) : 0;
+    list = graph ? MEM32(graph + GRAPH_NODES + 4) : 0;
+    if (s_env_skellog && nodes >= 20 && logged++ < 200)
+        fprintf(stderr, "[SKEL] obj tag %08X def %08X model %08X graph %08X count %u nodes %u\n", MEM32(data), def, model,
+                graph, graph ? MEM32(graph + GRAPH_NODES) : 0, nodes);
+    if (!graph || MEM32(graph + GRAPH_NODES) != nodes || list < 0x10000u || list + nodes * 0x20u > GUEST_HIGH_END)
+        return;
+    for (j = 0; j < nodes; j++) {
+        uint32_t q = MEM32(list + j * 0x20u + 8) & 0xFFFFu;
+        o->parent[j] = q < nodes && q != j ? (uint8_t)(q + 1u) : 0;
+    }
+}
+
+static uint32_t s_objs_moved;   /* objects the blend drew away from the game's pose this frame */
 static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double now)
 {
     Obj *o = &s_obj[index];
@@ -291,13 +443,15 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
     if (o->handle != handle || o->data != data || o->nodes_off != off || o->n != n) {
         obj_forget(o);                              /* a new object: no history yet */
         o->buf = o->prev = (float *)malloc(n * 3u * sizeof(float));
-        o->node_seen = (uint32_t *)calloc(nodes + 1, sizeof(uint32_t) + 2);
+        o->node_seen = (uint32_t *)calloc(nodes + 1, sizeof(uint32_t) + 4);
         if (!o->buf || !o->node_seen) {
             obj_forget(o);
             return;
         }
         o->node_run = (uint8_t *)(o->node_seen + nodes + 1);
         o->node_kept = o->node_run + nodes + 1;
+        o->carry = o->node_kept + nodes + 1;
+        o->parent = o->carry + nodes + 1;
         o->cur = o->prev + n;
         o->shown = o->cur + n;
         o->handle = handle;
@@ -305,6 +459,7 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
         o->nodes_off = off;
         o->n = n;
         obj_read(o, o->cur);
+        read_parents(o, data, nodes);
         memcpy(o->prev, o->cur, n * 4u);
         o->tick_time = now;
         o->step = o->last_step = 0.0f;
@@ -319,6 +474,23 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
     for (k = 0; k < n; k++)
         if (!isfinite(s_raw[k]))
             return;
+    if (s_trackonly) {   /* test: watch only -- which skeletal objects change on frames with no new tick */
+        if (memcmp(s_raw, o->cur, n * 4u)) {
+            static unsigned logged;
+            uint32_t ch = 0;
+            for (j = 0; j < nodes; j++) {
+                const float *a = s_raw + 3 + j * NODE_FLOATS, *b = o->cur + 3 + j * NODE_FLOATS;
+                int k2;
+                for (k2 = 0; k2 < NODE_FLOATS; k2++)
+                    if (fabsf(a[k2] - b[k2]) > 2e-4f) { ch++; break; }
+            }
+            if (nodes >= 20 && logged++ < 100000u)
+                fprintf(stderr, "[RAW] frame %u newtick %d obj %u tag %08X nodes %u changed %u pos %d nodes_va %08X\n", s_frame,
+                        s_tick_frame == s_frame, index, MEM32(data), nodes, ch, memcmp(s_raw, o->cur, 12) != 0, data + off);
+            memcpy(o->cur, s_raw, n * 4u);
+        }
+        return;
+    }
     /* A change is a new update. The tick counter is no help: it changes a
      * frame before the bodies move (measured 2026-11-23). Changes only in nodes
      * the game moves every frame are not. */
@@ -328,12 +500,45 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
             const float *a = s_raw + 3 + j * NODE_FLOATS, *b = o->cur + 3 + j * NODE_FLOATS;
             if (!memcmp(a, b, NODE_BYTES))
                 continue;
+            /* Float noise is no change (2026-11-25, Outskirts Pelican: marines'
+             * nodes rebuilt every frame differed only in the last bits, so they
+             * counted as moved every frame and were drawn unblended, stepping at
+             * 30 Hz). The value is still taken. RECOMP_HALO2_INTERP_NOISE=0 counts it (test). */
+            if (s_noise_rule) {
+                int k2, moved = 0;
+                for (k2 = 0; k2 < NODE_FLOATS && !moved; k2++)
+                    moved = fabsf(a[k2] - b[k2]) > 2e-4f;
+                if (!moved) {
+                    s_dbg_noise++;
+                    continue;
+                }
+            }
             o->node_run[j] = o->node_seen[j] == s_frame - 1 ? (uint8_t)(o->node_run[j] < 255 ? o->node_run[j] + 1 : 255) : 0;
             o->node_seen[j] = s_frame;
             if (!NODE_LIVE(o, j))
                 update = 1;
         }
-        if (getenv("RECOMP_HALO2_INTERP_LIVELOG") && s_frame % 600 == 1) {   /* test: objects with every-frame nodes */
+        /* A few nodes changing the frame after an update, with the object in place,
+         * are the game's every-frame nodes that skipped a frame, not a new update
+         * (2026-11-25, Outskirts Pelican: marines' arms; each such change restarted
+         * the whole body's blend and it moved unevenly). Treat them as the game's
+         * own for a few updates. RECOMP_HALO2_INTERP_EVERYRULE=0 turns it off (test). */
+        if (update && s_every_rule && o->upd_frame == s_frame - 1 && !memcmp(s_raw, o->cur, 12)) {
+            uint32_t changed = 0, blended = 0;
+            for (j = 0; j < nodes; j++)
+                if (!NODE_LIVE(o, j)) {
+                    blended++;
+                    changed += memcmp(s_raw + 3 + j * NODE_FLOATS, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES) != 0;
+                }
+            if (changed && changed * 2 <= blended) {
+                for (j = 0; j < nodes; j++)
+                    if (!NODE_LIVE(o, j) && memcmp(s_raw + 3 + j * NODE_FLOATS, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES))
+                        o->node_kept[j] = 4;
+                update = 0;
+                s_dbg_every_kept++;
+            }
+        }
+        if (s_env_livelog && s_frame % 600 == 1) {   /* test: objects with every-frame nodes */
             uint32_t live = 0;
             for (j = 0; j < nodes; j++) live += NODE_LIVE(o, j);
             if (live)
@@ -343,6 +548,15 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
         if (update)
             for (j = 0; j < nodes; j++)
                 if (o->node_kept[j]) o->node_kept[j]--;
+        /* A second whole new pose within one game tick is no new update (2026-11-25,
+         * Outskirts Pelican: marines got two full poses on back-to-back frames,
+         * and each restarted the blend, so they moved unevenly). Take its values,
+         * keep the update's timing. RECOMP_HALO2_INTERP_TICKRULE=0 turns it off (test). */
+        if (update && s_tick_rule && o->upd_frame && MEM32(GAME_TICK_COUNTER) == o->upd_tick &&
+            memcmp(s_raw, o->cur, 12) == 0) {
+            update = 0;
+            s_dbg_same_tick++;
+        }
         if (!update) {
             memcpy(o->cur, s_raw, n * 4u);          /* the game's own every-frame nodes: keep the update's timing */
             s_dbg_live_only++;
@@ -352,7 +566,34 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
             o->cur = t;
             memcpy(o->cur, s_raw, n * 4u);
             o->tick_time = now;
+            if (s_ticktime_rule && s_tick_frame && s_frame - s_tick_frame <= 3) {
+                double t = s_tick_time + s_frame_dt;   /* bodies move the frame after the counter */
+                if (t < now) {
+                    o->tick_time = t;
+                    s_dbg_late_seen++;
+                }
+            }
             s_dbg_changed++;
+            if (s_env_everylog && o->upd_frame == s_frame - 1) {   /* test: updates on consecutive frames */
+                static unsigned logged;
+                uint32_t nch = 0, nlive = 0, first = nodes, parent_obj = MEM32(data + 0x14);
+                float most = 0.0f;
+                for (j = 0; j < nodes; j++) {
+                    float d = dist2(o->prev + 3 + j * NODE_FLOATS + 10, o->cur + 3 + j * NODE_FLOATS + 10);
+                    nlive += NODE_LIVE(o, j);
+                    if (memcmp(o->prev + 3 + j * NODE_FLOATS, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES)) {
+                        nch++;
+                        if (first == nodes) first = j;
+                    }
+                    if (d > most) most = d;
+                }
+                if (logged++ < 20000u)
+                    fprintf(stderr, "[EVERY] frame %u obj %u tag %08X nodes %u pos %.2f %.2f %.2f step %.5f changed %u live %u first %u most %.4f parent %08X shown_prev %d\n",
+                            s_frame, index, MEM32(data), nodes, s_raw[0], s_raw[1], s_raw[2], sqrtf(dist2(o->prev, o->cur)),
+                            nch, nlive, first, sqrtf(most), parent_obj, o->shown_frame == s_frame - 1);
+            }
+            o->upd_frame = s_frame;
+            o->upd_tick = MEM32(GAME_TICK_COUNTER);
             /* A teleport (respawn, scripted move, cutscene cut) is a jump over 5 units
              * that is also far bigger than the step before it; a fast mover (a ship,
              * a vehicle) moves that far every update and is blended. */
@@ -375,7 +616,7 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
                 most = sqrtf(most);
                 if (nodes >= 4 && most > 0.4f && most > 4.0f * o->node_step + 0.2f) {   /* skeletal objects: a projectile's first move is no cut */
                     o->snapped = 1;
-                    if (getenv("RECOMP_HALO2_INTERP_SNAPLOG")) {   /* test: what the bone-jump rule caught */
+                    if (s_env_snaplog) {   /* test: what the bone-jump rule caught */
                         static int logged;
                         if (logged++ < 300)
                             fprintf(stderr, "[SNAP] frame %u obj %u tag %08X nodes %u most %.3f ref %.3f step %.3f last %.3f\n",
@@ -414,9 +655,11 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
             return;
         }
         alpha = (float)((now - o->tick_time + s_frame_dt) * 30.0);
-        if (alpha >= 1.0f)
+        if (alpha >= 1.0f) {
+            draw_log(index, nodes, o->cur, alpha, NODE_LIVE(o, nodes / 2), o->node_run[nodes / 2], o->node_kept[nodes / 2]);
             return;                                 /* the current state: nothing to change */
-        if (getenv("RECOMP_HALO2_INTERP_LIVEWHOLE"))   /* test: an object with game-moved nodes is not blended at all */
+        }
+        if (s_env_livewhole)   /* test: an object with game-moved nodes is not blended at all */
             for (j = 0; j < nodes; j++)
                 if (NODE_LIVE(o, j))
                     return;
@@ -429,7 +672,15 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
         for (j = 0; j < nodes; j++) {
             float *m = o->shown + 3 + j * NODE_FLOATS;
             if (NODE_LIVE(o, j)) {                  /* the game's every-frame node: as the game has it */
-                memcpy(m, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES);
+                /* ... but its place blended (2026-11-25, Outskirts Pelican: a marine's
+                 * every-frame nodes turned every frame yet moved only with the updates,
+                 * and carried along with a still neighbour they stepped at 30 Hz).
+                 * The game's axes, the blend's position. RECOMP_HALO2_INTERP_LIVEPOS=0
+                 * shows the whole node as the game has it and carries it (test). */
+                if (s_livepos_rule)
+                    memcpy(m, o->cur + 3 + j * NODE_FLOATS, 10 * sizeof(float));
+                else
+                    memcpy(m, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES);
                 s_dbg_everyframe++;
                 continue;
             }
@@ -442,7 +693,7 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
          * blend's move of that node (its drawn matrix against the game's),
          * applied to the game's pose of this one. RECOMP_HALO2_INTERP_LIVECARRY=0
          * shows it as the game has it (test). */
-        if (!(getenv("RECOMP_HALO2_INTERP_LIVECARRY") && getenv("RECOMP_HALO2_INTERP_LIVECARRY")[0] == '0'))
+        if (!s_livepos_rule && !(s_env_livecarry && s_env_livecarry[0] == '0'))
             for (j = 0; j < nodes; j++) {
                 const float *c = o->cur + 3 + j * NODE_FLOATS, *cp, *sp;
                 float *m = o->shown + 3 + j * NODE_FLOATS, best = 1e30f, R[9], t[3];
@@ -450,15 +701,52 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
                 int a, b;
                 if (!NODE_LIVE(o, j))
                     continue;
-                for (q = 0; q < nodes; q++) {
-                    float d;
-                    if (q == j || NODE_LIVE(o, q))
-                        continue;
-                    d = dist2(c + 10, o->cur + 3 + q * NODE_FLOATS + 10);
-                    if (d < best) { best = d; p = q; }
+                /* The nearest blended node, chosen each frame. Keeping the first choice
+                 * (RECOMP_HALO2_INTERP_CARRYSTICKY=1, test) measured worse on the
+                 * Metropolis intro: 31% of carried-node steps reversed against 18%
+                 * (2026-11-25) -- the nearest node is not the skeleton's parent. */
+                if (s_env_carrylog && o->carry[j]) {   /* test: would a fresh choice differ? */
+                    static int logged;
+                    uint32_t fresh = nodes;
+                    float fb = 1e30f;
+                    for (q = 0; q < nodes; q++) {
+                        float d;
+                        if (q == j || NODE_LIVE(o, q))
+                            continue;
+                        d = dist2(c + 10, o->cur + 3 + q * NODE_FLOATS + 10);
+                        if (d < fb) { fb = d; fresh = q; }
+                    }
+                    if (fresh != o->carry[j] - 1u && logged++ < 2000)
+                        fprintf(stderr, "[CARRY] frame %u obj %u node %u rides %u, nearest now %u\n",
+                                s_frame, index, j, o->carry[j] - 1u, fresh);
                 }
-                if (p == nodes)
-                    continue;                       /* no blended node: as the game has it */
+                /* Its nearest blended ancestor in the skeleton: the game builds the node
+                 * from that chain, so it rides exactly as its own parent is drawn.
+                 * RECOMP_HALO2_INTERP_SKELCARRY=0 picks the nearest node (test). */
+                if (!(s_env_skelcarry && s_env_skelcarry[0] == '0')) {
+                    uint32_t up = j, hops = 0;
+                    while (o->parent[up] && hops++ < nodes) {
+                        up = o->parent[up] - 1u;
+                        if (!NODE_LIVE(o, up)) { p = up; break; }
+                    }
+                }
+                if (p != nodes)
+                    o->carry[j] = (uint8_t)(p + 1u);
+                else if (o->carry[j] && o->carry[j] - 1u < nodes && o->carry[j] - 1u != j && !NODE_LIVE(o, o->carry[j] - 1u) &&
+                    s_env_carrysticky)   /* test: keep the first choice (measured worse, 2026-11-25) */
+                    p = o->carry[j] - 1u;
+                else {
+                    for (q = 0; q < nodes; q++) {
+                        float d;
+                        if (q == j || NODE_LIVE(o, q))
+                            continue;
+                        d = dist2(c + 10, o->cur + 3 + q * NODE_FLOATS + 10);
+                        if (d < best) { best = d; p = q; }
+                    }
+                    if (p == nodes)
+                        continue;                   /* no blended node: as the game has it */
+                    o->carry[j] = (uint8_t)(p + 1u);
+                }
                 cp = o->cur + 3 + p * NODE_FLOATS;
                 sp = o->shown + 3 + p * NODE_FLOATS;
                 /* R = Rshown * Rcur^T (axes as columns: forward 1-3, left 4-6, up 7-9) */
@@ -474,8 +762,15 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
                         m[1 + b * 3 + a] = R[a * 3] * v[0] + R[a * 3 + 1] * v[1] + R[a * 3 + 2] * v[2] + (b == 3 ? t[a] : 0.0f);
                 }
                 normalize3(m + 1); normalize3(m + 4); normalize3(m + 7);
+                if (s_env_carrypos && nodes >= 20) {   /* test: drawn position of carried nodes */
+                    static unsigned logged;
+                    if (logged++ < 200000u)
+                        fprintf(stderr, "[CPOS] %u %u %u %.5f %.5f %.5f rides %u parent %d anc %d pmove %.5f a %.2f\n", s_frame, index, j,
+                                m[10], m[11], m[12], p, (int)o->parent[j] - 1, carry_is_ancestor(o, j, p, nodes),
+                                sqrtf(dist2(sp + 10, cp + 10)), alpha);
+                }
             }
-        if (getenv("RECOMP_HALO2_INTERP_OBJLOG") && nodes >= 20 && s_frame <= s_objlog_until) {   /* test: skeletal objects' blend for 14 frames after a camera cut */
+        if (s_env_objlog && nodes >= 20 && s_frame <= s_objlog_until) {   /* test: skeletal objects' blend for 14 frames after a camera cut */
             static int logged;
             if (logged++ < 3000) {
                 /* the node whose drawn position moved most since the last frame drawn, and its state */
@@ -497,11 +792,13 @@ static void blend_object(uint32_t index, uint32_t handle, uint32_t data, double 
             }
         }
     }
+    draw_log(index, nodes, o->shown, alpha, NODE_LIVE(o, nodes / 2), o->node_run[nodes / 2], o->node_kept[nodes / 2]);
     memcpy(guest_floats(data + OBJECT_POSITION), o->shown, 12);
     memcpy(guest_floats(data + off), o->shown + 3, (n - 3) * 4u);
     o->moved = 1;
     o->shown_frame = s_frame;
     s_dbg_blended++;
+    s_objs_moved++;
 }
 
 static int object_still(uint32_t index, const Obj *o)
@@ -515,9 +812,19 @@ static int object_still(uint32_t index, const Obj *o)
 
 /* Put the game's own state back wherever the frame left the blend in place
  * (a node the game rebuilt during the frame keeps the game's value). */
+static Obj *obj_by_nodes(uint32_t va)
+{
+    uint32_t i;
+    for (i = 0; i < MAX_OBJECTS; i++)
+        if (s_obj[i].handle && s_obj[i].data + s_obj[i].nodes_off == va)
+            return &s_obj[i];
+    return NULL;
+}
+
 static void restore_objects(void)
 {
     uint32_t i, j;
+    s_objs_moved = 0;
     for (i = 0; i < MAX_OBJECTS; i++) {
         Obj *o = &s_obj[i];
         float *g;
@@ -536,14 +843,27 @@ static void restore_objects(void)
         else
             s_dbg_kept++;                           /* the game moved it during the frame */
         g = guest_floats(o->data + o->nodes_off);
-        for (j = 0; j < (o->n - 3) / NODE_FLOATS; j++) {
-            const float *sh = o->shown + 3 + j * NODE_FLOATS;
-            if (!memcmp(g + j * NODE_FLOATS, sh, NODE_BYTES))
-                memcpy(g + j * NODE_FLOATS, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES);
-            else {
-                s_dbg_kept++;                       /* rebuilt by the game during the frame (a turret aimed) */
-                if (o->node_kept)
-                    o->node_kept[j] = 8;            /* left alone for the next 8 updates */
+        {
+            /* Most nodes changed: a new update landed during the frame, not a node
+             * the game rebuilds itself (2026-11-25, Outskirts Pelican: 31 of a
+             * marine's 53 nodes were marked and drawn at 30 Hz). Keep the game's
+             * values, mark nothing. RECOMP_HALO2_INTERP_MIDFRAME=0 marks them (test). */
+            uint32_t nn = (o->n - 3) / NODE_FLOATS, diff = 0;
+            int midframe;
+            for (j = 0; j < nn; j++)
+                diff += memcmp(g + j * NODE_FLOATS, o->shown + 3 + j * NODE_FLOATS, NODE_BYTES) != 0;
+            midframe = s_midframe_rule && nn >= 4 && diff * 2 > nn;
+            if (midframe)
+                s_dbg_midframe++;
+            for (j = 0; j < nn; j++) {
+                const float *sh = o->shown + 3 + j * NODE_FLOATS;
+                if (!memcmp(g + j * NODE_FLOATS, sh, NODE_BYTES))
+                    memcpy(g + j * NODE_FLOATS, o->cur + 3 + j * NODE_FLOATS, NODE_BYTES);
+                else {
+                    s_dbg_kept++;                   /* rebuilt by the game during the frame (a turret aimed) */
+                    if (o->node_kept && !midframe)
+                        o->node_kept[j] = 8;        /* left alone for the next 8 updates */
+                }
             }
         }
         s_dbg_restored++;
@@ -587,6 +907,8 @@ static unsigned s_dbg_points, s_dbg_points_blended;
 static void blend_points(double now)
 {
     uint32_t a, i, k;
+    if (s_trackonly)
+        return;
     if (s_lift_points < 0)
         s_lift_points = getenv("RECOMP_HALO2_INTERP_LIFT_POINTS") ? (float)atof(getenv("RECOMP_HALO2_INTERP_LIFT_POINTS")) : 0.0f;
     for (a = 0; a < POINT_ARRAYS; a++) {
@@ -687,6 +1009,8 @@ static void world_updated(void);
 void h2_interp_world_updated(void)
 {
     double t0;
+    phase_probe('U');
+    interp_switch_pending();
     if (!interp_enabled())
         return;
     t0 = now_seconds();
@@ -849,6 +1173,352 @@ static void scan_frame(void)
  * frames, at the update hook (H) and just before the draw (D), the position of
  * node 0 and node 4 of the two first-person matrix runs, and the render camera. */
 static int s_trace_left;
+/* Test (RECOMP_HALO2_INTERP_PHASE=<guest va>[,bytes]): at each hook of the frame, whether a
+ * block of guest memory (an object's nodes) changed since the last hook, to find in
+ * which part of the frame the game writes it. */
+static void phase_probe(char where)
+{
+    static int on = -1;
+    static uint32_t va, len = 53u * NODE_BYTES, last, logged;
+    uint32_t h = 2166136261u, i;
+    const uint8_t *p;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HALO2_INTERP_PHASE");
+        on = e != NULL;
+        if (e) {
+            char *end;
+            va = (uint32_t)strtoul(e, &end, 16);
+            if (*end == ',')
+                len = (uint32_t)strtoul(end + 1, NULL, 0);
+        }
+    }
+    if (!on || va < 0x10000u || va + len > GUEST_HIGH_END)
+        return;
+    p = (const uint8_t *)XBOX_PTR(va);
+    for (i = 0; i < len; i++)
+        h = (h ^ p[i]) * 16777619u;
+    if (h != last && logged++ < 200000u)
+        fprintf(stderr, "[PHASE] frame %u %c tick %u newtick %d\n", s_frame, where, MEM32(GAME_TICK_COUNTER),
+                s_tick_frame == s_frame);
+    last = h;
+}
+
+/* ---- the view's object set-up between ticks
+ *
+ * Each view's set-up (sub_0002B970, retail 0x2b990: it builds the visible object list)
+ * re-poses some cutscene characters itself -- heads, faces, hands, fur, a dropship's hatch --
+ * from the pose it finds in memory, and leaves the result there. The Xbox drew once a tick, so
+ * it only ever re-posed the tick's own pose. Drawn at 60 fps with smooth motion, the views
+ * between ticks re-pose the blended pose instead (2026-11-25/26, found with phase probes).
+ *
+ * Around that call (patch 15), on a view the blend drew between poses: each node the re-pose
+ * changed stays as the game set it for the draw (put back, the Heretic's hands and a Brute's
+ * fur flashed, a Metropolis Phantom's hatch showed a hole), and after the draw it is moved onto
+ * the game's own pose -- its place relative to its skeleton parent as drawn, put on the parent's
+ * pose -- in the game's memory and the blend's current pose. Taken as drawn, the blend aimed the
+ * next frame at a pose from between ticks: the Outskirts Pelican riders' heads and faces were
+ * drawn ~0.05 behind their bodies, the faces vanished and their skin stretched into a slab every
+ * other frame (82 such frames in the intro; 0 after). Read as a new update and blended toward,
+ * marines' heads smeared (2026-11-25, a test laptop).
+ *
+ * On with smooth motion, off without it. RECOMP_HALO2_REPOSE=0/1 overrides it (test). */
+typedef struct { uint32_t va, len, at; } ReposeSnap;
+static ReposeSnap *s_rp;
+static uint8_t *s_rp_buf;
+static uint32_t s_rp_n, s_rp_cap, s_rp_bytes, s_rp_bufcap, s_rp_last_tick, s_rp_frames, s_rp_changed, s_rp_adopted;
+static int s_rp_rule = -1, s_rp_active, s_rp_tickview, s_rp_blendtick;
+static int s_rp_nodelog = -1;   /* test: RECOMP_HALO2_REPOSE_NODELOG=1 logs re-poses on tick and other views */
+static uint32_t s_rp_dumptag, s_rp_dumplo = 0, s_rp_dumphi = 9999;   /* test: RECOMP_HALO2_REPOSE_DUMPTAG / DUMPNODES */
+
+/* Re-poses left to the game for the draw: where, the values from before the re-pose and the
+ * re-pose itself; adopt 1: taken into the blend's pose and the game's memory, 2: the game's
+ * memory only (see s_rp_blendtick). */
+static ReposeSnap *s_rk;
+static uint8_t *s_rk_buf;
+static uint32_t s_rk_n, s_rk_cap, s_rk_bytes, s_rk_bufcap;
+static uint8_t *s_rk_adopt;
+static void repose_keep_note(uint32_t va, const uint8_t *before, uint32_t len, int adopt)
+{
+    if (s_rk_n == s_rk_cap) {
+        uint32_t cap = s_rk_cap ? s_rk_cap * 2 : 64;
+        ReposeSnap *r = (ReposeSnap *)realloc(s_rk, cap * sizeof *r);
+        uint8_t *f;
+        if (!r) return;
+        s_rk = r;
+        f = (uint8_t *)realloc(s_rk_adopt, cap);
+        if (!f) return;
+        s_rk_adopt = f; s_rk_cap = cap;
+    }
+    if (s_rk_bytes + 2 * len > s_rk_bufcap) {
+        uint32_t cap = (s_rk_bytes + 2 * len) * 2 + 65536;
+        uint8_t *b = (uint8_t *)realloc(s_rk_buf, cap);
+        if (!b) return;
+        s_rk_buf = b; s_rk_bufcap = cap;
+    }
+    s_rk[s_rk_n].va = va; s_rk[s_rk_n].len = len; s_rk[s_rk_n].at = s_rk_bytes;
+    s_rk_adopt[s_rk_n] = (uint8_t)adopt;
+    memcpy(s_rk_buf + s_rk_bytes, before, len);
+    memcpy(s_rk_buf + s_rk_bytes + len, XBOX_PTR(va), len);
+    s_rk_bytes += 2 * len;
+    s_rk_n++;
+}
+
+/* A node re-posed on a drawn view, moved onto the game's own pose: its place relative to its
+ * skeleton parent as drawn (ps: the parent as drawn, ns: the node as drawn) put on the parent's
+ * own pose (pc). Node: scale, three axes (each a world vector), position. */
+static void rebase_node(const float *ps, const float *pc, const float *ns, float *out)
+{
+    float d[3], l[3], r[NODE_FLOATS];
+    int k, a;
+    float s = ps[0] != 0.0f ? pc[0] / ps[0] : 1.0f;
+    for (k = 0; k < 3; k++)
+        d[k] = ns[10 + k] - ps[10 + k];
+    for (a = 0; a < 3; a++)   /* the offset in the drawn parent's axes */
+        l[a] = (d[0] * ps[1 + a * 3] + d[1] * ps[2 + a * 3] + d[2] * ps[3 + a * 3]) * s;
+    for (k = 0; k < 3; k++)
+        r[10 + k] = pc[10 + k] + l[0] * pc[1 + k] + l[1] * pc[4 + k] + l[2] * pc[7 + k];
+    for (a = 0; a < 3; a++) {   /* each of the node's axes, the same way */
+        const float *v = ns + 1 + a * 3;
+        float m0 = v[0] * ps[1] + v[1] * ps[2] + v[2] * ps[3];
+        float m1 = v[0] * ps[4] + v[1] * ps[5] + v[2] * ps[6];
+        float m2 = v[0] * ps[7] + v[1] * ps[8] + v[2] * ps[9];
+        for (k = 0; k < 3; k++)
+            r[1 + a * 3 + k] = m0 * pc[1 + k] + m1 * pc[4 + k] + m2 * pc[7 + k];
+    }
+    r[0] = ns[0] * s;
+    memcpy(out, r, sizeof r);
+}
+
+/* After the blend gave the game its values back: each re-posed node the game has not changed
+ * since is moved onto the game's own pose (see above). A node with no skeleton parent before it
+ * is taken as drawn. Then forget the list.
+ * RECOMP_HALO2_REPOSE_REBASE=0: every node taken as drawn (test). */
+static Obj *obj_by_nodes(uint32_t va);
+static int s_rk_rebase = -1;
+static uint32_t s_rk_rebased;
+static void repose_adopt(void)
+{
+    uint32_t i, j;
+    if (s_rk_rebase < 0) {
+        const char *e = getenv("RECOMP_HALO2_REPOSE_REBASE");
+        s_rk_rebase = !(e && e[0] == '0');
+    }
+    for (i = 0; i < s_rk_n; i++) {
+        const uint8_t *before = s_rk_buf + s_rk[i].at, *after = before + s_rk[i].len;
+        uint8_t *g = (uint8_t *)XBOX_PTR(s_rk[i].va);
+        uint32_t nn = s_rk[i].len / NODE_BYTES;
+        int memonly = s_rk_adopt[i] == 2;
+        Obj *o;
+        if (!(o = obj_by_nodes(s_rk[i].va)) || !o->cur)
+            continue;
+        for (j = 0; j < nn && 3 + (j + 1) * NODE_FLOATS <= o->n; j++) {
+            float *c = o->cur + 3 + j * NODE_FLOATS, r[NODE_FLOATS];
+            uint32_t p = o->parent ? o->parent[j] : 0;
+            if (!memcmp(before + j * NODE_BYTES, after + j * NODE_BYTES, NODE_BYTES) ||
+                memcmp(g + j * NODE_BYTES, after + j * NODE_BYTES, NODE_BYTES))
+                continue;                           /* not re-posed, or changed by the game since */
+            if (s_rk_rebase && p && p - 1u < j) {
+                /* the parent as the game saw it (after its own re-pose), and its own pose: the
+                 * blend's, or in memory-only mode the game's (moved already when re-posed) */
+                rebase_node((const float *)(after + (p - 1u) * NODE_BYTES),
+                            memonly ? (const float *)(g + (p - 1u) * NODE_BYTES) : o->cur + 3 + (p - 1u) * NODE_FLOATS,
+                            (const float *)(after + j * NODE_BYTES), r);
+                if (s_rp_nodelog > 0) {
+                    float dx = r[10] - c[10], dy = r[11] - c[11], dz = r[12] - c[12];
+                    static unsigned rbl;
+                    if (dx * dx + dy * dy + dz * dz > 0.03f * 0.03f && rbl++ < 20000u)
+                        fprintf(stderr, "[RB] frame %u tick %u tag %08X node %u parent %u moved %.3f %.3f %.3f%s\n", s_frame,
+                                MEM32(GAME_TICK_COUNTER), MEM32(o->data), j, p - 1u, dx, dy, dz, memonly ? " (memory)" : "");
+                }
+                memcpy(g + j * NODE_BYTES, r, NODE_BYTES);
+                if (!memonly)
+                    memcpy(c, r, NODE_BYTES);
+                s_rk_rebased++;
+            } else if (!memonly)
+                memcpy(c, g + j * NODE_BYTES, NODE_BYTES);
+            s_rp_adopted++;
+        }
+    }
+    s_rk_n = 0;
+    s_rk_bytes = 0;
+}
+
+/* Patch 15 calls this around sub_0002B970: after = 0 before it (snapshot every object's node
+ * block), 1 after it (note the blocks it changed). */
+void h2_interp_view_objects(int after)
+{
+    uint32_t hdr, max, entries, i;
+    if (s_rp_rule < 0) {
+        const char *e = getenv("RECOMP_HALO2_REPOSE");
+        s_rp_rule = e && *e ? (e[0] == '1' ? 1 : 0) : 2;   /* 2: follow smooth motion */
+    }
+    if (!s_rp_rule || (s_rp_rule == 2 && s_on <= 0))
+        return;
+    if (after) {
+        static unsigned hist[8];
+        if (!s_rp_active)
+            return;
+        s_rp_active = 0;
+        for (i = 0; i < s_rp_n; i++) {
+            uint8_t *g = (uint8_t *)XBOX_PTR(s_rp[i].va);
+            const float *a = (const float *)g, *b = (const float *)(s_rp_buf + s_rp[i].at);
+            uint32_t j, nn = s_rp[i].len / NODE_BYTES, jm = 0, nch = 0;
+            float most = 0.0f;
+            int bucket;
+            if (!memcmp(g, b, s_rp[i].len))
+                continue;                           /* not re-posed */
+            if (s_rp_dumptag) {   /* test: what the re-pose does to one tag's nodes lo..hi */
+                Obj *ob = obj_by_nodes(s_rp[i].va);
+                static unsigned dumped;
+                if (ob && MEM32(ob->data) == s_rp_dumptag && dumped < 3000000u)
+                    for (j = s_rp_dumplo; j < nn && j <= s_rp_dumphi; j++) {
+                        const float *x = b + j * NODE_FLOATS, *y = a + j * NODE_FLOATS;
+                        dumped++;
+                        fprintf(stderr, "[RPD] frame %u %s va %08X node %u scale %.3f>%.3f fwd %.2f %.2f %.2f>%.2f %.2f %.2f pos %.3f %.3f %.3f>%.3f %.3f %.3f\n",
+                                s_frame, s_rp_tickview ? "T" : "N", s_rp[i].va, j, x[0], y[0], x[1], x[2], x[3], y[1], y[2], y[3],
+                                x[10], x[11], x[12], y[10], y[11], y[12]);
+                        if (ob->cur && 3 + (j + 1) * NODE_FLOATS <= ob->n) {   /* the blend's pose against the drawn one */
+                            const float *c = ob->cur + 3 + j * NODE_FLOATS;
+                            fprintf(stderr, "[RPO] frame %u node %u slide %.3f %.3f %.3f tickminusshown %.3f %.3f %.3f obj %.3f %.3f %.3f\n",
+                                    s_frame, j, y[10] - x[10], y[11] - x[11], y[12] - x[12],
+                                    c[10] - x[10], c[11] - x[11], c[12] - x[12],
+                                    ob->cur[0] - getf(ob->data + OBJECT_POSITION), ob->cur[1] - getf(ob->data + OBJECT_POSITION + 4),
+                                    ob->cur[2] - getf(ob->data + OBJECT_POSITION + 8));
+                        }
+                    }
+            }
+            for (j = 0; j < nn; j++) {   /* how far the re-pose moved the block's nodes (world positions) */
+                float dx = a[j * NODE_FLOATS + 10] - b[j * NODE_FLOATS + 10];
+                float dy = a[j * NODE_FLOATS + 11] - b[j * NODE_FLOATS + 11];
+                float dz = a[j * NODE_FLOATS + 12] - b[j * NODE_FLOATS + 12];
+                float d = dx * dx + dy * dy + dz * dz;
+                if (d > most) { most = d; jm = j; }
+                nch += memcmp(a + j * NODE_FLOATS, b + j * NODE_FLOATS, NODE_BYTES) != 0;
+            }
+            most = sqrtf(most);
+            if (s_rp_nodelog) {   /* test: scale (float 0), axes (1..9) and position changes */
+                float rs = 0.0f, ra = 0.0f;
+                uint32_t js = 0, ja = 0, k;
+                Obj *ob = obj_by_nodes(s_rp[i].va);
+                static unsigned rlogged, logged;
+                for (j = 0; j < nn; j++) {
+                    float d0 = fabsf(a[j * NODE_FLOATS] - b[j * NODE_FLOATS]);
+                    if (d0 > rs) { rs = d0; js = j; }
+                    for (k = 1; k < 10; k++) {
+                        float dk = fabsf(a[j * NODE_FLOATS + k] - b[j * NODE_FLOATS + k]);
+                        if (dk > ra) { ra = dk; ja = j; }
+                    }
+                }
+                if ((rs > 0.05f || ra > 0.3f) && rlogged++ < 100000u)
+                    fprintf(stderr, "[RPR] frame %u %s va %08X tag %08X nodes %u scale %.3f->%.3f at %u axis %.3f at %u pos %.3f\n",
+                            s_frame, s_rp_tickview ? "T" : "N", s_rp[i].va, ob ? MEM32(ob->data) : 0u, nn,
+                            b[js * NODE_FLOATS], a[js * NODE_FLOATS], js, ra, ja, most);
+                if (most > 0.02f && logged++ < 200000u)
+                    fprintf(stderr, "[RPN] frame %u tick %u %s va %08X tag %08X nodes %u changed %u most %.3f at node %u from %.3f %.3f %.3f to %.3f %.3f %.3f\n",
+                            s_frame, MEM32(GAME_TICK_COUNTER), s_rp_tickview ? "T" : "N", s_rp[i].va,
+                            ob ? MEM32(ob->data) : 0u, nn, nch, most, jm,
+                            b[jm * NODE_FLOATS + 10], b[jm * NODE_FLOATS + 11], b[jm * NODE_FLOATS + 12],
+                            a[jm * NODE_FLOATS + 10], a[jm * NODE_FLOATS + 11], a[jm * NODE_FLOATS + 12]);
+            }
+            bucket = most < 0.001f ? 0 : most < 0.005f ? 1 : most < 0.01f ? 2 : most < 0.02f ? 3 :
+                     most < 0.05f ? 4 : most < 0.1f ? 5 : most < 0.5f ? 6 : 7;
+            hist[bucket]++;
+            if (s_rp_tickview)
+                continue;                           /* a tick's own view: as the Xbox drew it (logs only) */
+            s_rp_changed++;
+            repose_keep_note(s_rp[i].va, s_rp_buf + s_rp[i].at, s_rp[i].len, s_rp_blendtick ? 2 : 1);
+        }
+        if (s_rp_tickview)
+            return;
+        if (s_rp_frames % 600 == 599 && getenv("RECOMP_HALO2_REPOSE_LOG")) {
+            fprintf(stderr, "[REPOSE] moved by <.001 %u <.005 %u <.01 %u <.02 %u <.05 %u <.1 %u <.5 %u more %u\n",
+                    hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
+            memset(hist, 0, sizeof hist);
+        }
+        if (++s_rp_frames % 600 == 0 && getenv("RECOMP_HALO2_REPOSE_LOG")) {
+            fprintf(stderr, "[REPOSE] last 600 drawn views: %u node blocks re-posed, %u nodes adopted, %u of them rebased\n",
+                    s_rp_changed, s_rp_adopted, s_rk_rebased);
+            s_rp_changed = s_rp_adopted = s_rk_rebased = 0;
+        }
+        return;
+    }
+    {
+        uint32_t t = MEM32(GAME_TICK_COUNTER);
+        int newtick = t != s_rp_last_tick;
+        static int byblend = -1, memonly = -1;
+        s_rp_last_tick = t;
+        if (s_rp_nodelog < 0) {
+            const char *e = getenv("RECOMP_HALO2_REPOSE_DUMPTAG");
+            s_rp_nodelog = getenv("RECOMP_HALO2_REPOSE_NODELOG") != NULL;
+            if (e && *e) {
+                const char *r = getenv("RECOMP_HALO2_REPOSE_DUMPNODES");
+                s_rp_dumptag = (uint32_t)strtoul(e, NULL, 16);
+                if (r && *r)
+                    sscanf(r, "%u-%u", &s_rp_dumplo, &s_rp_dumphi);
+            }
+            e = getenv("RECOMP_HALO2_REPOSE_BLENDVIEW");
+            byblend = !(e && e[0] == '0');
+            e = getenv("RECOMP_HALO2_REPOSE_MEMONLY");
+            memonly = !(e && e[0] == '0');
+        }
+        /* A tick's own view is one the blend left alone. When two ticks land on back-to-back
+         * frames the blend still draws objects between poses on the second (common on a test laptop):
+         * left alone, the re-pose put a pilot's face where the blend drew it and the next frame
+         * drew it behind his head, a one-frame slab (2026-11-26, Outskirts Pelican). Such a view
+         * is guarded too, but its re-pose goes onto the game's pose in the game's memory only:
+         * the blend has just read the new update (taken into it as well, the pilot jumped for a
+         * frame). RECOMP_HALO2_REPOSE_BLENDVIEW=0: by the tick counter alone; MEMONLY=0: into
+         * both (tests). */
+        s_rp_tickview = newtick && !(byblend && s_objs_moved);
+        s_rp_blendtick = newtick && !s_rp_tickview && memonly;
+        if (s_rp_tickview && !s_rp_nodelog && !s_rp_dumptag)
+            return;                                 /* a tick's own view: as the Xbox drew it */
+    }
+    hdr = MEM32(OBJECT_ARRAY_PTR);
+    if (hdr < 0x80000000u || hdr >= GUEST_HIGH_END || MEM32(hdr + 0x2C) != DATA_ARRAY_SIG)
+        return;
+    max = MEM32(hdr + ARRAY_MAX) & 0xFFFFu;
+    entries = MEM32(hdr + ARRAY_DATA);
+    if (max > MAX_OBJECTS)
+        max = MAX_OBJECTS;
+    s_rp_n = 0;
+    s_rp_bytes = 0;
+    for (i = 0; i < max; i++) {
+        uint32_t e = entries + i * 12u, data = MEM32(e + 8), block, size, off;
+        if (!(MEM32(e) & 0xFFFFu) || data < 0x80000000u || data >= GUEST_HIGH_END)
+            continue;
+        block = MEM32(data + OBJECT_NODE_BLOCK);
+        size = block & 0xFFFFu;
+        off = block >> 16;
+        if (!size || size % NODE_BYTES || size > MAX_NODES * NODE_BYTES || off < 0x100u || off > 0x4000u ||
+            data + off + size > GUEST_HIGH_END)
+            continue;
+        if (s_rp_n == s_rp_cap) {
+            uint32_t cap = s_rp_cap ? s_rp_cap * 2 : 256;
+            ReposeSnap *r = (ReposeSnap *)realloc(s_rp, cap * sizeof *r);
+            if (!r)
+                return;
+            s_rp = r;
+            s_rp_cap = cap;
+        }
+        if (s_rp_bytes + size > s_rp_bufcap) {
+            uint32_t cap = (s_rp_bytes + size) * 2 + 65536;
+            uint8_t *b = (uint8_t *)realloc(s_rp_buf, cap);
+            if (!b)
+                return;
+            s_rp_buf = b;
+            s_rp_bufcap = cap;
+        }
+        s_rp[s_rp_n].va = data + off;
+        s_rp[s_rp_n].len = size;
+        s_rp[s_rp_n].at = s_rp_bytes;
+        memcpy(s_rp_buf + s_rp_bytes, XBOX_PTR(data + off), size);
+        s_rp_bytes += size;
+        s_rp_n++;
+    }
+    s_rp_active = 1;
+}
+
 static void trace_point(char where)
 {
     static const char *flag = (const char *)-1;
@@ -896,7 +1566,7 @@ static void world_updated(void)
     restore_points();
     probe_restore();
     if (s_probe > 0) {          /* no blending while probing */
-        if (!getenv("RECOMP_HALO2_INTERP_PROBE_LATE"))
+        if (!s_env_probe_late)
             probe_frame();
         return;
     }
@@ -965,6 +1635,7 @@ typedef struct {
 } CamState;
 
 static CamState s_cam[MAX_VIEWS];
+static uint32_t s_cam_used_frame[MAX_VIEWS];   /* the frame each slot last served a view */
 static uint32_t s_cam_frame;    /* frame of the copies counted in s_cam_index */
 static int s_cam_index;
 static int s_cam_moved;
@@ -1015,6 +1686,7 @@ static void camera_probe_measure(float z)
 void h2_interp_camera_copied(void)
 {
     float z;
+    phase_probe('C');
     if (s_on <= 0 || s_probe <= 0)
         return;
     z = getf(RENDER_CAMERA + 8);
@@ -1045,6 +1717,15 @@ static float track_part(CamTrack *t, const float *raw, int n, double now)
             step = sqrtf(dist2(raw, t->cur));
         else
             step = 1.0f - (raw[0] * t->cur[0] + raw[1] * t->cur[1] + raw[2] * t->cur[2]);
+        /* A tiny change the frame after an update is no update (2026-11-25, Outskirts
+         * intro: the direction stepped with the updates and also moved by float
+         * noise in between, so it looked as if it moved every frame and was never
+         * blended -- the view turned in 30 Hz steps). Take the value, keep the
+         * update's timing. RECOMP_HALO2_INTERP_CAMMINOR=0 counts it (test). */
+        if (held == 1 && step < 0.15f * t->last_step && s_cam_minor_rule) {
+            memcpy(t->cur, raw, n * sizeof(float));
+            goto blend;
+        }
         /* A cut between two cutscene shots (seen 2026-11-24 in the Arbiter intro:
          * a held shot, then half a unit and a big turn in one update, and the frame
          * between showed a view from neither shot): a change after the camera held
@@ -1053,7 +1734,7 @@ static float track_part(CamTrack *t, const float *raw, int n, double now)
         if (held > 4)
             t->step = 0.0f;                         /* held still: no recent steps */
         t->cut = s_cam_cut_rule && (held > 4 || step > 4.0f * t->step + (n == 3 ? 0.02f : 0.0005f));
-        if (getenv("RECOMP_HALO2_INTERP_CAMLOG")) {   /* test: every camera change */
+        if (s_env_camlog) {   /* test: every camera change */
             static int logged;
             if (logged++ < 40000)
                 fprintf(stderr, "[CAM] frame %u view %d %s held %u step %.5f ref %.5f cut %d\n", s_frame, s_cam_index - 1,
@@ -1061,7 +1742,12 @@ static float track_part(CamTrack *t, const float *raw, int n, double now)
         }
         t->last_step = step;
         t->step = step > t->step * 0.8f ? step : t->step * 0.8f;   /* the largest recent step, fading */
-        t->stepping = held >= 2;                    /* held for a frame before this change */
+        /* held for a frame before this change -- or, already stepping, a change that came
+         * with a new game tick: updates land on back-to-back frames when the frame rate
+         * wobbles (2026-11-25, a test laptop at 14-35 ms a frame), and treating that as a camera
+         * moving every frame drew it unblended for a frame while the objects were blended:
+         * a one-frame jump of the whole view. RECOMP_HALO2_INTERP_CAMTICK=0 turns it off (test). */
+        t->stepping = held >= 2 || (s_camtick_rule && t->stepping && s_frame - s_tick_frame <= 1);
         t->changed_frame = s_frame;
         /* from what the last frame showed, if it was still on its way */
         memcpy(t->prev, t->shown_frame == s_frame - 1 ? t->shown : t->cur, n * sizeof(float));
@@ -1069,6 +1755,7 @@ static float track_part(CamTrack *t, const float *raw, int n, double now)
         t->t = now;
     } else if (s_frame - t->changed_frame > 3)
         t->stepping = 0;                            /* holding still: nothing to blend */
+blend:
     if (!t->stepping || (t->cut && s_frame - t->changed_frame < 2))
         return -1.0f;
     alpha = (float)((now - t->t + s_frame_dt) * 30.0);
@@ -1098,7 +1785,46 @@ static void blend_camera_at(uint32_t va)
     }
     if (s_cam_index >= MAX_VIEWS)
         return;
-    c = &s_cam[s_cam_index++];
+    s_cam_index++;
+    {   /* The view's own history: the slot whose camera was nearest, not the slot of its
+         * place in the frame's order. A view drawn only on some frames (2026-11-25,
+         * a test laptop, Outskirts Pelican cockpit) moved the main view into another
+         * camera's slot, and it was blended from that camera: another shot every
+         * fourth frame. RECOMP_HALO2_INTERP_CAMSLOT=0 uses the order (test). */
+        int slot = s_cam_index - 1, i, best = -1, freeslot = -1;
+        float bd = 4.0f * 4.0f;                     /* within 4 units: the same camera */
+        if (s_camslot_rule) {
+            for (i = 0; i < MAX_VIEWS; i++) {
+                float dd;
+                if (s_cam_used_frame[i] == s_frame)
+                    continue;                       /* already this frame's other view */
+                if (!s_cam[i].pos.valid) {
+                    if (freeslot < 0) freeslot = i;
+                    continue;
+                }
+                dd = dist2(s_cam[i].pos.cur, raw);
+                if (dd < bd) { bd = dd; best = i; }
+            }
+            if (best < 0) {                         /* a new camera: a free slot, else the least recent */
+                best = freeslot;
+                if (best < 0) {
+                    uint32_t oldest = 0xFFFFFFFFu;
+                    for (i = 0; i < MAX_VIEWS; i++)
+                        if (s_cam_used_frame[i] != s_frame && s_cam_used_frame[i] <= oldest) { oldest = s_cam_used_frame[i]; best = i; }
+                }
+            }
+            if (best >= 0)
+                slot = best;
+        }
+        s_cam_used_frame[slot] = s_frame;
+        c = &s_cam[slot];
+        if (s_env_camlog) {   /* test: which history each view took */
+            static int vlogged;
+            if (vlogged++ < 40000)
+                fprintf(stderr, "[CAMV] frame %u view %d slot %d va %08X pos %.3f %.3f %.3f fwd %.3f %.3f %.3f\n", s_frame,
+                        s_cam_index - 1, slot, va, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+        }
+    }
     now = now_seconds();
     a_pos = track_part(&c->pos, raw, 3, now);
     a_rot = track_part(&c->rot, raw + 3, CAM_FLOATS - 3, now);
@@ -1115,7 +1841,7 @@ static void blend_camera_at(uint32_t va)
         if (c->pos.changed_frame == s_frame || c->rot.changed_frame == s_frame) {
             s_dbg_cam_cuts++;
             s_objlog_until = s_frame + 14;
-            if (getenv("RECOMP_HALO2_INTERP_OBJLOG"))
+            if (s_env_objlog)
                 fprintf(stderr, "[OBJ] camera cut at frame %u\n", s_frame);
             /* The objects moved for the new shot too, some by less than a
              * teleport: drawn between their old and new places, a character
@@ -1172,7 +1898,8 @@ static void blend_camera_at(uint32_t va)
  * argument (eax when that is 0). Blending the source makes every copy agree. */
 void h2_interp_view_render(uint32_t camera, uint32_t camera2)
 {
-    if (s_on <= 0 || s_probe > 0 || camera < 0x10000u || camera >= GUEST_HIGH_END)
+    phase_probe('V');
+    if (s_on <= 0 || s_probe > 0 || s_trackonly || camera < 0x10000u || camera >= GUEST_HIGH_END)
         return;
     if (camera2 && camera2 != camera && camera2 >= 0x10000u && camera2 < GUEST_HIGH_END &&
         !memcmp(guest_floats(camera2), guest_floats(camera), CAM_FLOATS * 4)) {
@@ -1232,9 +1959,10 @@ void h2_interp_first_person(uint32_t sets, uint32_t count)
 {
     float cam[9], f[3], l[3], u[3], d;
     double now;
+    phase_probe('F');
     uint32_t si, j;
     int k;
-    if (s_on <= 0 || s_probe > 0 || !s_fp_rule || s_fp_frame == s_frame)
+    if (s_on <= 0 || s_probe > 0 || s_trackonly || !s_fp_rule || s_fp_frame == s_frame)
         return;                                     /* once a frame: the main view */
     s_fp_frame = s_frame;
     s_fp_sets = 0;
@@ -1306,7 +2034,7 @@ void h2_interp_first_person(uint32_t sets, uint32_t count)
             t->cut = most > 0.05f && most > 4.0f * t->ref + 0.02f;
             if (t->cut) s_dbg_fp_cuts++;
             t->ref = most > t->ref * 0.8f ? most : t->ref * 0.8f;
-            t->stepping = held >= 2;
+            t->stepping = held >= 2 || (s_camtick_rule && t->stepping && s_frame - s_tick_frame <= 1);   /* as the camera */
             memcpy(t->prev, t->shown_frame == s_frame - 1 ? t->shown : t->cur, n * FP_REL * sizeof(float));
             memcpy(t->cur, rel, n * FP_REL * sizeof(float));
             t->changed_frame = s_frame;
@@ -1359,14 +2087,77 @@ static void restore_first_person(void)
     s_fp_sets = 0;
 }
 
+/* Is a cutscene showing its letterbox bars? As retail 0x13ccf1 decides it: the game options
+ * (TU15 0x4F3218; flag +1, index +2, state +8 == 3) or the byte at 0x4922E2 clear, then the
+ * amount at the record 0x51DF50 points to. For the widescreen cutscene view (settings.c). */
+static void cutscene_letterbox_check(void)
+{
+    uint32_t opts = MEM32(0x4F3218u), rec = MEM32(0x51DF50u);
+    int cond = 0;
+    float amount = 0.0f;
+    if (opts >= 0x10000u && opts < GUEST_HIGH_END)
+        cond = MEM8(opts + 1) && (int16_t)MEM16(opts + 2) != -1 && MEM32(opts + 8) == 3;
+    if (!MEM8(0x4922E2u))
+        cond = 1;
+    /* The game narrows its camera for a cutscene only while the record's byte +5 is set
+     * (retail 0x13ccf0, loc_0002FC76); the bars can stay up after it clears (a level's opening
+     * title, The Armory's "One Size Fits All") over the player's own view, which is not cropped.
+     * The main menu (game options state 3) sets it for its background: not cropped either. */
+    if (cond && rec >= 0x10000u && rec < GUEST_HIGH_END && MEM8(rec + 5) &&
+        !(opts >= 0x10000u && opts < GUEST_HIGH_END && MEM32(opts + 8) == 3))
+        amount = getf(rec);
+    static int lblog = -1;
+    static float lb_last;
+    if (lblog < 0)
+        lblog = getenv("RECOMP_HALO2_LBLOG") != NULL;
+    if (lblog && rec >= 0x10000u && rec < GUEST_HIGH_END) {   /* test: the cutscene record's bytes when they change */
+        static uint8_t last[32];
+        uint8_t now[32];
+        int k;
+        for (k = 0; k < 32; k++)
+            now[k] = MEM8(rec + k);
+        static int last_cond = -1;
+        if (memcmp(now, last, 32) || cond != last_cond) {
+            last_cond = cond;
+            fprintf(stderr, "[LBREC] %lu ms cond %d 4922E2 %02X opts %08X [%02X %04X %08X] amount %.3f |", (unsigned long)GetTickCount(),
+                    cond, MEM8(0x4922E2u), opts, opts >= 0x10000u && opts < GUEST_HIGH_END ? MEM8(opts + 1) : 0xFF,
+                    opts >= 0x10000u && opts < GUEST_HIGH_END ? MEM16(opts + 2) : 0xFFFF,
+                    opts >= 0x10000u && opts < GUEST_HIGH_END ? MEM32(opts + 8) : 0xFFFFFFFFu, amount);
+            for (k = 0; k < 32; k++)
+                fprintf(stderr, "%s%02X", k % 4 ? "" : " ", now[k]);
+            fprintf(stderr, "\n");
+            memcpy(last, now, 32);
+        }
+    }
+    if (lblog && amount != lb_last) {    /* RECOMP_HALO2_LBLOG=1 (test): the bar amount over time */
+        fprintf(stderr, "[LB] %lu ms amount %.3f\n", (unsigned long)GetTickCount(), amount);
+        if (amount == 0.0f && getenv("RECOMP_CLIP_TRIGGER")) {  /* test: a clip of the bars leaving */
+            FILE *t = fopen(getenv("RECOMP_CLIP_TRIGGER"), "w");
+            if (t) { fputs("x", t); fclose(t); }
+        }
+        lb_last = amount;
+    }
+    halo2_cutscene_view(amount);
+}
+
 void h2_interp_render_begin(void)
 {
+    phase_probe('D');
+    cutscene_letterbox_check();
     if (!interp_enabled())
         return;
-    if (s_probe > 0 && getenv("RECOMP_HALO2_INTERP_PROBE_LATE"))
+    if (s_probe > 0 && s_env_probe_late)
         probe_frame();          /* RECOMP_HALO2_INTERP_PROBE_LATE=1: after the per-frame update, just before the draw */
     trace_point('D');
     s_frame++;
+    {   /* when the game's tick counter last changed: an update's time is its tick's */
+        uint32_t t = MEM32(GAME_TICK_COUNTER);
+        if (t != s_tick_val) {
+            s_tick_val = t;
+            s_tick_time = now_seconds();
+            s_tick_frame = s_frame;
+        }
+    }
 }
 
 /* The line a test clip (RECOMP_CLIP=1, Delete) keeps for this frame: the game's
@@ -1408,6 +2199,7 @@ static void clip_note(void)
 
 void h2_interp_render_end(void)
 {
+    phase_probe('E');
     if (s_on <= 0) {
         if (s_on == 0 && !g_rclip_note[0])
             snprintf(g_rclip_note, sizeof g_rclip_note, "smoothing off (RECOMP_HALO2_INTERP not set)");
@@ -1428,6 +2220,7 @@ void h2_interp_render_end(void)
     {
         double t0 = now_seconds();
         restore_objects();
+        repose_adopt();
         restore_points();
         restore_camera();
         restore_first_person();
@@ -1436,14 +2229,38 @@ void h2_interp_render_end(void)
     probe_restore();
     if (++s_dbg_frames % 600 == 0) {
         fprintf(stderr, "[INTERP] last 600 frames: %u object frames, %u blended, %u restored, %u kept by the game,"
-                        " %u snaps, %u every-frame nodes, %u every-frame-only changes, %u new, %u changed, %u changed late, rejected %u/%u/%u/%u; camera %u blended, %u at a body, %u cuts; first person %u blended, %u cuts; particles %u, %u blended; %.1f us a frame\n",
-                s_dbg_objects, s_dbg_blended, s_dbg_restored, s_dbg_kept, s_dbg_snap, s_dbg_everyframe, s_dbg_live_only, s_dbg_new, s_dbg_changed, s_dbg_late, s_dbg_rej[0], s_dbg_rej[1], s_dbg_rej[2], s_dbg_rej[3],
+                        " %u snaps, %u every-frame nodes, %u every-frame-only changes (%u by the skipped-frame rule, %u second poses in a tick, %u timed from their tick, %u mid-frame updates, %u noise-only node changes), %u new, %u changed, %u changed late, rejected %u/%u/%u/%u; camera %u blended, %u at a body, %u cuts; first person %u blended, %u cuts; particles %u, %u blended; %.1f us a frame\n",
+                s_dbg_objects, s_dbg_blended, s_dbg_restored, s_dbg_kept, s_dbg_snap, s_dbg_everyframe, s_dbg_live_only, s_dbg_every_kept, s_dbg_same_tick, s_dbg_late_seen, s_dbg_midframe, s_dbg_noise, s_dbg_new, s_dbg_changed, s_dbg_late, s_dbg_rej[0], s_dbg_rej[1], s_dbg_rej[2], s_dbg_rej[3],
                 s_dbg_cam_blends, s_dbg_cam_fp, s_dbg_cam_cuts, s_dbg_fp, s_dbg_fp_cuts, s_dbg_points, s_dbg_points_blended, s_dbg_cost * 1e6 / 600.0);
         s_dbg_points = s_dbg_points_blended = 0;
         clip_note_reset();
         s_dbg_cost = 0;
-        s_dbg_objects = s_dbg_blended = s_dbg_restored = s_dbg_kept = s_dbg_snap = s_dbg_new = s_dbg_changed = s_dbg_late = s_dbg_everyframe = s_dbg_live_only = 0;
+        s_dbg_objects = s_dbg_blended = s_dbg_restored = s_dbg_kept = s_dbg_snap = s_dbg_new = s_dbg_changed = s_dbg_late = s_dbg_everyframe = s_dbg_live_only = s_dbg_every_kept = s_dbg_same_tick = s_dbg_late_seen = s_dbg_midframe = s_dbg_noise = 0;
         memset(s_dbg_rej, 0, sizeof s_dbg_rej);
         s_dbg_cam_blends = s_dbg_cam_fp = s_dbg_cam_cuts = s_dbg_fp = s_dbg_fp_cuts = 0;
     }
+}
+
+/* A smooth-motion switch from the settings (h2_interp_set_enabled), at the start of a
+ * frame's update hook: the frame before has put the game's own values back already.
+ * Turned on, it starts with no history (objects, camera, particles, first person),
+ * so the first blend is from what the game has now. */
+static void interp_switch_pending(void)
+{
+    LONG w = InterlockedExchange(&s_want, -1);
+    uint32_t i, a;
+    if (w < 0 || s_on < 0 || s_override >= 0 || w == s_on)
+        return;
+    if (w) {
+        for (i = 0; i < MAX_OBJECTS; i++)
+            if (s_obj[i].handle) obj_forget(&s_obj[i]);
+        memset(s_cam, 0, sizeof s_cam);
+        memset(s_cam_used_frame, 0, sizeof s_cam_used_frame);
+        for (a = 0; a < POINT_ARRAYS; a++)
+            if (s_points[a]) memset(s_points[a], 0, s_point_arrays[a].max * sizeof(PointTrack));
+        memset(s_fp, 0, sizeof s_fp);
+        s_cam_moved = 0;
+    }
+    s_on = (int)w;
+    fprintf(stderr, "[INTERP] smooth motion %s (setting changed)\n", w ? "on" : "off");
 }

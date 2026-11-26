@@ -297,9 +297,9 @@ void h2_diag_video(const char *why)
     dm.dmSize = sizeof dm;
     EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm);
     GetLocalTime(&st);
-    putf("[VIDEO] %02d:%02d:%02d %s: scale %dx, fullscreen %d, vsync %d, anisotropy %dx, fxaa %d, msaa %dx, "
+    putf("[VIDEO] %02d:%02d:%02d %s: scale %s, fullscreen %d, vsync %d, anisotropy %dx, fxaa %d, msaa %dx, "
          "widescreen %s, mouse aim %d | display %lux%lu at %lu Hz\n",
-         st.wHour, st.wMinute, st.wSecond, why, s.resolution_scale, s.fullscreen, s.vsync, s.anisotropy, s.fxaa, s.msaa,
+         st.wHour, st.wMinute, st.wSecond, why, halo2_scale_name(s.resolution_scale), s.fullscreen, s.vsync, s.anisotropy, s.fxaa, s.msaa,
          wide[s.widescreen & 3], s.mouse_aim, dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
 }
 

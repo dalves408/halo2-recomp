@@ -11663,7 +11663,9 @@ static void kernel_thunk_dispatch_body(void)
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+        static int verbose = -1;   /* RECOMP_LOG_VERBOSE=0: no call summaries (release logs) */
+        if (verbose < 0) { const char *e = getenv("RECOMP_LOG_VERBOSE"); verbose = !(e && e[0] == '0'); }
+        if (verbose && now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
