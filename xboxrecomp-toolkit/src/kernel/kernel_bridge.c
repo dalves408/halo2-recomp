@@ -388,10 +388,18 @@ static void kernel_data_init(void)
         if (f) {
             uint8_t k[16 + 16 + 256];
             if (fread(k, 1, sizeof k, f) == sizeof k) {
-                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), k, 16);
+                /* The LAN key keys System Link only (Xbox Live uses the signature keys). A player
+                 * without a console identity has it at zero, so one with the BIOS-derived key could
+                 * not see their games or be seen (2026-11-26: a host with an identity was never
+                 * found by a player without one). Every player keeps the same zero key;
+                 * RECOMP_XBOX_TITLE_LAN_KEY=1 uses the file's, for System Link with real consoles. */
+                const char *lan = getenv("RECOMP_XBOX_TITLE_LAN_KEY");
+                if (lan && lan[0] == '1')
+                    memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), k, 16);
                 memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), k + 16, 16);
                 memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), k + 32, 256);
-                fprintf(stderr, "  [KERNEL] title keys (LAN, signature, alternate) from file\n");
+                fprintf(stderr, "  [KERNEL] title keys (signature, alternate%s) from file\n",
+                        lan && lan[0] == '1' ? ", LAN" : "; System Link key left as every player's");
             } else
                 fprintf(stderr, "  [KERNEL] RECOMP_XBOX_TITLE_KEYS: file is not 288 bytes; keys left at zero\n");
             SecureZeroMemory(k, sizeof k);

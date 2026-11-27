@@ -17,6 +17,8 @@ typedef struct Halo2Settings {
     int mouse_invert;     /* 0/1: mouse up looks down */
     int frame_rate;       /* 0 Auto (60, or 30 when the PC can't hold 60), 1 60 fps, 2 30 fps; live */
     int smooth_motion;    /* 0/1: smooth motion, the in-between frames for the game's 30 Hz updates (h2_interp.c); default on; live */
+    int syslink_consoles; /* System Link with 0: recomp players (the shared key, default), 1: Xbox consoles and xemu
+                           * (the key from the verified console identity's BIOS); offered only with that identity; at start */
 } Halo2Settings;
 
 /* The frame rate the game targets now (main.c): 60 or 30. With the Auto

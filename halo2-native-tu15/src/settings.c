@@ -71,6 +71,7 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->mouse_invert = 0;
     s->frame_rate = 0;     /* Auto */
     s->smooth_motion = 1;  /* on */
+    s->syslink_consoles = 0;   /* recomp players */
 }
 
 static int clamp_sens(int v) { return v < 10 ? 10 : (v > 500 ? 500 : v); }
@@ -146,6 +147,7 @@ int halo2_settings_load(Halo2Settings *s)
     s->frame_rate = cfg_get("frame_rate", 0, path);
     if (s->frame_rate < 0 || s->frame_rate > 2) s->frame_rate = 0;
     s->smooth_motion = cfg_get("smooth_motion", 1, path) != 0;
+    s->syslink_consoles = (int)GetPrivateProfileIntA("network", "syslink_consoles", 0, path) != 0;
     return 1;
 }
 
@@ -182,6 +184,7 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("hires_textures", s->hires_textures ? 1 : 0, path);
     cfg_put("frame_rate", s->frame_rate >= 0 && s->frame_rate <= 2 ? s->frame_rate : 0, path);
     cfg_put("smooth_motion", s->smooth_motion ? 1 : 0, path);
+    cfg_put_in("network", "syslink_consoles", s->syslink_consoles ? 1 : 0, path);
     cfg_put_in("input", "mouse_aim", s->mouse_aim ? 1 : 0, path);
     cfg_put_in("input", "mouse_sens", clamp_sens(s->mouse_sens), path);
     cfg_put_in("input", "mouse_invert", s->mouse_invert ? 1 : 0, path);
@@ -346,6 +349,9 @@ static void boot_env(const Halo2Settings *s)
     snprintf(buf, sizeof buf, "%d", clamp_aniso(s->anisotropy) == 1 ? 0 : clamp_aniso(s->anisotropy));
     env_if_unset("RECOMP_GPU_ANISO", buf);
     env_if_unset("RECOMP_GPU_SMAA", s->aa ? "1" : "0");
+    /* System Link with Xbox consoles and xemu: the kernel then takes the LAN key from the verified
+     * identity's title keys (kernel_bridge.c); without that file the key stays the shared one. */
+    env_if_unset("RECOMP_XBOX_TITLE_LAN_KEY", s->syslink_consoles ? "1" : "0");
     env_if_unset("RECOMP_GPU_FXAA", "0");       /* FXAA and MSAA: test switches only */
     env_if_unset("RECOMP_GPU_MSAA", "1");
     /* Aniso only works on mip chains. */
@@ -366,11 +372,12 @@ void halo2_settings_boot(void)
     s_loaded = 1;
     fprintf(stderr,
             "[SETTINGS] display scale=%s fullscreen=%d vsync=%d aniso=%d aa=%s hires_textures=%d"
-            " frame_rate=%s smooth_motion=%d; mouse aim=%d sens=%d%% invert=%d\n",
+            " frame_rate=%s smooth_motion=%d; mouse aim=%d sens=%d%% invert=%d; system link %s\n",
             halo2_scale_name(s_cur.resolution_scale), s_cur.fullscreen, s_cur.vsync,
             s_cur.anisotropy, s_cur.aa ? "smaa" : "off", s_cur.hires_textures,
             s_cur.frame_rate == 1 ? "60" : s_cur.frame_rate == 2 ? "30" : "auto", s_cur.smooth_motion,
-            s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert);
+            s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert,
+            s_cur.syslink_consoles ? "consoles" : "recomp");
 }
 
 const Halo2Settings *halo2_settings_get(void)

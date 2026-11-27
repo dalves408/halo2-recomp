@@ -29,13 +29,15 @@ static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 5
 
 /* The settings as indexes into the lists above. */
 static const char *const FPS_TXT[] = { "Auto", "60 fps", "30 fps" };
-enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_SMOOTH, V_ANISO, V_AA, V_WIDE, V_HIRES, V_COUNT };
+static const char *const SYSLINK_TXT[] = { "Recomp players", "Xbox and xemu" };
+enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_SMOOTH, V_ANISO, V_AA, V_WIDE, V_HIRES, V_SYSLINK, V_COUNT };
 static const char *const V_LABEL[V_COUNT] = {
     "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "Anti-aliasing",
-    "Widescreen (at next start)", "Hi-res textures (at next start)",
+    "Widescreen (at next start)", "Hi-res textures (at next start)", "System Link (at next start)",
 };
-static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, OFFON, ANISO_TXT, AA_TXT, WIDE_TXT, OFFON };
-static const int V_N[V_COUNT] = { 6, 2, 2, 3, 2, 5, 2, 4, 2 };
+static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, OFFON, ANISO_TXT, AA_TXT, WIDE_TXT, OFFON,
+                                                   SYSLINK_TXT };
+static const int V_N[V_COUNT] = { 6, 2, 2, 3, 2, 5, 2, 4, 2, 2 };
 static int s_v[V_COUNT];
 enum { M_AIM, M_SENS, M_INV };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -127,6 +129,7 @@ static void load_all(int defaults)
     s_v[V_AA] = on ? GetPrivateProfileIntA("display", "aa", 1, path) != 0 : 1;
     s_v[V_WIDE] = clampi(on ? (int)GetPrivateProfileIntA("display", "widescreen", 2, path) : 2, 0, 3);
     s_v[V_HIRES] = on ? GetPrivateProfileIntA("display", "hires_textures", 1, path) != 0 : 1;
+    s_v[V_SYSLINK] = on ? GetPrivateProfileIntA("network", "syslink_consoles", 0, path) != 0 : 0;
     s_m[M_AIM] = on && GetPrivateProfileIntA("input", "mouse_aim", 0, path) != 0;
     s_m[M_SENS] = sens_ix(on ? (int)GetPrivateProfileIntA("input", "mouse_sens", 100, path) : 100);
     s_m[M_INV] = on && GetPrivateProfileIntA("input", "mouse_invert", 0, path) != 0;
@@ -157,6 +160,7 @@ static int save_all(HWND owner)
     snprintf(buf, sizeof buf, "%d", s_v[V_WIDE]);
     WritePrivateProfileStringA("display", "widescreen", buf, path);
     WritePrivateProfileStringA("display", "hires_textures", s_v[V_HIRES] ? "1" : "0", path);
+    WritePrivateProfileStringA("network", "syslink_consoles", s_v[V_SYSLINK] ? "1" : "0", path);
     WritePrivateProfileStringA("input", "mouse_aim", s_m[M_AIM] ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", SENS_VAL[s_m[M_SENS]]);
     WritePrivateProfileStringA("input", "mouse_sens", buf, path);
@@ -179,6 +183,26 @@ static void video_row_rect(int i, RECT *r)
     int top = px(130);
     SetRect(r, px(200), top + i * px(40), px(760), top + i * px(40) + px(34));
 }
+
+/* The System Link row is there only with a verified console identity (2026-11-26): Insignia Setup
+ * saves the identity's files, title keys included, only once the EEPROM and hard-drive key are
+ * verified against the console's BIOS, and only that player has the console key. */
+static int syslink_shown(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        char root[MAX_PATH], f[MAX_PATH];
+        install_root(root, sizeof root);
+        h2_data_path(root, "Identity\\eeprom.bin", f, sizeof f);
+        v = GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES;
+        h2_data_path(root, "Identity\\titlekeys.bin", f, sizeof f);
+        v = v && GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES;
+    }
+    return v;
+}
+
+/* Video rows shown: every row but System Link, which needs a verified identity. */
+static int video_rows(void) { return V_COUNT - (syslink_shown() ? 0 : 1); }
 
 /* The hi-res texture pack (the texture addon) is in <install>\textures, where the game loads it. */
 static int hires_installed(void)
@@ -226,7 +250,7 @@ static void draw(HDC dc, int w, int h)
         RECT note, sec;
         SetRect(&sec, px(200), px(96), px(760), px(126));
         ui_section(dc, &f, &sec, "Display");
-        for (i = 0; i < V_COUNT; i++) {
+        for (i = 0; i < video_rows(); i++) {
             RECT row, l, rr;
             video_row_rect(i, &row);
             ui_option_row(dc, &f, &row, V_LABEL[i],
@@ -235,7 +259,7 @@ static void draw(HDC dc, int w, int h)
             s_hits[s_nhits].row = i; s_hits[s_nhits].col = UI_HIT_PREV; s_hits[s_nhits++].r = l;
             s_hits[s_nhits].row = i; s_hits[s_nhits].col = UI_HIT_NEXT; s_hits[s_nhits++].r = rr;
         }
-        SetRect(&note, px(212), px(130) + V_COUNT * px(40) + px(16), px(760), h - px(80));
+        SetRect(&note, px(212), px(130) + video_rows() * px(40) + px(16), px(760), h - px(80));
         ui_text(dc, f.fine, RGB(150, 178, 210), &note,
                 "Frame rate Auto plays at 60 fps and drops to 30 if this PC can't keep up.\n"
                 "Smooth motion draws in-between frames so the game's 30 updates a second move at 60.\n"
@@ -291,7 +315,7 @@ static int hit(int x, int y, int *row, int *col)
 
 static void step_option(int row, int dir)
 {
-    if (s_page == PAGE_VIDEO && row >= 0 && row < V_COUNT) {
+    if (s_page == PAGE_VIDEO && row >= 0 && row < video_rows()) {
         if (row == V_HIRES && !hires_installed())
             return;                 /* nothing to switch: the texture addon is not installed */
         s_v[row] = (s_v[row] + dir + V_N[row]) % V_N[row];
@@ -484,7 +508,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         p.x = x; p.y = y;
         hit(x, y, &row, &col);
         if (s_page == PAGE_VIDEO && row < 0)
-            for (i = 0; i < V_COUNT; i++) {
+            for (i = 0; i < video_rows(); i++) {
                 RECT r;
                 video_row_rect(i, &r);
                 if (PtInRect(&r, p)) row = i;
@@ -636,7 +660,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));          /* res/halo2.ico */
     wc.lpszClassName = "Halo2NativeConfig";
     RegisterClassA(&wc);
-    SetRect(&r, 0, 0, px(BASE_W), px(BASE_H));
+    SetRect(&r, 0, 0, px(BASE_W), px(BASE_H + (syslink_shown() ? 40 : 0)));   /* the System Link row */
     AdjustWindowRect(&r, style, FALSE);
     w = CreateWindowExA(0, "Halo2NativeConfig", "Halo 2 Native - Settings", style,
                         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,

@@ -34,7 +34,19 @@ extern volatile int g_audio_muted;
 extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
-enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_SMOOTH, IT_ANISO, IT_AA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_SMOOTH, IT_ANISO, IT_AA, IT_WIDE, IT_HIRES, IT_SYSLINK, IT_CLOSE, IT_QUIT, IT_COUNT };
+
+/* xboxrecomp-toolkit console_id.c: an EEPROM and hard-drive key verified against the console's BIOS. */
+int xbox_ConsoleIdentityVerified(void);
+/* The System Link row is there only with a verified console identity: only that player has the
+ * console key (2026-11-26). Without one the row is not drawn, skipped, and the panel keeps its size. */
+static int syslink_shown(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = xbox_ConsoleIdentityVerified() ? 1 : 0;
+    return v;
+}
 enum { MODE_NONE, MODE_QUIT, MODE_SET, MODE_BUILD };
 
 /* gpu/d3d11_backend.c: the first-start shader build (rc_prebuild_scan). */
@@ -45,7 +57,7 @@ enum { M_AIM, M_SENS, M_INV };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
     "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "Anti-aliasing",
-    "Widescreen (at next start)", "Hi-res textures", "Close menu", "Quit game"
+    "Widescreen (at next start)", "Hi-res textures", "System Link (at next start)", "Close menu", "Quit game"
 };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -462,6 +474,7 @@ static void item_text(int item, char *out, size_t n)
     case IT_AA: snprintf(out, n, "%s", AA_TXT[s_edit.aa ? 1 : 0]); break;
     case IT_WIDE: snprintf(out, n, "%s", WIDE_TXT[clamp_to(s_edit.widescreen, 0, 3)]); break;
     case IT_HIRES: snprintf(out, n, "%s", !hires_installed() ? "Not installed" : OFFON[s_edit.hires_textures ? 1 : 0]); break;
+    case IT_SYSLINK: snprintf(out, n, "%s", s_edit.syslink_consoles ? "Xbox and xemu" : "Recomp players"); break;
     case IT_CLOSE: snprintf(out, n, "F1 / Esc"); break;
     case IT_QUIT: snprintf(out, n, "%s", s_set_armed ? "Press again" : "Exit to Windows"); break;
     default: out[0] = 0; break;
@@ -514,6 +527,10 @@ static void nudge(int item, int dir)
     case IT_HIRES:
         if (!hires_installed()) return;          /* nothing to switch: the texture addon is not installed */
         s_edit.hires_textures = !s_edit.hires_textures;
+        break;
+    case IT_SYSLINK:
+        if (!syslink_shown()) return;
+        s_edit.syslink_consoles = !s_edit.syslink_consoles;   /* at the next start */
         break;
     default: return;
     }
@@ -575,10 +592,11 @@ static void draw_settings(HDC hdc, int w, int h)
     int bw, bh, x, y, i;
     const char *hint;
 
-    if ((float)h / 640.0f < sc) sc = (float)h / 640.0f;
+    if ((float)h / (640.0f + (syslink_shown() ? 38.0f : 0.0f)) < sc)
+        sc = (float)h / (640.0f + (syslink_shown() ? 38.0f : 0.0f));
     ui_fonts_make(&f, sc);
     bw = ui_px(&f, 960);
-    bh = ui_px(&f, 640);   /* one Anti-aliasing row in place of FXAA and MSAA (was 680) */
+    bh = ui_px(&f, 640 + (syslink_shown() ? 38 : 0));   /* one Anti-aliasing row in place of FXAA and MSAA (was 680); System Link row */
     x = (w - bw) / 2;
     y = (h - bh) / 2;
     SetRect(&all, 0, 0, w, h);
@@ -613,11 +631,16 @@ static void draw_settings(HDC hdc, int w, int h)
         for (i = 0; i < IT_COUNT; i++) {
             RECT row;
             char val[40];
-            int top = ry + i * ui_px(&f, 38) + (i >= IT_CLOSE ? ui_px(&f, 18) : 0);
-            SetRect(&row, rx0, top, rx1, top + ui_px(&f, 34));
-            s_row_r[i] = row;
+            int slot = i - (i > IT_SYSLINK && !syslink_shown());
+            int top = ry + slot * ui_px(&f, 38) + (i >= IT_CLOSE ? ui_px(&f, 18) : 0);
             SetRect(&s_prev_r[i], 0, 0, 0, 0);
             SetRect(&s_next_r[i], 0, 0, 0, 0);
+            if (i == IT_SYSLINK && !syslink_shown()) {
+                SetRect(&s_row_r[i], 0, 0, 0, 0);
+                continue;
+            }
+            SetRect(&row, rx0, top, rx1, top + ui_px(&f, 34));
+            s_row_r[i] = row;
             item_text(i, val, sizeof val);
             if (i >= IT_CLOSE)
                 ui_button(hdc, &f, &row, i == IT_QUIT && s_set_armed ? "QUIT GAME - PRESS AGAIN"
@@ -823,6 +846,8 @@ static void move_row(int dir)
         return;
     }
     s_sel += dir;
+    if (s_page == PAGE_VIDEO && s_sel == IT_SYSLINK && !syslink_shown())
+        s_sel += dir;                          /* the hidden System Link row */
     if (s_sel < 0) s_sel = -1;                 /* up from the first row: the tabs */
     if (s_sel >= n) s_sel = n - 1;
 }
