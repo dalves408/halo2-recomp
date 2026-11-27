@@ -4,9 +4,9 @@ A static recompilation of the original Xbox Halo 2 into a native Windows x64 pro
 built on the xboxrecomp toolkit. The x86 game code is lifted to C, and a reimplemented
 Xbox kernel, NV2A GPU (Direct3D 11 backend), APU and USB stack run it on a PC.
 
-**Version 1.0.8** is out: get `Halo2-Recomp-Setup-1.0.8.exe` from
+**Version 1.1.0** is out: get `Halo2-Recomp-Setup-1.1.0.exe` from
 [Releases](https://github.com/dalves408/halo2-recomp/releases/latest). The optional
-[hi-res texture pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2) is a
+[hi-res texture pack v3](https://github.com/dalves408/halo2-recomp/releases/tag/textures-3) is a
 separate download (below).
 
 **No game content is in this repository.** You need your own retail Halo 2 disc. The
@@ -41,6 +41,8 @@ difference between the disc's executables and the update's.
 - **Shortcuts:** Start menu entries for the game, its settings program and Insignia Setup,
   and an optional desktop shortcut.
 - **Hi-res texture pack:** an optional task in Setup (unticked), or its own installer (below).
+  With an older official pack (v1 or v2) installed, Setup offers the update to v3, ticked;
+  unticked, the old pack is removed and the game uses its original textures.
 - **RecompLauncher:** the release also has `Halo2-Recomp-v<version>-Windows-x64.zip` for
   [RecompLauncher](https://recomplauncher.com/sdk) (level 3). It asks only for the
   disc, imports it with `halo2_import.exe --prepare` (title update 1.5 included), and uses the
@@ -51,9 +53,17 @@ difference between the disc's executables and the update's.
 `config.exe` beside the game (Start menu: Halo 2 Recomp Settings) and F1 in the game edit
 the same `data\settings.ini` and `data\keymap.ini`:
 
-- **VIDEO:** render scale, fullscreen, VSync, frame rate, anisotropic filtering, FXAA, MSAA,
-  widescreen, and hi-res textures on or off ("Not installed" when there is no texture
-  pack; in the F1 menu it applies at once from 1.0.5).
+- **VIDEO:** render scale (Native, the screen's own resolution, or 1x to 5x), fullscreen,
+  VSync, frame rate, smooth motion, anisotropic filtering, anti-aliasing, widescreen, and
+  hi-res textures on or off ("Not installed" when there is no texture pack; in the F1 menu
+  it applies at once from 1.0.5).
+- **Anti-aliasing** (from 1.1.0): **SMAA** (the default) or Off. SMAA smooths edges after the
+  frame is drawn and costs almost nothing; it replaced the FXAA and MSAA settings (MSAA 4x
+  cost about 40% of the frame rate). Settings from earlier versions switch to SMAA.
+- **Smooth motion** (from 1.0.9, on by default): Halo 2 updates its world 30 times a second;
+  smooth motion draws the frames in between, so characters, vehicles, effects and cutscene
+  cameras move at 60 fps. Only the drawing changes: the game's logic, aim and network play
+  still run at 30 updates a second. It takes effect at once.
 - **Frame rate** (from 1.0.6): **Auto** (the default) plays at 60 fps and switches to 30 for the
   rest of the session when the PC cannot hold 60 in play (an even 30 looks better than an
   uneven 40-50); **60** or **30** fixes it. Xbox Live matches run at 30 whatever it says.
@@ -254,20 +264,23 @@ copies off.
 
 ## Hi-res textures
 
-**For players:** the [Hi-Res Texture Pack v2](https://github.com/dalves408/halo2-recomp/releases/tag/textures-2)
-has 4,645 of the game's textures upscaled 4x, with mipmaps. Most are BC7. The scope and
-binocular overlays and the Metropolis water masks are uncompressed, and their transparency
-is exact: scaled back down, they match the originals.
+**For players:** the [Hi-Res Texture Pack v3](https://github.com/dalves408/halo2-recomp/releases/tag/textures-3)
+has 4,644 of the game's textures upscaled 4x, with mipmaps. Most are BC7; menu, HUD and
+small textures (575) are uncompressed. v3 was rebuilt to fix transparency (v2 had wrong
+alpha in 2,780 textures, such as a glow around Cortana in the Cairo Station intro): scaled
+back down, every texture's transparency matches the original.
 
-- **Install or update:** run `Halo2-Recomp-HiRes-Textures-2-Setup.exe` from that release, or
-  tick the texture pack task in the game's Setup (1.0.5 offers v2).
-  - **Texture pack v1 already installed:** Setup downloads only the update
-    (`texture-update-1-to-2.bin`, 2.7 MB) and replaces the 34 changed textures, each checked
-    first.
-  - **Otherwise:** Setup downloads the four `texture-0N.bin` parts (3.87 GB), checks each one's
-    size and SHA-256 and extracts them into `<game folder>\textures` (6.4 GB).
+- **Install or update:** run `Halo2-Recomp-HiRes-Textures-3-Setup.exe` from that release, or
+  tick the texture pack task in the game's Setup (1.0.9 and newer offer v3).
+  - Setup downloads the four `texture-0N.bin` parts (3.85 GB), checks each one's size and
+    SHA-256 and extracts them into `<game folder>\textures` (6.5 GB). An older official pack
+    (v1 or v2) is removed once v3 is in place; there is no small update from v2.
   - An interrupted download resumes. `.bin` files placed beside the Setup are used instead of
     downloading.
+- **Loading** (from 1.1.0): pack files are read and their GPU textures made on two loader
+  threads, and the game draws its own texture until the hi-res one is ready, so loading
+  doesn't stall the game. Particle smoke (`_smoke_` files) is never loaded from a pack: soft
+  smoke gains nothing from upscaling, and the upscaled one faded on NVIDIA and Intel GPUs.
 - **On or off:** Hi-res textures in the F1 menu (at once, from 1.0.5) or `config.exe` (VIDEO,
   at the next start). 1.0.0 has no switch: it loads the folder whenever it is there.
 - **Building the release:** `python scripts\build_texture_pack.py --revision <n>` packs a
@@ -275,16 +288,10 @@ is exact: scaled back down, they match the originals.
   again) and writes their pins to `installer\texture_payload.iss`. `build_installer.py` then
   builds the addon, `installer\halo2_textures.iss`. The parts and the addon go on a
   `textures-<n>` release that is not marked latest, so the game's update check never sees it.
-- **Revision 2:**
-  `build_texture_pack.py --revision 2 --overlay <remade dds> --patch-from 1`
-  - It lays the remade files over the source.
-  - It also builds the update from revision 1, after checking the rebuilt revision 1 file list
-    against its pinned SHA-256.
-  - It writes `installer\texture_patch_files.iss`, so Setup recognises a revision 1 folder,
-    including one whose update was interrupted.
-  - `scripts\remake_alpha.py` rebuilt those textures on a CUDA GPU. Each 4x4 block of the result
-    averages to the original texel's alpha. Alpha 0 and 255 stay exact. Edges are cleaned up
-    with total-variation smoothing.
+- **Revision 3** is a full rebuild (no update file): each texture's alpha and colour were fitted
+  back to the original on a CUDA GPU, so each 4x4 block of the result averages to the
+  original texel, with alpha 0 and 255 exact. The game Setup pins the manifests of earlier
+  official revisions (`TextureOlderManifests`) to recognise and replace them.
 
 **Making a pack:** put DDS replacements in `halo2-native-tu15\textures\`. Name each one
 `<hash16>_<W>x<H>_<anything>.dds`, keeping the extracted texture's name. A file can be
@@ -303,9 +310,9 @@ RGBA, with mipmaps. Cube maps are a single DDS cubemap.
 
 ## Status
 
-Campaign boots and plays at 60 FPS (Halo 2's own 30 FPS cadence is lifted; heavy open
-scenes can still drop below 60). Resolution scale, MSAA up to 8x, anisotropic filtering
-and FXAA are available. Third-party pads work through SDL3.
+Campaign boots and plays at 60 FPS, with smooth motion drawing the frames between the game's
+30 Hz updates (heavy open scenes can still drop below 60). Render scale (Native or 1x-5x),
+anisotropic filtering and SMAA are available. Third-party pads work through SDL3.
 
 Recent rendering fixes, each on by default with a switch to turn it off:
 
@@ -322,9 +329,13 @@ Recent rendering fixes, each on by default with a switch to turn it off:
 | A render target that changes size each frame is re-laid out on the GPU and copied back later, not waited for (1.0.8) | `RECOMP_GPU_RELAYOUT_ASYNC=0` |
 | A draw's vertices and indices sent in one upload (1.0.8) | `RECOMP_GPU_GEOM_ONE_MAP=0` |
 | Textures, scissor and clip constants not re-sent when unchanged (1.0.8) | `RECOMP_GPU_BIND_CACHE=0` |
-
-Known issue: the HUD is missing from DEL debug screenshots (development builds) when MSAA
-is on.
+| Smooth motion: in-between frames for the game's 30 Hz updates (1.0.9; also a setting) | `RECOMP_HALO2_INTERP=0` |
+| The game thread waits for the GPU's acknowledgement instead of spinning a core (1.1.0: about half its CPU time) | `RECOMP_PFB_FLUSH_WAIT=0` |
+| Textures that stopped changing are spot-checked each frame and compared in full every 16-31 frames (1.1.0) | `RECOMP_GPU_TEX_SETTLE=0` |
+| Hi-res pack textures loaded on background threads (1.1.0) | `RECOMP_TEX_PACK_ASYNC=0` |
+| Textures the game unloads kept on the GPU, up to 256 MB, and reused when they come back (1.1.0) | `RECOMP_GPU_TEX_PARK=0` |
+| A clear over the start of a pending relayout copy trims it instead of waiting for the GPU (1.1.0) | `RECOMP_GPU_RELAYOUT_TRIM=0` |
+| A full clear to the same colour not written to game memory again (1.1.0) | `RECOMP_GPU_CLEAR_SKIP=0` |
 
 ## Licenses
 
@@ -334,4 +345,4 @@ no game assets, and the game files come from your own disc.
 The xboxrecomp toolkit is MIT (`xboxrecomp-toolkit/LICENSE`, with `LICENSES/` and `NOTICE`
 for bundled components). SDL3 is zlib (`halo2-native-tu15/third_party/SDL3-3.4.20/LICENSE.txt`).
 The GPU backend's register-combiner shader generator is adapted from MIT-licensed code
-(`src/gpu/NOTICE.txt`).
+(`src/gpu/NOTICE.txt`). SMAA is MIT (`halo2-native-tu15/src/gpu/smaa/LICENSE.txt`).
