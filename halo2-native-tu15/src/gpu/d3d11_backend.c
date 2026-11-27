@@ -1441,6 +1441,8 @@ typedef struct {
     int alias_uncertain;
     uint64_t wserial;               /* s_wserial at the last color write */
     unsigned write_gen;             /* s_gen at the last color write */
+    uint32_t mclear_argb, mclear_seq; /* the last full clear mirrored to guest memory, and the host-write counter after it */
+    int mclear_valid;
     ID3D11Texture2D *msaa_tex;
     ID3D11RenderTargetView *msaa_rtv;
     UINT msaa_count;
@@ -2963,8 +2965,22 @@ static struct {
     uint64_t hi;
     int succ;                       /* successor surface slot, or -1 */
     uint32_t succ_w, succ_h, succ_pitch, succ_bpp;
+    uint32_t skip;                  /* leading guest bytes written since (rla_touch_mode): kept as they are */
 } s_rla;
-static unsigned s_rla_issued, s_rla_done, s_rla_dropped, s_rla_early, s_rla_sync, s_rla_covered;
+static uint8_t *s_rla_buf;
+static size_t s_rla_buf_cap;
+static unsigned s_rla_issued, s_rla_done, s_rla_dropped, s_rla_early, s_rla_sync, s_rla_covered, s_rla_trimmed;
+
+/* RECOMP_GPU_RELAYOUT_TRIM=0: a write over the start of staged bytes completes them first (test) */
+static int rla_trim_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_RELAYOUT_TRIM");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
 unsigned rla_stat(int i)
 {
     return i == 0 ? s_rla_issued : i == 1 ? s_rla_done : i == 2 ? s_rla_dropped :
@@ -3026,6 +3042,37 @@ static void rla_complete(void)
     s_rla.pending = 0;                  /* the writes below come back through the hooks */
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_rla.st, 0, D3D11_MAP_READ,
                                           0, &m))) {
+        if (s_rla.skip) {
+            /* The leading bytes were written after the copy was queued (the successor's clear):
+             * those come from guest memory as it is now, the rest from the staged copy. */
+            size_t row = (size_t)s_rla.w * s_rla.bpp, need = row * s_rla.h;
+            uint32_t y;
+            if (row > s_rla.pitch)
+                row = s_rla.pitch;
+            need = row * s_rla.h;
+            if (need > s_rla_buf_cap) {
+                uint8_t *nb = (uint8_t *)realloc(s_rla_buf, need);
+                if (!nb)
+                    goto unmap;
+                s_rla_buf = nb;
+                s_rla_buf_cap = need;
+            }
+            for (y = 0; y < s_rla.h; ++y) {
+                size_t g = (size_t)y * s_rla.pitch;
+                uint8_t *dst = s_rla_buf + (size_t)y * row;
+                memcpy(dst, (const uint8_t *)m.pData + (size_t)y * m.RowPitch, row);
+                if (g < s_rla.skip) {
+                    size_t n = s_rla.skip - g < row ? s_rla.skip - g : row;
+                    __try {
+                        memcpy(dst, GUEST(s_rla.va) + g, n);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        goto unmap;
+                    }
+                }
+            }
+            m.pData = s_rla_buf;
+            m.RowPitch = (UINT)row;
+        }
         memset(&tmp, 0, sizeof tmp);
         tmp.va = s_rla.va;
         tmp.w = s_rla.w;
@@ -3037,6 +3084,7 @@ static void rla_complete(void)
             rla_successor_shadow((const uint8_t *)m.pData, m.RowPitch);
             ok = 1;
         }
+unmap:
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_rla.st, 0);
     }
     ID3D11Texture2D_Release(s_rla.st);
@@ -3052,7 +3100,9 @@ static void rla_complete(void)
 
 /* Before the backend touches guest bytes [va, va+bytes): staged bytes there go
  * first. A write that covers all of them (a full clear of the successor) makes
- * them moot: they are dropped instead, with no wait. */
+ * them moot: they are dropped instead, with no wait. A write that covers their
+ * start (2026-11-26: the 128x128 clear after the 160x120 pass, every frame) trims
+ * them: no wait, and those bytes are left as written (s_rla.skip). */
 static void rla_touch_mode(uint32_t va, uint64_t bytes, int write)
 {
     uint32_t lo;
@@ -3067,6 +3117,13 @@ static void rla_touch_mode(uint32_t va, uint64_t bytes, int write)
             ID3D11Texture2D_Release(s_rla.st);
             s_rla.st = NULL;
             s_rla_covered++;
+            return;
+        }
+        if (write && rla_trim_enabled() && hi <= TEX_WR_MASK + 1ull && lo <= s_rla.lo && hi > s_rla.lo &&
+            s_rla.lo >= (s_rla.va & TEX_WR_MASK) && s_rla.hi - (s_rla.va & TEX_WR_MASK) <= UINT32_MAX) {
+            s_rla.skip = (uint32_t)(hi - (s_rla.va & TEX_WR_MASK));
+            s_rla.lo = (uint32_t)hi;
+            s_rla_trimmed++;
             return;
         }
         s_rla_early++;
@@ -3114,6 +3171,7 @@ static int relayout_issue(Surf *s, int need_gpu_seed)
         s_rla.hi = TEX_WR_MASK + 1ull;
     }
     s_rla.succ = -1;
+    s_rla.skip = 0;
     s_rla.pending = 1;
     s->gpu_dirty = 0;                   /* as the synchronous readback leaves it */
     s->guest_exact = 0;
@@ -4728,6 +4786,32 @@ static void shadow_from_clear(Surf *s, uint32_t argb)
     }
 }
 
+/* The guest copy of a surface still holds the full clear mirrored last time, with the same colour
+ * (2026-11-26): writing it again was ~7% of the GPU-command thread in the Cairo intro (the same
+ * targets are cleared to the same colour every frame while drawing happens on the GPU copy only).
+ * Holds when nothing on the host wrote those pages since (xbox_NoteGuestWrite: the back end's
+ * readbacks, file reads) and a sampled compare finds no game CPU write. Contiguous surfaces only;
+ * RECOMP_GPU_CLEAR_SKIP=0 always writes (test). */
+static int mirror_clear_still_there(Surf *s, uint32_t argb)
+{
+    static int on = -1;
+    size_t span;
+    uint64_t physical;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_GPU_CLEAR_SKIP");
+        on = !(v && v[0] == '0');
+    }
+    if (!on || !s->mclear_valid || s->mclear_argb != argb || !surf_fast_enabled() ||
+        !s_tex_physical_read || s_tex_strict_bounds || s->pitch != surf_guest_row(s) ||
+        !surface_guest_span(s, &span) || span != s->guest_shadow_bytes)
+        return 0;
+    rla_touch_mode(s->va, span, 1);     /* what the write would do first; a completion is a host write */
+    return !xbox_GuestWrittenSince(s->va, (uint32_t)span, s->mclear_seq) &&
+           surf_identity_current(s) &&
+           guest_data_span(s->va, span, &physical) == 2 &&
+           xbox_ContiguousGpuBytesSampleEqual((uint32_t)physical, s->guest_shadow, span);
+}
+
 static int mirror_full_color_clear(Surf *s, uint32_t argb)
 {
     int changed;
@@ -4736,8 +4820,14 @@ static int mirror_full_color_clear(Surf *s, uint32_t argb)
         (uint64_t)s->w * s->bpp > s->pitch || !ensure_guest_shadow(s))
         return 0;
     shadow_from_clear(s, argb);
-    if (!checked_write_guest_surface(s, s->guest_shadow, surf_guest_row(s)))
-        return 0;
+    if (!mirror_clear_still_there(s, argb)) {
+        s->mclear_valid = 0;
+        if (!checked_write_guest_surface(s, s->guest_shadow, surf_guest_row(s)))
+            return 0;
+        s->mclear_valid = 1;
+        s->mclear_argb = argb;
+        s->mclear_seq = xbox_GuestWriteSeq();
+    }
 #ifdef BRUTEFORCE_D3D11_TESTING
     if (scale_test_failure("guest-change-mirror"))
         *(uint32_t *)GUEST(s->va) ^= 1u;
@@ -6483,8 +6573,9 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
         if (cached && !cached->unsupported && cached->snapshot &&
             cached->snapshot_bytes == layout.span + palette_bytes &&
             (tex_verified(cached, t->offset, layout.span, t->palette, palette_bytes) ||
-             (guest_physical_bytes_match(t->offset, cached->snapshot, layout.span,
-                                         &cached->source_identity) &&
+             /* texels: the settled check (2026-11-26; the full compare of P8 textures was ~4.6% of the
+              * GPU-command thread in the Cairo intro); the palette (at most 1 KB) is compared in full. */
+             (tex_verify_settled(cached, t->offset, layout.span) &&
               guest_physical_bytes_match(t->palette, cached->snapshot + layout.span, palette_bytes,
                                          &cached->palette_identity) &&
               tex_mark_verified(cached, epoch))) &&
