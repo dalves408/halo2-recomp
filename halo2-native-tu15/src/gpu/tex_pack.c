@@ -126,16 +126,25 @@ static int parse_name(const char *name, uint64_t *hash, uint32_t *w, uint32_t *h
  * (scripts\remake_alpha.py: alpha rebuilt so a 4x box
  * downsample gives the original back) are uncompressed R8G8B8A8 and load
  * normally; pack_remade() tells them apart. Matched on the tag name the
- * pack's file names end with. */
+ * pack's file names end with.
+ *
+ * Particle smoke ("_smoke_": smoke_soft_small, smoke_volumetric, smoke_trail, ...) is skipped too
+ * (2026-11-26): soft sprites gain nothing from upscaling, and the pack's smoke_soft_small faded the
+ * branding-rod smoke in the Cairo intro to almost nothing on NVIDIA and Intel GPUs (AMD showed it).
+ * The sky backdrops ("skysmoke") are scenery and stay. */
 static int pack_skip(const char *name)
 {
     static const char *const skip[] = { "_scope_mask_", "_binoculars_elite", "_binoculars_human" };
+    static const char *const always[] = { "_smoke_" };   /* skipped even as an uncompressed remake */
     char low[MAX_PATH];
     size_t i, n = strlen(name);
     if (n >= sizeof low)
         return 0;
     for (i = 0; i <= n; i++)
         low[i] = (char)(name[i] >= 'A' && name[i] <= 'Z' ? name[i] + 32 : name[i]);
+    for (i = 0; i < sizeof always / sizeof always[0]; i++)
+        if (strstr(low, always[i]))
+            return 2;
     for (i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (strstr(low, skip[i]))
             return 1;
@@ -184,8 +193,11 @@ static void scan_dir(const char *dir, int depth)
             continue;
         if (!parse_name(fd.cFileName, &hash, &w, &h))
             continue;
-        if (pack_skip(fd.cFileName) && !pack_remade(full))
-            continue;
+        {
+            int sk = pack_skip(fd.cFileName);   /* 1: unless remade, 2: always */
+            if (sk == 2 || (sk && !pack_remade(full)))
+                continue;
+        }
         if (s_nfiles == s_capfiles) {
             int cap = s_capfiles ? s_capfiles * 2 : 1024;
             PackFile *f = (PackFile *)realloc(s_files, (size_t)cap * sizeof *f);
