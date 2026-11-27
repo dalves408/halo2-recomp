@@ -237,3 +237,16 @@ patch(p15, call15, "    h2_interp_view_objects(0);   /* re-pose guard (hand hook
       "    h2_interp_view_objects(1);   /* re-pose guard (hand hook) */\n", "h2_interp_view_objects(0);")
 patch(p15, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_interp_view_objects(int after);\n",
       "void h2_interp_view_objects(int after);")
+
+# 16. D3D's PFB flush kick (sub_00404EC0, the XDK KickOff wait): it sets 0x100410 bit 16 and spins
+#     until the "GPU" clears it. Our pushbuffer thread clears it, so the spin burned a whole core
+#     (47% of the game thread in Outskirts, 2026-11-26) that weak PCs need for that thread. With
+#     RECOMP_PFB_FLUSH_WAIT=1 (main.c default) it waits on the toolkit's acknowledgement event
+#     instead (nv2a_pfb_flush.c); =0 keeps the original spin.
+p16 = find("void sub_00404EC0(void)\n")
+patch(p16, "    MEM32(eax + 0x100410) = ecx;\n\nloc_00404EE0: ;\n",
+      "    MEM32(eax + 0x100410) = ecx;\n"
+      "    if (xbox_Nv2aPfbFlushWait()) { esp += 4; return; }   /* event wait (hand hook) */\n\nloc_00404EE0: ;\n",
+      "xbox_Nv2aPfbFlushWait()) { esp += 4; return; }")
+patch(p16, "#include <math.h>\n", "#include <math.h>\n\nint xbox_Nv2aPfbFlushWait(void);\n",
+      "int xbox_Nv2aPfbFlushWait(void);")

@@ -49,14 +49,6 @@ static int clamp_aniso(int v)
     return 1;
 }
 
-static int clamp_msaa(int v)
-{
-    if (v >= 8) return 8;
-    if (v >= 4) return 4;
-    if (v >= 2) return 2;
-    return 1;
-}
-
 const char *halo2_scale_name(int scale)
 {
     static const char *const names[] = { "native", "1x", "2x", "3x", "4x", "5x" };
@@ -71,8 +63,7 @@ void halo2_settings_defaults(Halo2Settings *s)
     s->fullscreen = 0;
     s->vsync = 1;
     s->anisotropy = 1;
-    s->fxaa = 0;
-    s->msaa = 1;
+    s->aa = 1;            /* SMAA */
     s->widescreen = 2;     /* 16:9 by default */
     s->hires_textures = 1;
     s->mouse_aim = 0;
@@ -142,8 +133,10 @@ int halo2_settings_load(Halo2Settings *s)
     s->fullscreen = cfg_get("fullscreen", 0, path) != 0;
     s->vsync = cfg_get("vsync", 1, path) != 0;
     s->anisotropy = clamp_aniso(cfg_get("anisotropy", 1, path));
-    s->fxaa = cfg_get("fxaa", cfg_get("aa_mode", 0, path) == 1, path) != 0;
-    s->msaa = clamp_msaa(cfg_get("msaa", 1, path));
+    /* One anti-aliasing setting, SMAA (2026-11-26): FXAA cost about the same, blurred textures
+     * and HUD text; MSAA cost 42-51% of the frame rate. A file from before it has no "aa" key
+     * and gets SMAA, whatever its old fxaa/msaa said. */
+    s->aa = cfg_get("aa", 1, path) != 0;
     s->widescreen = cfg_get("widescreen", 2, path);
     if (s->widescreen < 0 || s->widescreen > 3) s->widescreen = 2;
     s->hires_textures = cfg_get("hires_textures", 1, path) != 0;
@@ -184,8 +177,7 @@ int halo2_settings_save(const Halo2Settings *s)
     cfg_put("fullscreen", s->fullscreen ? 1 : 0, path);
     cfg_put("vsync", s->vsync ? 1 : 0, path);
     cfg_put("anisotropy", clamp_aniso(s->anisotropy), path);
-    cfg_put("fxaa", s->fxaa ? 1 : 0, path);
-    cfg_put("msaa", clamp_msaa(s->msaa), path);
+    cfg_put("aa", s->aa ? 1 : 0, path);
     cfg_put("widescreen", s->widescreen >= 0 && s->widescreen <= 3 ? s->widescreen : 2, path);
     cfg_put("hires_textures", s->hires_textures ? 1 : 0, path);
     cfg_put("frame_rate", s->frame_rate >= 0 && s->frame_rate <= 2 ? s->frame_rate : 0, path);
@@ -343,7 +335,7 @@ static void boot_env(const Halo2Settings *s)
     env_if_unset("RECOMP_FULLSCREEN", s->fullscreen ? "1" : "0");
     env_if_unset("RECOMP_PRESENT_VSYNC", s->vsync ? "1" : "0");
     /* Frames reach the screen through the D3D11 presenter (gpu_present.c):
-     * vsync-paced and, above 1x or with FXAA, straight from the GPU. The GDI
+     * vsync-paced and, above 1x or with anti-aliasing, straight from the GPU. The GDI
      * window path showed about 40 of 60 frames a second on a 1080p laptop
      * (a 16 ms sleep after each 9 ms blit), which read as hitching. GDI stays
      * the fallback when the presenter cannot start; RECOMP_D3D_PRESENT=0
@@ -353,9 +345,9 @@ static void boot_env(const Halo2Settings *s)
      * legacy "on" (8x) for older launchers. */
     snprintf(buf, sizeof buf, "%d", clamp_aniso(s->anisotropy) == 1 ? 0 : clamp_aniso(s->anisotropy));
     env_if_unset("RECOMP_GPU_ANISO", buf);
-    env_if_unset("RECOMP_GPU_FXAA", s->fxaa ? "1" : "0");
-    snprintf(buf, sizeof buf, "%d", clamp_msaa(s->msaa));
-    env_if_unset("RECOMP_GPU_MSAA", buf);
+    env_if_unset("RECOMP_GPU_SMAA", s->aa ? "1" : "0");
+    env_if_unset("RECOMP_GPU_FXAA", "0");       /* FXAA and MSAA: test switches only */
+    env_if_unset("RECOMP_GPU_MSAA", "1");
     /* Aniso only works on mip chains. */
     if (clamp_aniso(s->anisotropy) >= 2)
         env_if_unset("RECOMP_GPU_MIPS", "1");
@@ -373,10 +365,10 @@ void halo2_settings_boot(void)
     widescreen_boot(s_cur.widescreen);
     s_loaded = 1;
     fprintf(stderr,
-            "[SETTINGS] display scale=%s fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires_textures=%d"
+            "[SETTINGS] display scale=%s fullscreen=%d vsync=%d aniso=%d aa=%s hires_textures=%d"
             " frame_rate=%s smooth_motion=%d; mouse aim=%d sens=%d%% invert=%d\n",
             halo2_scale_name(s_cur.resolution_scale), s_cur.fullscreen, s_cur.vsync,
-            s_cur.anisotropy, s_cur.fxaa, s_cur.msaa, s_cur.hires_textures,
+            s_cur.anisotropy, s_cur.aa ? "smaa" : "off", s_cur.hires_textures,
             s_cur.frame_rate == 1 ? "60" : s_cur.frame_rate == 2 ? "30" : "auto", s_cur.smooth_motion,
             s_cur.mouse_aim, s_cur.mouse_sens, s_cur.mouse_invert);
 }
@@ -399,13 +391,12 @@ void halo2_settings_copy(Halo2Settings *s)
 void halo2_gpu_apply_live(const Halo2Settings *s)
 {
     char buf[16];
-    int scale, aniso, msaa;
+    int scale, aniso;
 
     if (!s)
         return;
     scale = clamp_scale(s->resolution_scale);
     aniso = clamp_aniso(s->anisotropy);
-    msaa = clamp_msaa(s->msaa);
 
     if (scale == 0) {
         _putenv_s("RECOMP_GPU_SCALE", "native");
@@ -428,12 +419,10 @@ void halo2_gpu_apply_live(const Halo2Settings *s)
         _putenv_s("RECOMP_GPU_MIPS", "1");
     halo2_gpu_set_aniso(aniso);
 
-    _putenv_s("RECOMP_GPU_FXAA", s->fxaa ? "1" : "0");
-    halo2_gpu_set_fxaa(s->fxaa ? 1 : 0);
-
-    snprintf(buf, sizeof buf, "%d", msaa);
-    _putenv_s("RECOMP_GPU_MSAA", buf);
-    halo2_gpu_set_msaa(msaa);
+    _putenv_s("RECOMP_GPU_SMAA", s->aa ? "1" : "0");
+    halo2_gpu_set_smaa(s->aa ? 1 : 0);
+    halo2_gpu_set_fxaa(0);
+    halo2_gpu_set_msaa(1);
 
     halo2_gpu_set_hires(s->hires_textures);
 }
@@ -449,8 +438,7 @@ int halo2_settings_apply(const Halo2Settings *s, int save)
     t.fullscreen = t.fullscreen ? 1 : 0;
     t.vsync = t.vsync ? 1 : 0;
     t.anisotropy = clamp_aniso(t.anisotropy);
-    t.fxaa = t.fxaa ? 1 : 0;
-    t.msaa = clamp_msaa(t.msaa);
+    t.aa = t.aa ? 1 : 0;
     if (t.widescreen < 0 || t.widescreen > 3) t.widescreen = 2;
     t.hires_textures = t.hires_textures ? 1 : 0;
     t.mouse_aim = t.mouse_aim ? 1 : 0;
@@ -497,9 +485,9 @@ void halo2_settings_pump(void)
     LeaveCriticalSection(&s_pending_lock);
 
     snprintf(s_last_apply, sizeof s_last_apply,
-             "scale=%s fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d hires=%d smooth_motion=%d",
+             "scale=%s fullscreen=%d vsync=%d aniso=%d aa=%s hires=%d smooth_motion=%d",
              halo2_scale_name(t.resolution_scale), t.fullscreen, t.vsync,
-             t.anisotropy, t.fxaa, t.msaa, t.hires_textures, t.smooth_motion);
+             t.anisotropy, t.aa ? "smaa" : "off", t.hires_textures, t.smooth_motion);
     fprintf(stderr, "[SETTINGS] live apply %s\n", s_last_apply);
     fflush(stderr);
     halo2_gpu_apply_live(&t);

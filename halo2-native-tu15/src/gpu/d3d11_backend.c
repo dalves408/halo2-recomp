@@ -74,6 +74,7 @@
 #include "texture_decode.h"
 #include "texture_sampler.h"
 #include "fxaa.h"
+#include "smaa.h"
 #include "vsh_hlsl.h"
 #include "../perf_counters.h"
 
@@ -1172,6 +1173,7 @@ static ID3D11PixelShader *get_rc_shader(const GpuRcKey *k)
 
 /* ---- device -------------------------------------------------------------- */
 
+static void park_clear(void);
 static void msaa_query_device(void);
 static int ensure_device_for_scale(int scale_requested)
 {
@@ -1214,17 +1216,22 @@ static int ensure_device_for_scale(int scale_requested)
     s_failed = 1;               /* until everything below has worked */
     {
         IDXGIAdapter *adapter = s_warp ? NULL : pick_adapter();
+        /* Multithreaded by default (2026-11-26): the hi-res pack's loader threads create their
+         * textures on it (tex_pack.c; a 4 MB texture took up to 27 ms on this thread). The
+         * immediate context stays on this thread alone. RECOMP_GPU_DEVICE_ST=1: single-threaded. */
+        const char *st = getenv("RECOMP_GPU_DEVICE_ST");
+        UINT devflags = st && st[0] == '1' ? D3D11_CREATE_DEVICE_SINGLETHREADED : 0;
         hr = D3D11CreateDevice(adapter,
                                s_warp ? D3D_DRIVER_TYPE_WARP
                                       : adapter ? D3D_DRIVER_TYPE_UNKNOWN
                                                 : D3D_DRIVER_TYPE_HARDWARE,
-                               NULL, D3D11_CREATE_DEVICE_SINGLETHREADED, &fl, 1,
+                               NULL, devflags, &fl, 1,
                                D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
         if (FAILED(hr) && adapter) {
             fprintf(stderr, "[GPU-D3D11] device on the chosen adapter failed 0x%08lX; "
                     "retrying on the default adapter\n", (unsigned long)hr);
             hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                                   D3D11_CREATE_DEVICE_SINGLETHREADED, &fl, 1,
+                                   devflags, &fl, 1,
                                    D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
         }
         if (adapter)
@@ -1236,6 +1243,10 @@ static int ensure_device_for_scale(int scale_requested)
         goto failed;
     }
     InterlockedExchange(&s_device_thread, (LONG)GetCurrentThreadId());
+    {
+        const char *st = getenv("RECOMP_GPU_DEVICE_ST");
+        texpack_set_device(s_dev, !(st && st[0] == '1'));
+    }
     report_device_identity(got);
     msaa_query_device();
     if (!compile(s_base_hlsl, sizeof s_base_hlsl - 1, "base", "vs_main", "vs_5_0", &vsb)
@@ -1365,6 +1376,8 @@ failed:
     s_xlayout = s_base_layout = NULL;
     s_xvs = s_base_vs = NULL;
     s_base_ps = NULL;
+    texpack_set_device(NULL, 0);        /* no loader thread on this device any more */
+    park_clear();                       /* parked textures belong to this device */
     if (s_ctx) ID3D11DeviceContext_Release(s_ctx);
     if (s_dev) ID3D11Device_Release(s_dev);
     s_ctx = NULL;
@@ -1972,6 +1985,37 @@ static int guest_physical_bytes_match(uint32_t va, const void *snapshot, size_t 
            guest_identity_still_valid(va, bytes, GUEST_BOUNDS_IGNORE, expected);
 }
 
+/* Test: RECOMP_GPU_TEXVERIFY_LOG=1 counts the byte compares that re-verify cached textures
+ * (calls, bytes, how many found a change, by size) and logs them every 600 frames. */
+static int s_tvlog = -1;
+static uint64_t s_tv_calls, s_tv_bytes, s_tv_changed, s_tv_changed_bytes, s_tv_size[6];
+static uint64_t s_tv_sampled;
+static uint32_t s_tv_gen0;
+static int tex_verify_bytes(uint32_t va, const void *snapshot, size_t bytes, const GuestSpanIdentity *expected,
+                            unsigned gen)
+{
+    int same = guest_physical_bytes_match(va, snapshot, bytes, expected);
+    if (s_tvlog < 0)
+        s_tvlog = getenv("RECOMP_GPU_TEXVERIFY_LOG") && getenv("RECOMP_GPU_TEXVERIFY_LOG")[0] == '1';
+    if (s_tvlog) {
+        s_tv_calls++;
+        s_tv_bytes += bytes;
+        s_tv_size[bytes < 4096 ? 0 : bytes < 32768 ? 1 : bytes < 131072 ? 2 : bytes < 524288 ? 3 : bytes < 2097152 ? 4 : 5]++;
+        if (!same) { s_tv_changed++; s_tv_changed_bytes += bytes; }
+        if (gen - s_tv_gen0 >= 600u) {
+            double f = (double)(gen - s_tv_gen0);
+            fprintf(stderr, "[TEXVERIFY] per frame: %.1f sampled only, %.1f full compares, %.2f MB, %.2f found changed (%.3f MB);"
+                            " sizes <4K %.1f <32K %.1f <128K %.1f <512K %.1f <2M %.1f more %.1f\n",
+                    s_tv_sampled / f, s_tv_calls / f, s_tv_bytes / f / 1048576.0, s_tv_changed / f, s_tv_changed_bytes / f / 1048576.0,
+                    s_tv_size[0] / f, s_tv_size[1] / f, s_tv_size[2] / f, s_tv_size[3] / f, s_tv_size[4] / f, s_tv_size[5] / f);
+            s_tv_calls = s_tv_bytes = s_tv_changed = s_tv_changed_bytes = s_tv_sampled = 0;
+            memset(s_tv_size, 0, sizeof s_tv_size);
+            s_tv_gen0 = gen;
+        }
+    }
+    return same;
+}
+
 static int query_suspend_clear(void);
 static void query_resume_clear(int counting);
 static void bind_targets(Surf *s, Depth *d);
@@ -2185,6 +2229,49 @@ int halo2_gpu_msaa(void)
 {
     return (int)s_msaa_want;
 }
+
+void halo2_gpu_set_smaa(int on)
+{
+    halo2_smaa_set_enabled(on ? 1 : 0);
+    if (on && !s_direct_present) {
+        s_direct_present = 1;
+        fprintf(stderr, "[GPU-D3D11] shared GPU presentation enabled for SMAA\n");
+    }
+    fprintf(stderr, "[SMAA] %s\n", on ? "enabled (applied at present)" : "disabled");
+}
+
+#ifdef RECOMP_DEBUG_TOOLS
+/* Test: RECOMP_DEBUG_AA_TRIGGER=<file> switches anti-aliasing live when the file appears
+ * (off, fxaa, smaa, smaa_low|medium|high|ultra, msaa2, msaa4, msaa8), so one paused scene
+ * can be captured in every mode. The file is deleted once read. */
+static void aa_test_trigger(void)
+{
+    static const char *path = (const char *)-1;
+    static unsigned poll;
+    char mode[32] = "";
+    FILE *f;
+    if (path == (const char *)-1)
+        path = getenv("RECOMP_DEBUG_AA_TRIGGER");
+    if (!path || !*path || (poll++ & 7u))
+        return;
+    f = fopen(path, "r");
+    if (!f)
+        return;
+    if (!fgets(mode, sizeof mode, f))
+        mode[0] = 0;
+    fclose(f);
+    DeleteFileA(path);
+    mode[strcspn(mode, "\r\n ")] = 0;
+    halo2_gpu_set_fxaa(!strcmp(mode, "fxaa"));
+    if (!strncmp(mode, "smaa_", 5)) {
+        _putenv_s("RECOMP_GPU_SMAA_PRESET", mode + 5);
+        halo2_smaa_shutdown();          /* rebuilt with the preset on next use */
+    }
+    halo2_gpu_set_smaa(!strncmp(mode, "smaa", 4));
+    halo2_gpu_set_msaa(!strncmp(mode, "msaa", 4) ? atoi(mode + 4) : 1);
+    fprintf(stderr, "[AA-TEST] mode %s\n", mode);
+}
+#endif
 
 void halo2_gpu_set_fxaa(int on)
 {
@@ -2462,6 +2549,7 @@ static struct { uint32_t lo, hi; LONG epoch; } s_tex_wr[TEX_WR_RING];
 static int guarded_guest_write(void *destination, const void *source, size_t bytes)
 {
     rla_touch_mode((uint32_t)((uintptr_t)destination - (uintptr_t)GUEST(0)), bytes, 1);
+    xbox_NoteGuestWrite((uint32_t)((uintptr_t)destination - (uintptr_t)GUEST(0)), (uint32_t)bytes);
     {
         LONG e = InterlockedIncrement(&s_tex_epoch);
         uintptr_t va = (uintptr_t)destination - (uintptr_t)GUEST(0);
@@ -4680,6 +4768,13 @@ typedef struct {
     GuestSpanIdentity source_identity, palette_identity;
     uint32_t gen, stable, last_use;
     uint32_t vgen, vepoch;          /* frame and write epoch of the last full compare */
+    uint32_t sv_gen, sv_seq;        /* frame and host-write counter of the last full compare that matched */
+    uint8_t sv_clean, sv_dynamic;   /* full compares in a row that matched; changed after settling */
+    const uint8_t *sv_snap;         /* the snapshot those counts are about */
+    uint64_t pack_hash;             /* hi-res pack key while its replacement loads */
+    uint8_t pack_pending;           /* the replacement was still loading: ask again on use */
+    uint64_t content_key;           /* exact content of the upload (tex_content_key), 0: none */
+    size_t content_bytes;           /* its guest size, for the parked-texture budget */
     const uint8_t *vsnap;
     int index_next;
     int index_bucket;          /* bucket used at insert, or -1 */
@@ -4734,10 +4829,9 @@ static void maybe_test_live_settings(void)
         last_gen = s_gen;
         halo2_settings_copy(&t);
         t.resolution_scale = 5;
-        t.msaa = 4;
         t.anisotropy = 8;
-        t.fxaa = 1;
-        fprintf(stderr, "[SETTINGS] test live apply queued (scale=5x msaa=4 aniso=8 fxaa=1 ntex=%d gen=%u)\n",
+        t.aa = 1;
+        fprintf(stderr, "[SETTINGS] test live apply queued (scale=5x aniso=8 aa=smaa ntex=%d gen=%u)\n",
                 s_ntex, s_gen);
         fflush(stderr);
         halo2_settings_apply(&t, 0);
@@ -4749,11 +4843,10 @@ static void maybe_test_live_settings(void)
     ++cycle;
     halo2_settings_copy(&t);
     t.resolution_scale = 5;
-    t.msaa = (cycle % 3u == 0) ? 1 : ((cycle % 3u == 1) ? 4 : 8);
     t.anisotropy = (cycle % 2u) ? 8 : 1;
-    t.fxaa = (int)(cycle % 2u);
-    fprintf(stderr, "[SETTINGS] test live cycle %u queued (scale=5x msaa=%d aniso=%d fxaa=%d ntex=%d gen=%u)\n",
-            cycle, t.msaa, t.anisotropy, t.fxaa, s_ntex, s_gen);
+    t.aa = (int)(cycle % 2u);
+    fprintf(stderr, "[SETTINGS] test live cycle %u queued (scale=5x aniso=%d aa=%d ntex=%d gen=%u)\n",
+            cycle, t.anisotropy, t.aa, s_ntex, s_gen);
     fflush(stderr);
     halo2_settings_apply(&t, 0);
 }
@@ -4852,6 +4945,55 @@ static int tex_mark_verified(Tex *e, LONG epoch)
     e->vepoch = (uint32_t)epoch;
     e->vsnap = e->snapshot;
     return 1;
+}
+
+/* A cached texture's guest bytes still the snapshot's (2026-11-26). Comparing every texture in
+ * full each frame was ~13% of the GPU-command thread in Outskirts (147 textures, 5.8 MB a frame)
+ * and almost never found a change. So a texture whose full compares matched 3 times in a row
+ * is "settled": each frame it gets a sampled compare (17 pieces of 32 bytes) and a full one
+ * every 16-31 frames (staggered by address), and any host write to its pages since its last
+ * full compare (a file read, the back end's own writes; xbox_NoteGuestWrite) forces a full one.
+ * A texture that changes after settling without such a write is written by the game itself
+ * (a video frame, a glyph cache): it is compared in full every frame from then on.
+ * RECOMP_GPU_TEX_SETTLE=0 compares everything in full (test). */
+static int s_tex_settle = -1;
+static int tex_verify_settled(Tex *e, uint32_t va, size_t bytes)
+{
+    uint64_t physical;
+    uint32_t seq;
+    if (s_tex_settle < 0) {
+        const char *v = getenv("RECOMP_GPU_TEX_SETTLE");
+        s_tex_settle = !(v && v[0] == '0');
+    }
+    if (s_tex_settle && !e->sv_dynamic && e->sv_clean >= 3 && e->sv_snap == e->snapshot &&
+        s_gen - e->sv_gen < 16u + ((va >> 12) & 15u) && s_tex_physical_read && !s_tex_strict_bounds &&
+        e->source_identity.allocation && !xbox_GuestWrittenSince(va, (uint32_t)bytes, e->sv_seq)) {
+        if (!s_rla_hold)
+            rla_touch(va, bytes);
+        if (guest_data_span(va, bytes, &physical) == 2 &&
+            guest_identity_still_valid(va, bytes, GUEST_BOUNDS_IGNORE, &e->source_identity) &&
+            xbox_ContiguousGpuBytesSampleEqual((uint32_t)physical, e->snapshot, bytes)) {
+            s_tv_sampled++;
+            return 1;
+        }
+    }
+    seq = xbox_GuestWriteSeq();         /* before the compare: a write during it is seen next time */
+    if (tex_verify_bytes(va, e->snapshot, bytes, &e->source_identity, s_gen)) {
+        if (e->sv_snap != e->snapshot) {
+            e->sv_snap = e->snapshot;
+            e->sv_clean = 0;
+            e->sv_dynamic = 0;
+        }
+        if (e->sv_clean < 255)
+            e->sv_clean++;
+        e->sv_gen = s_gen;
+        e->sv_seq = seq;
+        return 1;
+    }
+    if (e->sv_clean >= 3 && !xbox_GuestWrittenSince(va, (uint32_t)bytes, e->sv_seq))
+        e->sv_dynamic = 1;
+    e->sv_clean = 0;
+    return 0;
 }
 
 static uint64_t hash_bytes(const uint8_t *p, size_t n)
@@ -5213,8 +5355,115 @@ static uint32_t tex_lod_control(uint32_t control0, unsigned extra)
     return (control0 & ~((0xFFFu << 18) | (0xFFFu << 6))) | min_lod << 18 | max_lod << 6;
 }
 
+/* Parked textures (2026-11-26): the game evicts textures to fit its 64 MB and streams the same
+ * ones in again; in the Cairo intro about half of ~3,800 decodes and uploads (320 of 750 ms on
+ * the GPU-command thread) were content uploaded before. When an entry goes, its own GPU texture
+ * (not a hi-res or sharp-text copy) is parked under its exact content key, and an upload of the
+ * same content takes it back instead of decoding again. Bounded by guest size (256 MB), least
+ * recently parked first; cleared with the device. RECOMP_GPU_TEX_PARK=0 turns it off (test). */
+#define PARK_MAX 8192
+#define PARK_BUDGET ((size_t)256 << 20)
+typedef struct {
+    uint64_t key;
+    ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;
+    size_t bytes;
+    uint32_t seq;
+} Parked;
+static Parked *s_park;
+static int s_npark, s_park_on = -1;
+static size_t s_park_bytes;
+static uint32_t s_park_seq;
+static unsigned s_park_hits, s_park_puts;
+
+static int park_enabled(void)
+{
+    if (s_park_on < 0) {
+        const char *e = getenv("RECOMP_GPU_TEX_PARK");
+        s_park_on = !(e && e[0] == '0');
+        if (s_park_on && !(s_park = (Parked *)calloc(PARK_MAX, sizeof *s_park)))
+            s_park_on = 0;
+    }
+    return s_park_on;
+}
+
+static void park_drop(int i)
+{
+    ID3D11ShaderResourceView_Release(s_park[i].srv);
+    ID3D11Texture2D_Release(s_park[i].tex);
+    s_park_bytes -= s_park[i].bytes;
+    s_park[i] = s_park[--s_npark];
+}
+
+static void park_clear(void)
+{
+    while (s_npark)
+        park_drop(s_npark - 1);
+}
+
+/* Takes over the caller's references; 0: not parked (the caller releases them). */
+static int park_put(uint64_t key, ID3D11Texture2D *tex, ID3D11ShaderResourceView *srv, size_t bytes)
+{
+    int i;
+    if (!key || !tex || !srv || !park_enabled() || bytes > PARK_BUDGET / 4)
+        return 0;
+    for (i = 0; i < s_npark; i++)
+        if (s_park[i].key == key)
+            return 0;                   /* already parked: this copy goes */
+    while (s_npark && (s_npark == PARK_MAX || s_park_bytes + bytes > PARK_BUDGET)) {
+        int old = 0;
+        for (i = 1; i < s_npark; i++)
+            if (s_park[i].seq < s_park[old].seq)
+                old = i;
+        park_drop(old);
+    }
+    s_park[s_npark].key = key;
+    s_park[s_npark].tex = tex;
+    s_park[s_npark].srv = srv;
+    s_park[s_npark].bytes = bytes;
+    s_park[s_npark].seq = ++s_park_seq;
+    s_park_bytes += bytes;
+    s_npark++;
+    s_park_puts++;
+    return 1;
+}
+
+/* Hands back the parked copy of this content, if there is one (the caller owns it). */
+static int park_take(uint64_t key, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
+{
+    int i;
+    if (!key || !s_npark)
+        return 0;
+    for (i = 0; i < s_npark; i++)
+        if (s_park[i].key == key) {
+            *tex = s_park[i].tex;
+            *srv = s_park[i].srv;
+            s_park_bytes -= s_park[i].bytes;
+            s_park[i] = s_park[--s_npark];
+            s_park_hits++;
+            return 1;
+        }
+    return 0;
+}
+
 static void release_tex(Tex *e)
 {
+    /* the game's own texture: orig_* when a hi-res or sharp-text copy was swapped in */
+    if (e->content_key && (e->orig_tex ? e->orig_srv != NULL : e->srv != NULL) &&
+        park_put(e->content_key, e->orig_tex ? e->orig_tex : e->tex,
+                 e->orig_tex ? e->orig_srv : e->srv, e->content_bytes)) {
+        if (e->orig_tex) {              /* the copy goes; the game's texture is parked */
+            if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+            if (e->tex) ID3D11Texture2D_Release(e->tex);
+        }
+        e->orig_srv = NULL;
+        e->orig_tex = NULL;
+        e->srv = NULL;
+        e->tex = NULL;
+        e->content_key = 0;
+        release_tex_snapshot(e);
+        return;
+    }
     if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
     if (e->tex) ID3D11Texture2D_Release(e->tex);
     if (e->orig_srv) ID3D11ShaderResourceView_Release(e->orig_srv);
@@ -6003,6 +6252,37 @@ static int sharp_text_build(const uint8_t *src, uint32_t pitch, ID3D11Texture2D 
 
 /* The view a stage samples, and the size its texel-space coordinates are
  * divided by (*tw, *th). */
+/* A cached texture whose hi-res replacement was still loading (tex_pack.c): asked again on each
+ * use until it is there, then swapped in, the game's own texture kept for alpha-kill stages. */
+static void tex_pack_retry(Tex *e)
+{
+    ID3D11Texture2D *ptex;
+    ID3D11ShaderResourceView *psrv;
+    unsigned plevels, pextra;
+    int found;
+    if (!e->pack_pending || e->hires)
+        return;
+    if (!texpack_enabled()) {
+        e->pack_pending = 0;
+        return;
+    }
+    found = texpack_lookup(s_dev, e->pack_hash, e->w, e->h, e->cube, &ptex, &psrv, &plevels, &pextra);
+    if (found == 2)
+        return;
+    e->pack_pending = 0;
+    if (found != 1)
+        return;
+    e->orig_tex = e->tex;
+    e->orig_srv = e->srv;
+    e->orig_levels = e->uploaded_levels ? e->uploaded_levels : 1;
+    e->tex = ptex;
+    e->srv = psrv;
+    e->hires = 1;
+    e->lod_extra = (uint8_t)pextra;
+    e->view_levels = plevels;
+    s_st.tex_hires++;
+}
+
 static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, unsigned stage,
                                              float *tw, float *th, unsigned *mip_levels)
 {
@@ -6167,10 +6447,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
         LONG epoch = s_tex_epoch;
         if (cached && !cached->unsupported && cached->snapshot_bytes == layout.span &&
             (tex_verified(cached, t->offset, layout.span, 0, 0) ||
-             (guest_physical_bytes_match(t->offset, cached->snapshot, layout.span,
-                                         &cached->source_identity) &&
+             (tex_verify_settled(cached, t->offset, layout.span) &&
               tex_mark_verified(cached, epoch)))) {
             cached->last_use = s_gen;
+            tex_pack_retry(cached);
             *mip_levels = tex_levels_out(cached);
             s_st.texture_physical_hits++;
             return cached->srv;
@@ -6211,6 +6491,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
             guest_identity_still_valid(t->offset, layout.span, GUEST_BOUNDS_IGNORE,
                                        &cached->source_identity)) {
             cached->last_use = s_gen;
+            tex_pack_retry(cached);
             *mip_levels = tex_levels_out(cached);
             s_st.texture_physical_hits++;
             return cached->srv;
@@ -6451,9 +6732,89 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
     set_tex_key(e, t, cube, palette_entries, layout.levels);
     e->source_identity = source_identity;
     e->palette_identity = palette_identity;
-    upload_result = upload(e, t, cube, &layout, snapshot,
-                           palette_bytes ? snapshot + source_bytes : NULL,
-                           palette_entries, &path);
+    {
+        /* Test: RECOMP_GPU_TEXUP_LOG=1 times decode + upload and counts uploads whose exact
+         * content (format, size, bytes) was uploaded before in this session. */
+        static int uplog = -1;
+        static uint64_t *seen;
+        static double up_ms, rep_ms;
+        static unsigned ups, reps, gen0;
+        LARGE_INTEGER q0, q1, qf;
+        uint64_t key = 0;
+        if (uplog < 0) {
+            uplog = getenv("RECOMP_GPU_TEXUP_LOG") && getenv("RECOMP_GPU_TEXUP_LOG")[0] == '1';
+            if (uplog && !(seen = (uint64_t *)calloc(1u << 18, sizeof *seen)))
+                uplog = 0;
+        }
+        if (uplog) {
+            key = hash_bytes(snapshot, snapshot_bytes) ^ ((uint64_t)t->color << 56) ^
+                  ((uint64_t)t->width << 40) ^ ((uint64_t)t->height << 28) ^ (uint64_t)cube;
+            if (!key) key = 1;
+            QueryPerformanceCounter(&q0);
+        }
+        {
+            uint64_t ckey = 0;
+            if (park_enabled()) {
+                ckey = hash_bytes(snapshot, snapshot_bytes) ^ ((uint64_t)t->color << 56) ^
+                       ((uint64_t)t->width << 40) ^ ((uint64_t)t->height << 28) ^ ((uint64_t)t->pitch << 8) ^
+                       ((uint64_t)layout.levels << 4) ^ ((uint64_t)palette_entries << 20) ^ (uint64_t)cube;
+                if (!ckey)
+                    ckey = 1;
+            }
+            Tex *same = NULL;
+            int si;
+            /* the same content live at another address (the game streamed it in again
+             * before its old copy went): share that entry's own GPU texture */
+            for (si = 0; ckey && si < s_ntex && !same; si++)
+                if (s_tex[si].content_key == ckey && &s_tex[si] != e &&
+                    (s_tex[si].orig_tex ? s_tex[si].orig_srv != NULL : s_tex[si].srv != NULL))
+                    same = &s_tex[si];
+            if (same) {
+                e->tex = same->orig_tex ? same->orig_tex : same->tex;
+                e->srv = same->orig_tex ? same->orig_srv : same->srv;
+                ID3D11Texture2D_AddRef(e->tex);
+                ID3D11ShaderResourceView_AddRef(e->srv);
+                upload_result = TEX_UPLOAD_OK;
+                path = "shared";
+                s_park_hits++;
+            } else if (ckey && park_take(ckey, &e->tex, &e->srv)) {
+                upload_result = TEX_UPLOAD_OK;
+                path = "parked";
+            } else
+                upload_result = upload(e, t, cube, &layout, snapshot,
+                                       palette_bytes ? snapshot + source_bytes : NULL,
+                                       palette_entries, &path);
+            if (upload_result == TEX_UPLOAD_OK) {
+                e->content_key = ckey;
+                e->content_bytes = snapshot_bytes;
+            }
+        }
+        if (uplog) {
+            uint32_t slot = (uint32_t)(key >> 20) & ((1u << 18) - 1);
+            double ms;
+            int repeat = 0;
+            QueryPerformanceCounter(&q1);
+            QueryPerformanceFrequency(&qf);
+            ms = (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            while (seen[slot] && seen[slot] != key)
+                slot = (slot + 1) & ((1u << 18) - 1);
+            repeat = seen[slot] == key;
+            seen[slot] = key;
+            ups++;
+            up_ms += ms;
+            if (repeat) { reps++; rep_ms += ms; }
+            if (s_gen - gen0 >= 600u) {
+                fprintf(stderr, "[TEXUP] last %u frames: %u uploads %.1f ms, %u of them repeats of earlier content %.1f ms;"
+                                " parked %u, taken back %u, %d parked now (%.0f MB)\n",
+                        s_gen - gen0, ups, up_ms, reps, rep_ms, s_park_puts, s_park_hits, s_npark,
+                        s_park_bytes / 1048576.0);
+                s_park_puts = s_park_hits = 0;
+                ups = reps = 0;
+                up_ms = rep_ms = 0;
+                gen0 = s_gen;
+            }
+        }
+    }
     if (upload_result != TEX_UPLOAD_OK) {
         free(snapshot);
         if (upload_result == TEX_UPLOAD_UNSUPPORTED) {
@@ -6501,8 +6862,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t, int cube, uns
         ID3D11ShaderResourceView *psrv;
         unsigned plevels, pextra;
         uint64_t phash = hash_bytes(snapshot + s0->offset, s0->size);
-        if (texpack_lookup(s_dev, phash, t->width,
-                           t->height, cube, &ptex, &psrv, &plevels, &pextra)) {
+        int found = texpack_lookup(s_dev, phash, t->width, t->height, cube, &ptex, &psrv, &plevels, &pextra);
+        e->pack_pending = found == 2;
+        e->pack_hash = phash;
+        if (found == 1) {
             if (getenv("RECOMP_TEX_PACK_LOG"))      /* which pack file (named by this hash) a guest texture became */
                 fprintf(stderr, "[TEXPACK] hit tex %08X %ux%u hash %016llx\n", t->offset, t->width, t->height,
                         (unsigned long long)phash);
@@ -9535,13 +9898,19 @@ static void publish_shared_present(Surf *sf)
             return;
         }
     }
-    if (halo2_fxaa_enabled()) {
-        /* FXAA sets its own shaders, constants, sampler and output state
-         * and does not put them back. */
+#ifdef RECOMP_DEBUG_TOOLS
+    aa_test_trigger();
+#endif
+    if (halo2_fxaa_enabled() || halo2_smaa_enabled()) {
+        /* FXAA and SMAA set their own shaders, constants, samplers and
+         * output state and do not put them back. */
         s_pipe.valid = 0;
         s_fragment.valid = 0;
     }
-    halo2_fxaa_apply(s_dev, s_ctx, s_present_shared, s_present_rtv, width, height);
+    if (halo2_smaa_enabled())
+        halo2_smaa_apply(s_dev, s_ctx, s_present_shared, s_present_rtv, width, height);
+    else
+        halo2_fxaa_apply(s_dev, s_ctx, s_present_shared, s_present_rtv, width, height);
     ID3D11DeviceContext_Flush(s_ctx);
 #ifdef RECOMP_DEBUG_TOOLS
     if (halo2_screenshot_enabled())
@@ -10211,10 +10580,10 @@ void halo2_debug_drawlist_write(const char *png_path, FILE *sidecar)
 
     if (sidecar) {
         if (hs)
-            fprintf(sidecar, "settings: scale=%dx fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d"
+            fprintf(sidecar, "settings: scale=%dx fullscreen=%d vsync=%d aniso=%d aa=%d"
                              " (live: scale=%.2fx msaa=%u aniso=%d mips=%d)\n",
-                    hs->resolution_scale, hs->fullscreen, hs->vsync, hs->anisotropy, hs->fxaa,
-                    hs->msaa, gpu_scale_value(), (unsigned)s_msaa_want, s_tex_aniso, s_tex_mips);
+                    hs->resolution_scale, hs->fullscreen, hs->vsync, hs->anisotropy, hs->aa,
+                    gpu_scale_value(), (unsigned)s_msaa_want, s_tex_aniso, s_tex_mips);
         fprintf(sidecar, "last_apply: %s\n", halo2_settings_last_apply()
                 ? halo2_settings_last_apply() : "(none)");
         if (s_dl[0]) {
@@ -11157,7 +11526,8 @@ int bruteforce_d3d11_install(void)
     if (s_tex_aniso >= 2 && !s_tex_mips)
         s_tex_mips = 1;
     halo2_fxaa_set_enabled(tex_fxaa && strcmp(tex_fxaa, "1") == 0);
-    if (halo2_fxaa_enabled() && !(direct_present && strcmp(direct_present, "0") == 0))
+    halo2_smaa_set_enabled(getenv("RECOMP_GPU_SMAA") && strcmp(getenv("RECOMP_GPU_SMAA"), "1") == 0);
+    if ((halo2_fxaa_enabled() || halo2_smaa_enabled()) && !(direct_present && strcmp(direct_present, "0") == 0))
         s_direct_present = 1;
     if (!tex_msaa || !*tex_msaa || strcmp(tex_msaa, "0") == 0 || strcmp(tex_msaa, "1") == 0)
         s_msaa_want = 1;
@@ -11183,7 +11553,9 @@ int bruteforce_d3d11_install(void)
     if (s_msaa_want > 1)
         fprintf(stderr, "[GPU-D3D11] requested MSAA %ux (clamped to device support at create)\n",
                 (unsigned)s_msaa_want);
-    if (halo2_fxaa_enabled())
+    if (halo2_smaa_enabled())
+        fprintf(stderr, "[SMAA] enabled (applied at present, in place of FXAA)\n");
+    else if (halo2_fxaa_enabled())
         fprintf(stderr, "[FXAA] enabled (applied at present)\n");
     s_vsh_flags = mulzero && strcmp(mulzero, "1") == 0 ? GPU_VSH_MULZERO : 0;
     s_vsh_sync = getenv("RECOMP_GPU_VSH_SYNC") && strcmp(getenv("RECOMP_GPU_VSH_SYNC"), "1") == 0;

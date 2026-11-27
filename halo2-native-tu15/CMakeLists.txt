@@ -91,6 +91,7 @@ set(GAME_SOURCES
     src/gpu/texture_sampler.c
     src/gpu/tex_pack.c
     src/gpu/fxaa.c
+    src/gpu/smaa.c
     src/gpu/vsh_hlsl.c
     src/settings.c
     src/overlay.c

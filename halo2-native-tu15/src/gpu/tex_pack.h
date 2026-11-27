@@ -25,7 +25,12 @@ int texpack_active(void);
  * name), directly or through mip_aliases.txt. On a match returns 1 with
  * references the caller owns (*tex and *srv), the view's level count and
  * the number of levels the replacement adds over the guest size
- * (log2 of the scale). 0: no replacement, nothing returned. */
+ * (log2 of the scale). 0: no replacement, nothing returned. 2: there is one, but it is
+ * still loading (nothing returned): ask again on a later use. */
+/* The back end's device; multithreaded: it may create textures from other threads, so the
+ * loader threads create the replacements themselves. */
+void texpack_set_device(ID3D11Device *dev, int multithreaded);
+
 int texpack_lookup(ID3D11Device *dev, uint64_t hash, unsigned width, unsigned height,
                    int cube, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv,
                    unsigned *levels, unsigned *lod_extra);

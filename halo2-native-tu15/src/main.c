@@ -312,9 +312,9 @@ static void halo2_write_crash_report(PEXCEPTION_POINTERS ep)
         }
         s = halo2_settings_get();
         if (s)
-            fprintf(f, "Settings scale=%s fullscreen=%d vsync=%d aniso=%d fxaa=%d msaa=%d\n",
+            fprintf(f, "Settings scale=%s fullscreen=%d vsync=%d aniso=%d aa=%s\n",
                     halo2_scale_name(s->resolution_scale), s->fullscreen, s->vsync,
-                    s->anisotropy, s->fxaa, s->msaa);
+                    s->anisotropy, s->aa ? "smaa" : "off");
         if (halo2_settings_last_apply() && halo2_settings_last_apply()[0])
             fprintf(f, "Last live apply: %s\n", halo2_settings_last_apply());
         fclose(f);
@@ -692,6 +692,9 @@ int main(void)
     if (!getenv("RECOMP_VBLANK")) _putenv_s("RECOMP_VBLANK", "paced");
     if (!getenv("RECOMP_PB_EXEC")) _putenv_s("RECOMP_PB_EXEC", "1");
     if (!getenv("RECOMP_PB_WALK")) _putenv_s("RECOMP_PB_WALK", "dma");
+    /* D3D's flush kick waits on the pushbuffer thread's acknowledgement event instead of
+     * spinning a core (patch 16, sub_00404EC0; 2026-11-26). =0 keeps the spin (test). */
+    if (!getenv("RECOMP_PFB_FLUSH_WAIT")) _putenv_s("RECOMP_PFB_FLUSH_WAIT", "1");
     if (!getenv("RECOMP_AC97_READY")) _putenv_s("RECOMP_AC97_READY", "1");
     if (!getenv("RECOMP_TITLE_KEVENTS")) _putenv_s("RECOMP_TITLE_KEVENTS", "1");
     if (!getenv("RECOMP_DISPATCH_GATE")) _putenv_s("RECOMP_DISPATCH_GATE", "1");

@@ -220,6 +220,11 @@ uint64_t xbox_ContiguousBlockIdentity(uint32_t va, uint32_t *remaining);
 /* Exact comparison against the GPU's physical view of contiguous memory.
  * Returns zero if the bytes differ or the physical view is unavailable. */
 int xbox_ContiguousGpuBytesEqual(uint32_t physical, const void *snapshot, size_t bytes);
+int xbox_ContiguousGpuBytesSampleEqual(uint32_t physical, const void *snapshot, size_t bytes);
+/* Host-side writes into guest RAM, by 4 KB page (xbox_memory_layout.c). */
+void xbox_NoteGuestWrite(uint32_t va, uint32_t bytes);
+uint32_t xbox_GuestWriteSeq(void);
+int xbox_GuestWrittenSince(uint32_t va, uint32_t bytes, uint32_t seq);
 uint64_t xbox_HeapBlockIdentity(uint32_t va, uint32_t *remaining);
 /* Changes when the guest mapping is initialized or shut down. */
 uint64_t xbox_MemoryLayoutGeneration(void);

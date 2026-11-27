@@ -191,6 +191,33 @@ begin
   if not Result then Log('The current texture pack is installed; the texture download offer is hidden.');
 end;
 
+{ An earlier official revision (its manifest is pinned in TextureOlderManifests) is in the game folder: Setup offers
+  the update to this revision as its own task, ticked (a user with v2 saw only the unticked "install" task and
+  kept v2, 2026-11-26). }
+function TextureOlderPackInstalled: Boolean;
+var
+  Manifest: String;
+begin
+  Result := False;
+#ifdef TextureOlderManifests
+  if TextureForceRepair or TextureInstalledPackCurrent(WizardDirValue) then Exit;
+  Manifest := AddBackslash(WizardDirValue) + 'textures\manifest.txt';
+  if not FileExists(Manifest) then Exit;
+  try
+    Result := Pos(Lowercase(GetSHA256OfFile(Manifest)), Lowercase('{#TextureOlderManifests}')) > 0;
+  except
+    Result := False;
+  end;
+  if Result then Log('An earlier official texture pack is installed; the update to this revision is offered, ticked.');
+#endif
+end;
+
+{ No pack, or one that is not ours: the plain install offer (unticked) }
+function TextureNewPackOffer: Boolean;
+begin
+  Result := TexturePackNeedsInstall and not TextureOlderPackInstalled;
+end;
+
 { Whether Setup will apply the small update instead of the full pack (for the Ready page and the free-space check) }
 function TextureWillUpdate: Boolean;
 begin
@@ -201,7 +228,7 @@ end;
 function WantTexturePack: Boolean;
 begin
 #ifdef TextureOptional
-  Result := WizardIsTaskSelected('hires') or
+  Result := WizardIsTaskSelected('hires') or WizardIsTaskSelected('hiresupdate') or
     (CompareText(ExpandConstant('{param:HIRES|no}'), 'yes') = 0);
 #else
   Result := True;

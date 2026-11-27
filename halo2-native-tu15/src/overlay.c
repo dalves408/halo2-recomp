@@ -34,7 +34,7 @@ extern volatile int g_audio_muted;
 extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt,
                         SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
 
-enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_SMOOTH, IT_ANISO, IT_FXAA, IT_MSAA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FS, IT_VSYNC, IT_FPS, IT_SMOOTH, IT_ANISO, IT_AA, IT_WIDE, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
 enum { MODE_NONE, MODE_QUIT, MODE_SET, MODE_BUILD };
 
 /* gpu/d3d11_backend.c: the first-start shader build (rc_prebuild_scan). */
@@ -44,7 +44,7 @@ enum { PAGE_VIDEO, PAGE_CONTROLS };
 enum { M_AIM, M_SENS, M_INV };
 
 static const char *const ITEM_NAME[IT_COUNT] = {
-    "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "FXAA", "MSAA",
+    "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "Anti-aliasing",
     "Widescreen (at next start)", "Hi-res textures", "Close menu", "Quit game"
 };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
@@ -411,12 +411,10 @@ static void open_settings(void)
 
 static int clamp_to(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static int aniso_ix(int a) { return a >= 16 ? 4 : a >= 8 ? 3 : a >= 4 ? 2 : a >= 2 ? 1 : 0; }
-static int msaa_ix(int a) { return a >= 8 ? 3 : a >= 4 ? 2 : a >= 2 ? 1 : 0; }
 
 static const int ANISO_VAL[5] = { 1, 2, 4, 8, 16 };
-static const int MSAA_VAL[4] = { 1, 2, 4, 8 };
 static const char *const ANISO_TXT[5] = { "Off", "2x", "4x", "8x", "16x" };
-static const char *const MSAA_TXT[4] = { "Off", "2x", "4x", "8x" };
+static const char *const AA_TXT[2] = { "Off", "SMAA" };
 static const char *const OFFON[2] = { "Off", "On" };
 static const char *const WIDE_TXT[4] = { "Off (4:3)", "Auto (monitor)", "16:9", "16:10" };
 static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500 };
@@ -461,8 +459,7 @@ static void item_text(int item, char *out, size_t n)
     }
     case IT_SMOOTH: snprintf(out, n, "%s", OFFON[s_edit.smooth_motion ? 1 : 0]); break;
     case IT_ANISO: snprintf(out, n, "%s", ANISO_TXT[aniso_ix(s_edit.anisotropy)]); break;
-    case IT_FXAA: snprintf(out, n, "%s", OFFON[s_edit.fxaa ? 1 : 0]); break;
-    case IT_MSAA: snprintf(out, n, "%s", MSAA_TXT[msaa_ix(s_edit.msaa)]); break;
+    case IT_AA: snprintf(out, n, "%s", AA_TXT[s_edit.aa ? 1 : 0]); break;
     case IT_WIDE: snprintf(out, n, "%s", WIDE_TXT[clamp_to(s_edit.widescreen, 0, 3)]); break;
     case IT_HIRES: snprintf(out, n, "%s", !hires_installed() ? "Not installed" : OFFON[s_edit.hires_textures ? 1 : 0]); break;
     case IT_CLOSE: snprintf(out, n, "F1 / Esc"); break;
@@ -512,11 +509,7 @@ static void nudge(int item, int dir)
         v = aniso_ix(s_edit.anisotropy) + dir;
         s_edit.anisotropy = ANISO_VAL[clamp_to(v, 0, 4)];
         break;
-    case IT_FXAA: s_edit.fxaa = !s_edit.fxaa; break;
-    case IT_MSAA:
-        v = msaa_ix(s_edit.msaa) + dir;
-        s_edit.msaa = MSAA_VAL[clamp_to(v, 0, 3)];
-        break;
+    case IT_AA: s_edit.aa = !s_edit.aa; break;
     case IT_WIDE: s_edit.widescreen = (clamp_to(s_edit.widescreen, 0, 3) + dir + 4) % 4; break;
     case IT_HIRES:
         if (!hires_installed()) return;          /* nothing to switch: the texture addon is not installed */
@@ -585,7 +578,7 @@ static void draw_settings(HDC hdc, int w, int h)
     if ((float)h / 640.0f < sc) sc = (float)h / 640.0f;
     ui_fonts_make(&f, sc);
     bw = ui_px(&f, 960);
-    bh = ui_px(&f, 680);   /* 640 + the Smooth motion row */
+    bh = ui_px(&f, 640);   /* one Anti-aliasing row in place of FXAA and MSAA (was 680) */
     x = (w - bw) / 2;
     y = (h - bh) / 2;
     SetRect(&all, 0, 0, w, h);

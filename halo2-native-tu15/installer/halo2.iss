@@ -97,7 +97,12 @@ Name: "{autodesktop}\Halo 2 Recomp"; Filename: "{app}\halo2_recomp.exe"; Working
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 #ifdef HasTextures
+#ifdef TexturePatchFrom
 Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download; only a small update if an earlier pack is installed)"; Flags: unchecked; Check: TexturePackNeedsInstall
+#else
+Name: "hiresupdate"; Description: "Update your hi-res texture pack to v{#TextureVersion} (about {#TextureDownloadBytes / 1000000} MB download). Your older pack has textures with wrong transparency and is removed either way: untick this to play with the original textures"; Check: TextureOlderPackInstalled
+Name: "hires"; Description: "Install the hi-res texture pack v{#TextureVersion} (4x textures, about {#TextureDownloadBytes / 1000000} MB download)"; Flags: unchecked; Check: TextureNewPackOffer
+#endif
 #endif
 
 [Run]
@@ -511,6 +516,17 @@ var
   Code: Integer;
   Msg, Params: String;
 begin
+#ifdef HasTextures
+  { An earlier official texture pack is not kept (2026-11-26, the user's rule): with the update
+    unticked it is removed here; with it ticked the new revision replaces it (texture_download_code.iss). }
+  if (CurStep = ssPostInstall) and TextureOlderPackInstalled and not WantTexturePack then
+  begin
+    if DelTree(ExpandConstant('{app}\textures'), True, True, True) then
+      Log('The earlier official texture pack was removed (the update was not chosen).')
+    else
+      Log('The earlier official texture pack could not be removed completely.');
+  end;
+#endif
   if CurStep = ssInstall then
     UpdateOnly := GameFilesPresent(ExpandConstant('{app}'));
   if (CurStep = ssPostInstall) and not UpdateOnly then

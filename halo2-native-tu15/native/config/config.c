@@ -20,8 +20,7 @@ static const char *const SCALE_TXT[] = { "Native", "1x", "2x", "3x", "4x", "5x" 
 static const char *const OFFON[] = { "Off", "On" };
 static const char *const ANISO_TXT[] = { "Off", "2x", "4x", "8x", "16x" };
 static const int ANISO_VAL[] = { 1, 2, 4, 8, 16 };
-static const char *const MSAA_TXT[] = { "Off", "2x", "4x", "8x" };
-static const int MSAA_VAL[] = { 1, 2, 4, 8 };
+static const char *const AA_TXT[] = { "Off", "SMAA" };
 static const char *const WIDE_TXT[] = { "Off (4:3)", "Auto (monitor)", "16:9", "16:10" };
 static const char *const SENS_TXT[] = { "25%", "50%", "75%", "100%", "125%", "150%", "200%",
                                         "250%", "300%", "400%", "500%" };
@@ -30,13 +29,13 @@ static const int SENS_VAL[] = { 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 5
 
 /* The settings as indexes into the lists above. */
 static const char *const FPS_TXT[] = { "Auto", "60 fps", "30 fps" };
-enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_SMOOTH, V_ANISO, V_FXAA, V_MSAA, V_WIDE, V_HIRES, V_COUNT };
+enum { V_SCALE, V_FS, V_VSYNC, V_FPS, V_SMOOTH, V_ANISO, V_AA, V_WIDE, V_HIRES, V_COUNT };
 static const char *const V_LABEL[V_COUNT] = {
-    "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "FXAA", "MSAA",
+    "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "Anti-aliasing",
     "Widescreen (at next start)", "Hi-res textures (at next start)",
 };
-static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, OFFON, ANISO_TXT, OFFON, MSAA_TXT, WIDE_TXT, OFFON };
-static const int V_N[V_COUNT] = { 6, 2, 2, 3, 2, 5, 2, 4, 4, 2 };
+static const char *const *const V_TXT[V_COUNT] = { SCALE_TXT, OFFON, OFFON, FPS_TXT, OFFON, ANISO_TXT, AA_TXT, WIDE_TXT, OFFON };
+static const int V_N[V_COUNT] = { 6, 2, 2, 3, 2, 5, 2, 4, 2 };
 static int s_v[V_COUNT];
 enum { M_AIM, M_SENS, M_INV };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
@@ -51,7 +50,7 @@ enum { B_RESET, B_SAVE, B_CANCEL, B_COUNT };
 static const char *const B_TXT[B_COUNT] = { "RESET DEFAULTS", "SAVE", "CANCEL" };
 static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
 #define BASE_W 960
-#define BASE_H 680   /* 640 + the Smooth motion row */
+#define BASE_H 640   /* one Anti-aliasing row in place of FXAA and MSAA (was 680) */
 static float s_scale = 1.0f;
 static int s_page = PAGE_CONTROLS;
 static int s_sel_row = -1, s_sel_col = -1, s_listen;
@@ -124,8 +123,8 @@ static void load_all(int defaults)
     s_v[V_FPS] = clampi(on ? (int)GetPrivateProfileIntA("display", "frame_rate", 0, path) : 0, 0, 2);
     s_v[V_SMOOTH] = on ? GetPrivateProfileIntA("display", "smooth_motion", 1, path) != 0 : 1;
     s_v[V_ANISO] = index_of(ANISO_VAL, 5, on ? (int)GetPrivateProfileIntA("display", "anisotropy", 1, path) : 1);
-    s_v[V_FXAA] = on && GetPrivateProfileIntA("display", "fxaa", 0, path) != 0;
-    s_v[V_MSAA] = index_of(MSAA_VAL, 4, on ? (int)GetPrivateProfileIntA("display", "msaa", 1, path) : 1);
+    /* SMAA by default; a file from before the one setting has no "aa" key (settings.c) */
+    s_v[V_AA] = on ? GetPrivateProfileIntA("display", "aa", 1, path) != 0 : 1;
     s_v[V_WIDE] = clampi(on ? (int)GetPrivateProfileIntA("display", "widescreen", 2, path) : 2, 0, 3);
     s_v[V_HIRES] = on ? GetPrivateProfileIntA("display", "hires_textures", 1, path) != 0 : 1;
     s_m[M_AIM] = on && GetPrivateProfileIntA("input", "mouse_aim", 0, path) != 0;
@@ -154,9 +153,7 @@ static int save_all(HWND owner)
     WritePrivateProfileStringA("display", "smooth_motion", s_v[V_SMOOTH] ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", ANISO_VAL[s_v[V_ANISO]]);
     WritePrivateProfileStringA("display", "anisotropy", buf, path);
-    WritePrivateProfileStringA("display", "fxaa", s_v[V_FXAA] ? "1" : "0", path);
-    snprintf(buf, sizeof buf, "%d", MSAA_VAL[s_v[V_MSAA]]);
-    WritePrivateProfileStringA("display", "msaa", buf, path);
+    WritePrivateProfileStringA("display", "aa", s_v[V_AA] ? "1" : "0", path);
     snprintf(buf, sizeof buf, "%d", s_v[V_WIDE]);
     WritePrivateProfileStringA("display", "widescreen", buf, path);
     WritePrivateProfileStringA("display", "hires_textures", s_v[V_HIRES] ? "1" : "0", path);

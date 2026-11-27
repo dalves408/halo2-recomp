@@ -9,8 +9,7 @@ typedef struct Halo2Settings {
     int fullscreen;       /* 0/1 */
     int vsync;            /* 0/1 */
     int anisotropy;       /* 1=off, or 2/4/8/16 */
-    int fxaa;             /* 0/1 */
-    int msaa;             /* 1=off, or 2/4/8 */
+    int aa;               /* anti-aliasing: 0 off, 1 SMAA (high preset); replaced FXAA and MSAA (2026-11-26) */
     int widescreen;       /* 0 off (4:3), 1 auto (the monitor's shape), 2 16:9 (default), 3 16:10; at start */
     int hires_textures;   /* 0/1: load the hi-res pack in <game folder>\textures (default on); live */
     int mouse_aim;        /* 0/1: mouse turns the view (h2_mouse.c); off in Xbox Live */

@@ -4634,6 +4634,82 @@ int xbox_ContiguousGpuBytesEqual(uint32_t physical, const void *snapshot, size_t
 #endif
 }
 
+/* Like xbox_ContiguousGpuBytesEqual, but compares only 16 spread 32-byte pieces and the last
+ * 32 bytes: a cheap per-frame check for a texture that has stayed unchanged (2026-11-26). */
+int xbox_ContiguousGpuBytesSampleEqual(uint32_t physical, const void *snapshot, size_t bytes)
+{
+#ifdef _WIN32
+    int equal = 1, i;
+    const uint8_t *s = (const uint8_t *)snapshot;
+    if (!snapshot || !bytes || physical >= XBOX_CONTIG_SIZE ||
+        bytes > XBOX_CONTIG_SIZE - physical)
+        return 0;
+    AcquireSRWLockShared(&g_contig_gpu_view_lock);
+    if (!g_contig_gpu_view)
+        equal = 0;
+    else if (bytes <= 17 * 32)
+        equal = memcmp(g_contig_gpu_view + physical, s, bytes) == 0;
+    else {
+        size_t step = (bytes - 32) / 16;
+        for (i = 0; i < 16 && equal; i++)
+            equal = memcmp(g_contig_gpu_view + physical + i * step, s + i * step, 32) == 0;
+        if (equal)
+            equal = memcmp(g_contig_gpu_view + physical + bytes - 32, s + bytes - 32, 32) == 0;
+    }
+    ReleaseSRWLockShared(&g_contig_gpu_view_lock);
+    return equal;
+#else
+    (void)physical;
+    (void)snapshot;
+    (void)bytes;
+    return 0;
+#endif
+}
+
+/* Writes the host side makes into guest RAM (file reads, the GPU back end's clears and
+ * readbacks), by 4 KB page of the 64 MB physical space: the write counter at each page's last
+ * write. A texture verified when the counter read N is untouched by them while every page it
+ * spans is still <= N. Guest code's own writes are not seen here. */
+#define GW_SPACE 0x04000000u
+#define GW_PAGES (GW_SPACE >> 12)
+static volatile LONG s_gw_seq = 1;
+static LONG s_gw_page[GW_PAGES];
+
+void xbox_NoteGuestWrite(uint32_t va, uint32_t bytes)
+{
+    uint32_t lo, n, p;
+    LONG seq;
+    if (!bytes)
+        return;
+    seq = InterlockedIncrement(&s_gw_seq);
+    lo = (va & (GW_SPACE - 1)) >> 12;
+    n = bytes >= GW_SPACE ? GW_PAGES : ((((va & 0xFFFu) + bytes - 1) >> 12) + 1);
+    if (n > GW_PAGES)
+        n = GW_PAGES;
+    for (p = 0; p < n; p++)
+        InterlockedExchange(&s_gw_page[(lo + p) & (GW_PAGES - 1)], seq);
+}
+
+uint32_t xbox_GuestWriteSeq(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&s_gw_seq, 0, 0);
+}
+
+int xbox_GuestWrittenSince(uint32_t va, uint32_t bytes, uint32_t seq)
+{
+    uint32_t lo, n, p;
+    if (!bytes)
+        return 0;
+    lo = (va & (GW_SPACE - 1)) >> 12;
+    n = bytes >= GW_SPACE ? GW_PAGES : ((((va & 0xFFFu) + bytes - 1) >> 12) + 1);
+    if (n > GW_PAGES)
+        n = GW_PAGES;
+    for (p = 0; p < n; p++)
+        if ((uint32_t)s_gw_page[(lo + p) & (GW_PAGES - 1)] > seq)
+            return 1;
+    return 0;
+}
+
 /* High-water mark of the window: everything below it was, at some point,
  * memory a MmAllocateContiguousMemory call returned.
  *

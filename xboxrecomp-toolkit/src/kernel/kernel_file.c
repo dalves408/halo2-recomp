@@ -524,7 +524,35 @@ NTSTATUS __stdcall xbox_NtReadFile(
     return st;
 }
 
+/* A read lands in guest RAM: noted (before and after) for the GPU back end's texture checks,
+ * which trust an unchanged texture between full compares (xbox_memory_layout.c). */
+extern ptrdiff_t g_xbox_mem_offset;
+void xbox_NoteGuestWrite(uint32_t va, uint32_t bytes);
+static void note_read_target(const void *buffer, ULONG length)
+{
+    uintptr_t host = (uintptr_t)buffer, base = (uintptr_t)g_xbox_mem_offset;
+    if (buffer && length && host >= base && host - base < 0x100000000ull)
+        xbox_NoteGuestWrite((uint32_t)(host - base), (uint32_t)length);
+}
+
+static NTSTATUS nt_read_file_inner(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset);
+
 static NTSTATUS nt_read_file(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    NTSTATUS st_out;
+    note_read_target(Buffer, Length);
+    st_out = nt_read_file_inner(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset);
+    note_read_target(Buffer, Length);
+    return st_out;
+}
+
+static NTSTATUS nt_read_file_inner(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)

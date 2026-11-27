@@ -19,7 +19,14 @@
  *
  * Every DDS loads once, on the first texture that asks for it, and stays on
  * the GPU; texture entries hold their own references. The pack can be
- * switched off and on while the game runs (texpack_set_active). */
+ * switched off and on while the game runs (texpack_set_active).
+ *
+ * Loading (2026-11-26): loaded on the GPU-command thread, a burst of new textures
+ * stalled it 40-130 ms in the Cairo intro (565 files, up to 32 ms each). Now two
+ * loader threads read and check the file; the GPU-command thread only creates the
+ * texture from memory, at most ~3 ms of that in any 16 ms, and the game's own texture
+ * is drawn until then (the lookup says "pending" and is asked again).
+ * RECOMP_TEX_PACK_ASYNC=0 loads on the spot as before (test). */
 #include "tex_pack.h"
 
 #include <stdio.h>
@@ -35,7 +42,11 @@ typedef struct {
 
 typedef struct {
     char *path;
-    int state;              /* 0 not loaded, 1 loaded, -1 unusable */
+    volatile LONG state;    /* 0 not loaded, 2 queued, 3 read (ready to create), 1 loaded, -1 unusable */
+    uint8_t *data;          /* the file, read and checked on a loader thread */
+    D3D11_SUBRESOURCE_DATA *init;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
     unsigned levels, w, h, cube;
@@ -323,7 +334,7 @@ static unsigned format_info(DXGI_FORMAT *fmt, int *compressed)
     }
 }
 
-static const char *load_dds(ID3D11Device *dev, PackFile *pf)
+static const char *parse_dds(PackFile *pf)
 {
     D3D11_SUBRESOURCE_DATA init[6 * 16];
     D3D11_TEXTURE2D_DESC td;
@@ -337,7 +348,6 @@ static const char *load_dds(ID3D11Device *dev, PackFile *pf)
     unsigned unit;
     int compressed;
     FILE *f = fopen(pf->path, "rb");
-    HRESULT hr;
 
     if (!f)
         return "cannot open";
@@ -458,9 +468,6 @@ static const char *load_dds(ID3D11Device *dev, PackFile *pf)
     td.Usage = D3D11_USAGE_IMMUTABLE;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     td.MiscFlags = faces == 6 ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
-    hr = ID3D11Device_CreateTexture2D(dev, &td, init, &pf->tex);
-    if (FAILED(hr))
-        FAIL("texture creation failed");
     memset(&sv, 0, sizeof sv);
     sv.Format = fmt;
     if (faces == 6) {
@@ -470,19 +477,138 @@ static const char *load_dds(ID3D11Device *dev, PackFile *pf)
         sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         sv.Texture2D.MipLevels = mips;
     }
-    hr = ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)pf->tex, &sv, &pf->srv);
-    if (FAILED(hr)) {
-        ID3D11Texture2D_Release(pf->tex);
-        pf->tex = NULL;
-        FAIL("view creation failed");
-    }
+    pf->init = (D3D11_SUBRESOURCE_DATA *)malloc(sizeof *pf->init * faces * mips);
+    if (!pf->init)
+        FAIL("out of memory");
+    memcpy(pf->init, init, sizeof *pf->init * faces * mips);
+    pf->td = td;
+    pf->sv = sv;
+    pf->data = data;
 #undef FAIL
-    free(data);
     pf->levels = mips;
     pf->w = w;
     pf->h = h;
     pf->cube = faces == 6;
     return NULL;
+}
+
+/* The GPU texture from a file a loader thread read (GPU-command thread); the file's memory goes. */
+static const char *create_dds(ID3D11Device *dev, PackFile *pf)
+{
+    const char *err = NULL;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &pf->td, pf->init, &pf->tex)))
+        err = "texture creation failed";
+    else if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)pf->tex, &pf->sv, &pf->srv))) {
+        ID3D11Texture2D_Release(pf->tex);
+        pf->tex = NULL;
+        err = "view creation failed";
+    }
+    free(pf->data);
+    free(pf->init);
+    pf->data = NULL;
+    pf->init = NULL;
+    return err;
+}
+
+/* ---- loader threads -------------------------------------------------------- */
+
+static int s_async = -1;
+static ID3D11Device *volatile s_mt_dev;   /* set when the device may create from other threads */
+static SRWLOCK s_dev_lock = SRWLOCK_INIT; /* held shared while a loader creates on s_mt_dev */
+
+/* Exclusive: returns once no loader is creating on the old device (released after this). */
+void texpack_set_device(ID3D11Device *dev, int multithreaded)
+{
+    AcquireSRWLockExclusive(&s_dev_lock);
+    s_mt_dev = multithreaded ? dev : NULL;
+    ReleaseSRWLockExclusive(&s_dev_lock);
+}
+static CRITICAL_SECTION s_q_lock;
+static CONDITION_VARIABLE s_q_cv;
+static int *s_q;                /* file indexes in request order; each file at most once */
+static int s_q_head, s_q_tail;
+static double s_qpf_ms;
+static LONGLONG s_budget_start, s_budget_spent;
+
+static DWORD WINAPI loader_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        PackFile *pf;
+        const char *err;
+        EnterCriticalSection(&s_q_lock);
+        while (s_q_head == s_q_tail)
+            SleepConditionVariableCS(&s_q_cv, &s_q_lock, INFINITE);
+        pf = &s_files[s_q[s_q_head++]];
+        LeaveCriticalSection(&s_q_lock);
+        err = parse_dds(pf);
+        AcquireSRWLockShared(&s_dev_lock);
+        if (!err && s_mt_dev) {         /* the GPU texture too: nothing left for the GPU-command thread */
+            err = create_dds(s_mt_dev, pf);
+            ReleaseSRWLockShared(&s_dev_lock);
+            if (!err) {
+                InterlockedIncrement((volatile LONG *)&s_loaded);
+                InterlockedExchange(&pf->state, 1);
+                continue;
+            }
+        } else
+            ReleaseSRWLockShared(&s_dev_lock);
+        if (err) {
+            fprintf(stderr, "[TEXPACK] %s: %s; the original texture stays\n", pf->path, err);
+            fflush(stderr);
+        }
+        InterlockedExchange(&pf->state, err ? -1 : 3);
+    }
+}
+
+static int async_on(void)
+{
+    if (s_async < 0) {
+        const char *e = getenv("RECOMP_TEX_PACK_ASYNC");
+        LARGE_INTEGER f;
+        int i;
+        s_async = !(e && e[0] == '0') && s_nfiles > 0;
+        QueryPerformanceFrequency(&f);
+        s_qpf_ms = (double)f.QuadPart / 1000.0;
+        if (s_async) {
+            s_q = (int *)malloc(sizeof *s_q * (size_t)s_nfiles);
+            if (!s_q) {
+                s_async = 0;
+                return 0;
+            }
+            InitializeCriticalSection(&s_q_lock);
+            InitializeConditionVariable(&s_q_cv);
+            for (i = 0; i < 2; i++) {
+                HANDLE h = CreateThread(NULL, 0, loader_thread, NULL, 0, NULL);
+                if (h) {
+                    SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
+                    CloseHandle(h);
+                }
+            }
+        }
+    }
+    return s_async;
+}
+
+static void enqueue(int file)
+{
+    EnterCriticalSection(&s_q_lock);
+    if (s_q_tail < s_nfiles)
+        s_q[s_q_tail++] = file;
+    LeaveCriticalSection(&s_q_lock);
+    WakeConditionVariable(&s_q_cv);
+}
+
+/* Creation time allowed: ~3 ms in any 16 ms window (one 60 Hz frame). */
+static int budget_left(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if ((double)(now.QuadPart - s_budget_start) > 16.0 * s_qpf_ms) {
+        s_budget_start = now.QuadPart;
+        s_budget_spent = 0;
+    }
+    return (double)s_budget_spent < 3.0 * s_qpf_ms;
 }
 
 int texpack_lookup(ID3D11Device *dev, uint64_t hash, unsigned width, unsigned height,
@@ -499,16 +625,32 @@ int texpack_lookup(ID3D11Device *dev, uint64_t hash, unsigned width, unsigned he
     if (!k)
         return 0;
     pf = &s_files[k->file];
-    if (pf->state == 0) {
-        const char *err = load_dds(dev, pf);
+    if (pf->state == 0 && async_on()) {
+        pf->state = 2;
+        enqueue(k->file);
+        return 2;
+    }
+    if (pf->state == 2 || (pf->state == 3 && !budget_left()))
+        return 2;
+    if (pf->state == 0 || pf->state == 3) {
+        LARGE_INTEGER q0, q1, qf;
+        const char *err;
+        QueryPerformanceCounter(&q0);
+        err = pf->state == 3 ? NULL : parse_dds(pf);
+        if (!err)
+            err = create_dds(dev, pf);
+        QueryPerformanceCounter(&q1);
+        QueryPerformanceFrequency(&qf);
+        s_budget_spent += q1.QuadPart - q0.QuadPart;
         pf->state = err ? -1 : 1;
         if (err) {
             fprintf(stderr, "[TEXPACK] %s: %s; the original texture stays\n", pf->path, err);
         } else {
             s_loaded++;
             if (s_log)
-                fprintf(stderr, "[TEXPACK] loaded %s (%ux%u, %u levels%s)\n", pf->path,
-                        pf->w, pf->h, pf->levels, pf->cube ? ", cube" : "");
+                fprintf(stderr, "[TEXPACK] loaded %s (%ux%u, %u levels%s) in %.2f ms\n", pf->path,
+                        pf->w, pf->h, pf->levels, pf->cube ? ", cube" : "",
+                        (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart);
         }
         fflush(stderr);
     }
