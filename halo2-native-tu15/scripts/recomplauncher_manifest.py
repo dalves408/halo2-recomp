@@ -26,6 +26,7 @@ PROGRAMS = {
     'halo2_recomp.exe': 'halo2_recomp.exe',
     'halo2_downloader.exe': 'halo2_downloader.exe',
     'halo2_import.exe': 'halo2_import.exe',
+    'halo2_mappack.exe': 'halo2_mappack.exe',   # the Map Pack disc's maps and videos (config.exe EXTRAS)
     'config.exe': 'Config.exe',
     'Insignia Setup.exe': 'Insignia Setup.exe',
     'Halo2 Updater.exe': 'Halo2 Updater.exe',

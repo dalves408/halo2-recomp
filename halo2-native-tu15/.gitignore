@@ -53,3 +53,5 @@ analysis/
 build-ninja/
 SaveData/
 xbox_kernel.log
+# the Map Pack disc's bonus videos, copied by halo2_mappack (never game data in git)
+extras/

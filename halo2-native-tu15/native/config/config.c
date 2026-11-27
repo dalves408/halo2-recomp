@@ -14,6 +14,7 @@
 #include "halo_ui.h"
 #include "update_check.h"
 #include "version.h"
+#include "extras.h"
 
 /* resolution_scale 0 = Native (the window's own resolution, as in the F1 menu), 1..5 = times 640x480 */
 static const char *const SCALE_TXT[] = { "Native", "1x", "2x", "3x", "4x", "5x" };
@@ -47,10 +48,10 @@ static int s_m[UI_MOUSE_ROWS];
 static KbMap s_map;
 
 /* The window. */
-enum { PAGE_VIDEO, PAGE_CONTROLS };
+enum { PAGE_VIDEO, PAGE_CONTROLS, PAGE_EXTRAS, PAGE_COUNT };
 enum { B_RESET, B_SAVE, B_CANCEL, B_COUNT };
 static const char *const B_TXT[B_COUNT] = { "RESET DEFAULTS", "SAVE", "CANCEL" };
-static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
+static const char *const TABS[PAGE_COUNT] = { "VIDEO", "CONTROLS", "EXTRAS" };
 #define BASE_W 960
 #define BASE_H 640   /* one Anti-aliasing row in place of FXAA and MSAA (was 680) */
 static float s_scale = 1.0f;
@@ -60,7 +61,7 @@ static int s_hover_row = -1, s_hover_col = -1, s_hover_btn = -1, s_hover_tab = -
 static char s_status[160];
 static UiHit s_hits[160];
 static int s_nhits;
-static RECT s_tab_r[2], s_btn_r[B_COUNT], s_upd_r, s_report_r;
+static RECT s_tab_r[PAGE_COUNT], s_btn_r[B_COUNT], s_upd_r, s_report_r;
 static int s_hover_upd, s_hover_report, s_upd_state = -1;
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -224,7 +225,7 @@ static void draw(HDC dc, int w, int h)
     SetRect(&r, 0, 0, w, h);
     ui_background(dc, &r);
     SetRect(&band, px(16), px(16), w - px(16), px(84));
-    ui_header(dc, &f, &band, "SETTINGS", TABS, 2, s_page, 0, s_page == PAGE_CONTROLS, s_tab_r);
+    ui_header(dc, &f, &band, "SETTINGS", TABS, PAGE_COUNT, s_page, 0, s_page == PAGE_CONTROLS, s_tab_r);
     /* Report a problem: in the title band, on both pages (left of the wield legend) */
     SetRect(&s_report_r, band.right - px(150) - px(200), band.top + px(14), band.right - px(150), band.bottom - px(14));
     ui_button(dc, &f, &s_report_r, "REPORT A PROBLEM", 0, s_hover_report);
@@ -246,6 +247,10 @@ static void draw(HDC dc, int w, int h)
         }
         SetRect(&area, px(32), px(100), w - px(32), h - px(76));
         s_nhits = ui_controls(dc, &f, &area, &c, s_hits, (int)(sizeof s_hits / sizeof s_hits[0]));
+    } else if (s_page == PAGE_EXTRAS) {
+        RECT area;
+        SetRect(&area, px(32), px(96), w - px(32), h - px(72));
+        extras_draw(dc, &f, &area);
     } else {
         RECT note, sec;
         SetRect(&sec, px(200), px(96), px(760), px(126));
@@ -279,6 +284,8 @@ static void draw(HDC dc, int w, int h)
         }
         SetRect(&st, px(36), by, bx - px(10), by + bh);
         SetRect(&s_upd_r, 0, 0, 0, 0);
+        if (!s_status[0] && extras_status()[0])
+            snprintf(s_status, sizeof s_status, "%s", extras_status());
         if (!s_listen && !s_status[0]) {
             UpdInfo u;
             upd_get(&u);
@@ -295,6 +302,7 @@ static void draw(HDC dc, int w, int h)
                          : (s_status[0] ? s_status
                             : (s_page == PAGE_CONTROLS
                                ? "Click a box, then press a key or mouse button. Right-click a box to clear it."
+                               : s_page == PAGE_EXTRAS ? "Your Map Pack disc's maps and bonus videos."
                                : "Click the arrows to change a setting.")),
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
@@ -463,6 +471,17 @@ static void do_report(HWND h)
 
 static void refresh(HWND h) { InvalidateRect(h, NULL, FALSE); }
 
+/* A copy from the Map Pack disc or a re-encode still running: stop it first? */
+static int ok_to_close(HWND h)
+{
+    if (!extras_busy()) return 1;
+    if (MessageBoxA(h, "The Map Pack disc is still being copied, or the videos re-encoded. Stop it and close?",
+                    "Halo 2 Recomp", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return 0;
+    extras_cancel();
+    return 1;
+}
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -471,6 +490,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         load_all(0);
         install_root(root, sizeof root);
         upd_start(root);                  /* quiet; at most once every 2 hours */
+        extras_init(h, root);
         SetTimer(h, 1, 500, NULL);
         return 0;
     }
@@ -514,7 +534,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 if (PtInRect(&r, p)) row = i;
             }
         for (i = 0; i < B_COUNT; i++) if (PtInRect(&s_btn_r[i], p)) b = i;
-        for (i = 0; i < 2; i++) if (PtInRect(&s_tab_r[i], p)) t = i;
+        for (i = 0; i < PAGE_COUNT; i++) if (PtInRect(&s_tab_r[i], p)) t = i;
+        if (s_page == PAGE_EXTRAS && extras_hover(x, y)) refresh(h);
         if (row != s_hover_row || col != s_hover_col || b != s_hover_btn || t != s_hover_tab ||
             PtInRect(&s_upd_r, p) != s_hover_upd || PtInRect(&s_report_r, p) != s_hover_report) {
             s_hover_row = row; s_hover_col = col; s_hover_btn = b; s_hover_tab = t;
@@ -560,7 +581,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (m == WM_LBUTTONDOWN) {
-            for (i = 0; i < 2; i++)
+            for (i = 0; i < PAGE_COUNT; i++)
                 if (PtInRect(&s_tab_r[i], p) && s_page != i) {
                     s_page = i; s_sel_row = s_sel_col = -1; s_status[0] = 0;
                     refresh(h);
@@ -572,15 +593,19 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                         load_all(1);
                         snprintf(s_status, sizeof s_status, "Defaults restored. Save to keep them.");
                     } else if (i == B_SAVE) {
-                        if (save_all(h)) DestroyWindow(h);
+                        if (ok_to_close(h) && save_all(h)) DestroyWindow(h);
                         return 0;
                     } else {
-                        DestroyWindow(h);
+                        if (ok_to_close(h)) DestroyWindow(h);
                         return 0;
                     }
                     refresh(h);
                     return 0;
                 }
+        }
+        if (m == WM_LBUTTONDOWN && s_page == PAGE_EXTRAS) {
+            s_status[0] = 0;
+            if (extras_click(h, x, y)) { refresh(h); return 0; }
         }
         if (hit(x, y, &row, &col)) {
             s_status[0] = 0;
@@ -615,7 +640,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             refresh(h);
             return 0;
         }
-        if (w == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        if (w == VK_ESCAPE) { if (ok_to_close(h)) DestroyWindow(h); return 0; }
         if (m == WM_SYSKEYDOWN) break;
         return 0;
     case WM_SYSCHAR:
@@ -629,10 +654,15 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         refresh(h);
         return 0;
     }
+    case WM_APP_EXTRAS:              /* a copy or re-encode moved on */
+        s_status[0] = 0;
+        refresh(h);
+        return 0;
     case WM_CLOSE:
-        DestroyWindow(h);
+        if (ok_to_close(h)) DestroyWindow(h);
         return 0;
     case WM_DESTROY:
+        extras_cancel();
         PostQuitMessage(0);
         return 0;
     }

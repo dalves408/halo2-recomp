@@ -83,6 +83,7 @@ set(GAME_SOURCES
     src/update_check.c
     src/h2_release.c
     src/h2_diag.c
+    src/h2_content.c
     src/gpu/d3d11_backend.c
     src/gpu/rc_hlsl.c
     src/gpu/render_scale.c
@@ -238,10 +239,12 @@ if(MSVC AND HALO2_PERF_LTO)
 endif()
 
 # Halo 2 Native 1.5 settings editor (Video tab). Same ini as the F1 overlay.
-add_executable(halo2_config WIN32 native/config/config.c src/keybinds.c src/halo_ui.c src/update_check.c res/config.rc)
+add_executable(halo2_config WIN32 native/config/config.c native/config/extras.c native/config/media.c
+    src/keybinds.c src/halo_ui.c src/update_check.c res/config.rc)
 target_include_directories(halo2_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set_target_properties(halo2_config PROPERTIES OUTPUT_NAME "Config")
-target_link_libraries(halo2_config PRIVATE user32 gdi32 comctl32 shell32 winhttp version advapi32)
+target_link_libraries(halo2_config PRIVATE user32 gdi32 comctl32 shell32 winhttp version advapi32
+    comdlg32 winmm mfplat mfreadwrite mfuuid ole32)
 add_custom_command(TARGET halo2_config POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:halo2_config>"
@@ -265,6 +268,13 @@ target_link_libraries(halo2_updater PRIVATE user32 gdi32 shell32 winhttp)
 add_executable(halo2_import installer/halo2_import.c res/tools.rc)
 target_compile_definitions(halo2_import PRIVATE UNICODE _UNICODE)
 target_link_libraries(halo2_import PRIVATE bcrypt shell32)
+
+# halo2_mappack.exe: the map packs (and, if asked, the bonus videos) from the player's Halo 2 Multiplayer Map Pack
+# disc, every file checked against its pin (installer/mappack_manifest.h, installer/gen_mappack_manifest.py).
+# Installed beside the game: Setup and config.exe's EXTRAS page both run it.
+add_executable(halo2_mappack installer/halo2_mappack.c res/tools.rc)
+target_compile_definitions(halo2_mappack PRIVATE UNICODE _UNICODE)
+target_link_libraries(halo2_mappack PRIVATE bcrypt shell32)
 
 # halo2_texture_download.exe: the Setups' download helper for the hi-res texture pack's .bin parts (resumable, checked
 # against the pinned size and SHA-256). Not installed; Setup runs it from its temp folder.
@@ -313,5 +323,6 @@ if(MSVC AND H2_RELEASE)
         target_link_options(${t} PRIVATE /ENTRY:mainCRTStartup /PDBALTPATH:${t}.pdb)
     endforeach()
     target_link_options(halo2_import PRIVATE /PDBALTPATH:halo2_import.pdb)
+    target_link_options(halo2_mappack PRIVATE /PDBALTPATH:halo2_mappack.pdb)
     target_link_options(halo2_texture_download PRIVATE /PDBALTPATH:halo2_texture_download.pdb)
 endif()

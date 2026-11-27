@@ -840,6 +840,12 @@ int main(void)
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+#ifndef H2_DOWNLOADER
+    {   /* the map packs signed for the hard-drive key just set (h2_content.c) */
+        extern void halo2_content_sign(void);
+        halo2_content_sign();
+    }
+#endif
     xbox_OhciInit();
     /* The MCPX Ethernet controller: System Link, and Xbox Live through
      * Insignia with the player's own console identity (RECOMP_NET=1). */

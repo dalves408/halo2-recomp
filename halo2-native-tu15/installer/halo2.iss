@@ -68,6 +68,8 @@ Source: "{#BuildDir}\halo2_downloader.exe"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#BuildDir}\Config.exe"; DestDir: "{app}"; DestName: "config.exe"; Flags: ignoreversion
 Source: "{#BuildDir}\Insignia Setup.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\Halo2 Updater.exe"; DestDir: "{app}"; Flags: ignoreversion
+; the Multiplayer Map Pack disc's maps and videos: run by Setup and by config.exe's EXTRAS page
+Source: "{#BuildDir}\halo2_mappack.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; controllers (SDL3, zlib license): the game needs it beside halo2_recomp.exe
 Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\third_party\SDL3-3.4.20\LICENSE.txt"; DestDir: "{app}"; DestName: "SDL3-LICENSE.txt"; Flags: ignoreversion skipifsourcedoesntexist
@@ -110,8 +112,10 @@ Filename: "{app}\halo2_recomp.exe"; Description: "Play Halo 2 now"; Flags: nowai
 
 [Code]
 var
-  SrcPage, UpdatePage: TWizardPage;
-  SrcEdit: TNewEdit;
+  SrcPage, UpdatePage, MapPage: TWizardPage;
+  SrcEdit, MapEdit: TNewEdit;
+  MapVideos: TNewCheckBox;
+  MapError: String;
   UpdateOnly, UpdateMode: Boolean;
   OldDir, OldVer, NewVer: String;
   VerRel: Integer;          { -1: the installed version is older, 0: same, 1: newer than this Setup }
@@ -303,6 +307,29 @@ begin
     SrcEdit.Text := D;
 end;
 
+procedure BrowseMapFile(Sender: TObject);
+var
+  F: String;
+begin
+  F := MapEdit.Text;
+  if GetOpenFileName('Select the Map Pack disc image', F, '', 'Xbox disc images (*.iso;*.xiso)|*.iso;*.xiso|All files (*.*)|*.*', 'iso') then
+    MapEdit.Text := F;
+end;
+
+procedure BrowseMapFolder(Sender: TObject);
+var
+  D: String;
+begin
+  D := MapEdit.Text;
+  if BrowseForFolder('Select the folder that holds the Map Pack disc''s files', D, False) then
+    MapEdit.Text := D;
+end;
+
+function WantMapPack: Boolean;
+begin
+  Result := (MapEdit <> nil) and (Trim(MapEdit.Text) <> '');
+end;
+
 function MakeLabel(Page: TWizardPage; Text: String; Top: Integer): TNewStaticText;
 begin
   Result := TNewStaticText.Create(Page);
@@ -347,6 +374,42 @@ begin
 
   L := MakeLabel(SrcPage, 'Title update 1.5 is included: Setup brings the game to 1.5 from your disc''s own files.',
     B1.Top + B1.Height + ScaleY(18));
+
+  { Optional: the Halo 2 Multiplayer Map Pack disc. Its maps are always installed from it; its videos only when
+    ticked. config.exe's EXTRAS page can add the disc later too. }
+  MapPage := CreateCustomPage(SrcPage.ID, 'Multiplayer Map Pack (optional)',
+    'If you have the Halo 2 Multiplayer Map Pack disc, Setup can add its maps and bonus videos.');
+  L := MakeLabel(MapPage, 'Halo 2 Multiplayer Map Pack disc: a disc image (.iso, .xiso) or a folder with its files. ' +
+    'Leave this empty to skip it.', 0);
+  MapEdit := TNewEdit.Create(MapPage);
+  MapEdit.Parent := MapPage.Surface;
+  MapEdit.Left := 0; MapEdit.Top := L.Top + L.Height + ScaleY(4);
+  MapEdit.Width := MapPage.SurfaceWidth;
+  MapEdit.Text := ExpandConstant('{param:MAPPACK|}');   { setup /MAPPACK=<image or folder> }
+  B1 := TNewButton.Create(MapPage);
+  B1.Parent := MapPage.Surface;
+  B1.Caption := 'Disc image...';
+  B1.Left := 0; B1.Top := MapEdit.Top + MapEdit.Height + ScaleY(6);
+  B1.Width := ScaleX(110);
+  B1.OnClick := @BrowseMapFile;
+  B2 := TNewButton.Create(MapPage);
+  B2.Parent := MapPage.Surface;
+  B2.Caption := 'Folder...';
+  B2.Left := B1.Left + B1.Width + ScaleX(8); B2.Top := B1.Top;
+  B2.Width := ScaleX(110);
+  B2.OnClick := @BrowseMapFolder;
+  L := MakeLabel(MapPage, 'Maps: Bonus Map Pack (Containment, Warlock), Killtacular (Sanctuary, Turf) and Maptacular ' +
+    '(Backwash, Elongation, Gemini, Relic, Terminal), about 430 MB. Blastacular was never on a disc: download it ' +
+    'in the game through Xbox Live (Insignia).', B1.Top + B1.Height + ScaleY(16));
+  MapVideos := TNewCheckBox.Create(MapPage);
+  MapVideos.Parent := MapPage.Surface;
+  MapVideos.Left := 0; MapVideos.Top := L.Top + L.Height + ScaleY(14);
+  MapVideos.Width := MapPage.SurfaceWidth; MapVideos.Height := ScaleY(20);
+  MapVideos.Caption := 'Also copy the bonus videos (about 2.8 GB)';
+  MapVideos.Checked := ExpandConstant('{param:MAPVIDEOS|0}') = '1';
+  L := MakeLabel(MapPage, 'Another Day at the Beach, Halo 2: Killtacular, the audio test, the Halo 2 announcement ' +
+    'trailer and Halo E3 2000. Watch them on the EXTRAS page of Halo 2 Recomp Settings, which can also re-encode ' +
+    'them to H.264 to save space.', MapVideos.Top + MapVideos.Height + ScaleY(6));
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
@@ -369,9 +432,18 @@ begin
     WizardForm.FinishedLabel.Caption := 'Halo 2 Recomp ' + NewVer + ' is installed.' + #13#10#13#10 +
       'Settings and controls: the Halo 2 Recomp Settings shortcut, or F1 in the game. ' +
       'For Xbox Live through Insignia, run Halo 2 Recomp Insignia Setup first.';
+  if (CurPageID = wpFinished) and WantMapPack and (MapError = '') then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'The Multiplayer Map Pack maps are installed.';
   if (CurPageID = wpFinished) and WantTexturePack and TexturePackInstalled then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
       'The hi-res texture pack is installed in the textures folder and loads when the game starts.';
+end;
+
+function MapPackMemo(Space, NewLine: String): String;
+begin
+  Result := 'Multiplayer Map Pack maps from:' + NewLine + Space + Trim(MapEdit.Text);
+  if MapVideos.Checked then Result := Result + NewLine + 'Bonus videos: copied (about 2.8 GB)';
 end;
 
 { The "Ready to install" page says what is about to happen. }
@@ -393,6 +465,7 @@ begin
     S := S + NewLine + Space + WizardDirValue + NewLine + NewLine +
          'Only the program files are replaced. Your game files, saves, settings and console identity are kept.';
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
+    if WantMapPack then S := S + NewLine + NewLine + MapPackMemo(Space, NewLine);
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
       S := S + NewLine + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
@@ -405,6 +478,7 @@ begin
     S := S + 'Game files (about 4.7 GB) from:' + NewLine + Space + Trim(SrcEdit.Text) + NewLine;
     S := S + 'Title update 1.5: made from your disc' + NewLine;
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
+    if WantMapPack then S := S + NewLine + MapPackMemo(Space, NewLine) + NewLine;
 #ifdef HasTextures
     if WantTexturePack and TexturePackNeedsInstall then
       S := S + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
@@ -452,6 +526,13 @@ begin
   begin
     QuitNow := True;
     WizardForm.Close;
+    Result := False;
+    Exit;
+  end;
+  if (CurPageID = MapPage.ID) and WantMapPack and
+     not (FileExists(Trim(MapEdit.Text)) or DirExists(Trim(MapEdit.Text))) then
+  begin
+    MsgBox('Select an existing Map Pack disc image or folder, or leave the box empty.', mbError, MB_OK);
     Result := False;
     Exit;
   end;
@@ -555,6 +636,37 @@ begin
       if LastError <> '' then Log('importer: ' + LastError);
       MsgBox(Msg + #13#10#13#10 + 'Halo 2 Recomp was installed but cannot start yet. ' +
         'Run Setup again with the same folder and select a correct disc image or folder.', mbError, MB_OK);
+    end;
+  end;
+  if (CurStep = ssPostInstall) and WantMapPack and GameFilesPresent(ExpandConstant('{app}')) then
+  begin
+    if MapVideos.Checked then
+      WizardForm.StatusLabel.Caption := 'Copying the Multiplayer Map Pack maps and videos from your disc...'
+    else
+      WizardForm.StatusLabel.Caption := 'Copying the Multiplayer Map Pack maps from your disc...';
+    WizardForm.FilenameLabel.Caption := '';
+    WizardForm.ProgressGauge.Position := 0;
+    LastError := '';
+    Params := '"' + Trim(MapEdit.Text) + '" "' + ExpandConstant('{app}\data') + '"';
+    if MapVideos.Checked then Params := Params + ' --videos "' + ExpandConstant('{app}\extras') + '"';
+    if not ExecAndLogOutput(ExpandConstant('{app}\halo2_mappack.exe'), Params, '', SW_SHOWNORMAL,
+        ewWaitUntilTerminated, Code, @ImportLog) then
+      Code := 99;
+    if Code <> 0 then
+    begin
+      case Code of
+        2: Msg := 'The Map Pack disc image or folder could not be found.';
+        3: Msg := 'That file is not an Xbox disc image.';
+        4: Msg := 'That is not the Halo 2 Multiplayer Map Pack disc.';
+        5: Msg := 'Some Map Pack files are missing or damaged. The dump may be incomplete.';
+        6: Msg := 'The Map Pack files could not be written to the install folder.';
+      else
+        Msg := 'The Map Pack files could not be copied.';
+      end;
+      MapError := Msg;
+      if LastError <> '' then Log('map pack: ' + LastError);
+      MsgBox(Msg + #13#10#13#10 + 'The game is installed and plays without them. You can add the Map Pack disc ' +
+        'later on the EXTRAS page of Halo 2 Recomp Settings.', mbError, MB_OK);
     end;
   end;
 #ifdef HasTextures

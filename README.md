@@ -308,6 +308,29 @@ RGBA, with mipmaps. Cube maps are a single DDS cubemap.
 - **Switches:** `RECOMP_TEX_PACK=<dir>` uses another folder, `RECOMP_TEX_PACK=0` turns the
   pack off, and `RECOMP_TEX_PACK_LOG=1` logs each texture as it loads.
 
+## Multiplayer Map Pack and bonus videos
+
+If you own the **Halo 2 Multiplayer Map Pack** disc (2005), the game can take its maps and
+videos from it, like the game disc itself:
+
+- **In Setup:** an optional page after the game disc asks for the Map Pack disc (an image or a
+  folder with its files) and whether to copy the bonus videos too (unticked).
+- **Later:** `config.exe`, **EXTRAS** page, **ADD MAP PACK DISC...**
+- **Maps:** the Bonus Map Pack (Containment, Warlock), Killtacular (Sanctuary, Turf) and
+  Maptacular (Backwash, Elongation, Gemini, Relic, Terminal), about 430 MB, installed where the
+  game's downloaded content goes. Every file is checked against its pinned SHA-256
+  (`installer/halo2_mappack.c`, `installer/mappack_manifest.h`). Blastacular was never on a
+  disc: it comes from the in-game content download (Xbox Live through Insignia).
+- **Videos** (about 2.8 GB): Another Day at the Beach (in English and the Windows display
+  language), Halo 2: Killtacular (with the disc's subtitles: press S in the player), the audio
+  test (5.1), the Halo 2 announcement trailer and Halo E3 2000. Watch them on the EXTRAS page.
+  They are copied exactly as on the disc (MPEG-1 with CRI ADX audio); **RE-ENCODE TO H.264**
+  there makes them about a quarter of the size with Windows' own encoders and removes the
+  originals.
+- **Packs and the console identity:** each pack's `ContentMeta.xbx` is signed for the
+  hard-drive key the game runs with. The game signs it again at every start for the current key,
+  so packs stay listed when you add or remove a console identity.
+
 ## Status
 
 Campaign boots and plays at 60 FPS, with smooth motion drawing the frames between the game's
@@ -346,3 +369,5 @@ The xboxrecomp toolkit is MIT (`xboxrecomp-toolkit/LICENSE`, with `LICENSES/` an
 for bundled components). SDL3 is zlib (`halo2-native-tu15/third_party/SDL3-3.4.20/LICENSE.txt`).
 The GPU backend's register-combiner shader generator is adapted from MIT-licensed code
 (`src/gpu/NOTICE.txt`). SMAA is MIT (`halo2-native-tu15/src/gpu/smaa/LICENSE.txt`).
+The EXTRAS player decodes MPEG-1 with pl_mpeg by Dominic Szablewski (MIT,
+`halo2-native-tu15/native/config/pl_mpeg.h`, with marked changes for CRI Sofdec video).

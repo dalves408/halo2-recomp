@@ -27,7 +27,7 @@ INSTALLER = ROOT / 'installer'
 OUTPUT = INSTALLER / 'Output'
 SMALL_SIZES = (55, 64, 80, 96, 128)
 PROGRAMS = ('halo2_recomp', 'halo2_downloader', 'Config', 'Insignia Setup', 'Halo2 Updater', 'halo2_import',
-            'halo2_texture_download')
+            'halo2_mappack', 'halo2_texture_download')
 
 # The Halo 2 manuals' palette (src/halo_ui.c)
 BG_TOP, BG_MID, BG_BOT = (14, 52, 104), (8, 33, 72), (3, 13, 32)
