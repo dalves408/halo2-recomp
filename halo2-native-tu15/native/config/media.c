@@ -381,15 +381,29 @@ static int mp4_frame(Media *m, double *t)
             return 0;
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (s) IMFSample_Release(s); return 0; }
         if (!s) continue;
-        if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(s, &b))) {
-            if (SUCCEEDED(IMFMediaBuffer_Lock(b, &p, NULL, &len))) {
+        /* The decoder's rows are padded (a width that is not a multiple of 16, like a cropped 572: rows 576 pixels
+         * apart): the 2D buffer's own pitch says where each row starts; the media type's default stride does not. */
+        if (SUCCEEDED(IMFSample_GetBufferByIndex(s, 0, &b))) {
+            IMF2DBuffer *b2 = NULL;
+            BYTE *scan0;
+            LONG pitch;
+            if (SUCCEEDED(IMFMediaBuffer_QueryInterface(b, &IID_IMF2DBuffer, (void **)&b2)) &&
+                SUCCEEDED(IMF2DBuffer_Lock2D(b2, &scan0, &pitch))) {
+                int y;
+                for (y = 0; y < m->h; y++)
+                    memcpy(m->bgrx + (size_t)y * m->w * 4, scan0 + (ptrdiff_t)y * pitch, (size_t)m->w * 4);
+                IMF2DBuffer_Unlock2D(b2);
+            } else if (SUCCEEDED(IMFMediaBuffer_Lock(b, &p, NULL, &len))) {
                 int y, st = m->stride < 0 ? -m->stride : m->stride;
+                if (len >= (DWORD)m->h * (DWORD)m->w * 4 && len % (DWORD)m->h == 0 && (int)(len / m->h) > st)
+                    st = (int)(len / m->h);   /* no 2D buffer: the rows are as far apart as the buffer says */
                 for (y = 0; y < m->h; y++) {
                     const BYTE *row = m->stride < 0 ? p + (size_t)(m->h - 1 - y) * st : p + (size_t)y * st;
                     if ((size_t)(y + 1) * st <= len) memcpy(m->bgrx + (size_t)y * m->w * 4, row, (size_t)m->w * 4);
                 }
                 IMFMediaBuffer_Unlock(b);
             }
+            if (b2) IMF2DBuffer_Release(b2);
             IMFMediaBuffer_Release(b);
         }
         IMFSample_Release(s);
@@ -591,6 +605,96 @@ static void seterr(char *err, size_t n, const char *what, HRESULT hr)
     if (err && n) snprintf(err, n, "%s (0x%08lX)", what, (unsigned long)hr);
 }
 
+/* The picture's area: the disc's videos are 640x480 with black bars where the film is wider than 4:3 (or the picture
+ * smaller than the frame). A first pass decodes the whole video and marks every row and column that has picture in
+ * any frame looked at (every 3rd): a row or column counts when more than 2% of it is brighter than black (luma above
+ * 50, black being 16). The crop keeps all of those, so no frame loses picture; it is used only when it takes 8 pixels
+ * or more off a side, and its edges are even (NV12). The measured bars (2026-11-27): Beach rows 66-413, Killtacular
+ * 25-455, the trailer 48-431, the audio test 87-479, E3 2000 none. */
+static int find_picture(const WCHAR *const *src, int n, int *x0, int *y0, int *cw, int *ch_, void (*progress)(double, void *),
+                        void *user, volatile LONG *cancel)
+{
+    Media *m = media_open(src, n);
+    int16_t *pcm = (int16_t *)malloc(sizeof(int16_t) * 6 * 4800);
+    unsigned char *row = NULL, *col = NULL;
+    int w, h, frames = 0, top, bot, lft, rgt, ok = 0;
+    long long apos = 0;
+    double t;
+    if (!m || !pcm || m->mp4 || !media_next_frame(m, &t)) goto out;
+    w = media_width(m); h = media_height(m);
+    row = (unsigned char *)calloc((size_t)h, 1);
+    col = (unsigned char *)calloc((size_t)w, 1);
+    if (!row || !col) goto out;
+    do {
+        if (cancel && *cancel) goto out;
+        if (frames % 3 == 0 && m->frame) {
+            const plm_plane_t *yp = &m->frame->y;
+            int x, y, need_r = (w - 16) / 50, need_c = (h - 16) / 50;
+            int *cc = (int *)calloc((size_t)w, sizeof(int));
+            if (!cc) goto out;
+            for (y = 8; y < h - 8; y++) {
+                const uint8_t *py = yp->data + (size_t)y * yp->width;
+                int c = 0;
+                for (x = 8; x < w - 8; x++)
+                    if (py[x] > 50) { c++; cc[x]++; }
+                if (c > need_r) row[y] = 1;
+            }
+            for (x = 8; x < w - 8; x++) if (cc[x] > need_c) col[x] = 1;
+            free(cc);
+        }
+        frames++;
+        /* the sound is read alongside, or its bytes would pile up */
+        while (apos * media_fps(m) < (long long)frames * media_rate(m)) {
+            int got = media_audio(m, pcm, 1600);
+            if (got <= 0) break;
+            apos += got;
+        }
+        if (progress && frames % 60 == 0) progress(media_progress(m), user);
+    } while (media_next_frame(m, &t));
+    for (top = 8; top < h - 8 && !row[top]; top++) {}
+    for (bot = h - 9; bot > top && !row[bot]; bot--) {}
+    for (lft = 8; lft < w - 8 && !col[lft]; lft++) {}
+    for (rgt = w - 9; rgt > lft && !col[rgt]; rgt--) {}
+    if (top >= bot || lft >= rgt) goto out;   /* all black: keep the frame */
+    /* a side with less than 8 pixels of bar, or only the 8-pixel margin looked past, keeps its edge */
+    if (top <= 8) top = 0;
+    if (bot >= h - 9) bot = h - 1;
+    if (lft <= 8) lft = 0;
+    if (rgt >= w - 9) rgt = w - 1;
+    top &= ~1; lft &= ~1;
+    bot |= 1; rgt |= 1;
+    if (bot >= h) bot = h - 1;
+    if (rgt >= w) rgt = w - 1;
+    *x0 = lft; *y0 = top; *cw = rgt - lft + 1; *ch_ = bot - top + 1;
+    ok = 1;
+out:
+    if (m) media_close(m);
+    free(pcm); free(row); free(col);
+    return ok;
+}
+
+/* The picture cropped to x0,y0 cw x ch as NV12 (Y rows of cw, then Cb Cr pairs). */
+static void frame_nv12_crop(Media *m, uint8_t *dst, int x0, int y0, int cw, int ch)
+{
+    plm_frame_t *f = m->frame;
+    int y, x;
+    uint8_t *uv = dst + (size_t)cw * ch;
+    if (!f) return;
+    for (y = 0; y < ch; y++) memcpy(dst + (size_t)y * cw, f->y.data + (size_t)(y0 + y) * f->y.width + x0, (size_t)cw);
+    for (y = 0; y < ch / 2; y++)
+        for (x = 0; x < cw / 2; x++) {
+            uv[(size_t)y * cw + 2 * x] = f->cb.data[(size_t)(y0 / 2 + y) * f->cb.width + x0 / 2 + x];
+            uv[(size_t)y * cw + 2 * x + 1] = f->cr.data[(size_t)(y0 / 2 + y) * f->cr.width + x0 / 2 + x];
+        }
+}
+
+struct crop_progress { void (*fn)(double, void *); void *user; double base, span; };
+static void crop_progress_fn(double p, void *u)
+{
+    struct crop_progress *c = (struct crop_progress *)u;
+    if (c->fn) c->fn(c->base + p * c->span, c->user);
+}
+
 int media_encode_mp4(const WCHAR *const *src, int n, const WCHAR *dst, void (*progress)(double, void *), void *user,
                      volatile LONG *cancel, char *err, size_t errn)
 {
@@ -606,12 +710,23 @@ int media_encode_mp4(const WCHAR *const *src, int n, const WCHAR *dst, void (*pr
     double fps, vt;
     uint8_t *nv12 = NULL;
     int16_t *pcm = NULL;
+    int cx = 0, cy = 0, cw = 0, chh = 0;
+    struct crop_progress cp;
+    cp.fn = progress; cp.user = user;
+    if (m && !m->mp4) {   /* the first pass (about a fifth of the time): where the picture is */
+        cp.base = 0; cp.span = 0.2;
+        if (!find_picture(src, n, &cx, &cy, &cw, &chh, progress ? crop_progress_fn : NULL, &cp, cancel)) cw = 0;
+        if (cancel && *cancel) { media_close(m); return -1; }
+    }
+    cp.base = 0.2; cp.span = 0.8;
     if (!m) { seterr(err, errn, "The video could not be read", E_FAIL); return 0; }
     if (m->mp4) { media_close(m); seterr(err, errn, "Already re-encoded", E_FAIL); return 0; }
     mf_up();
     /* the first picture and some audio first: the size, rate and channel count are known after them */
     if (!media_next_frame(m, &vt)) { media_close(m); seterr(err, errn, "The video has no pictures", E_FAIL); return 0; }
     w = media_width(m); h = media_height(m); fps = media_fps(m);
+    if (cw <= 0 || chh <= 0) { cx = 0; cy = 0; cw = w; chh = h; }
+    w = cw; h = chh;   /* the size written: the picture's area */
     pcm = (int16_t *)malloc(sizeof(int16_t) * 6 * 4800);
     nv12 = (uint8_t *)malloc((size_t)w * h * 3 / 2);
     {
@@ -629,11 +744,11 @@ int media_encode_mp4(const WCHAR *const *src, int n, const WCHAR *dst, void (*pr
     hr = MFCreateSinkWriterFromURL(part, NULL, at, &wr);
     IMFAttributes_Release(at);
     if (FAILED(hr)) { seterr(err, errn, "Windows could not create the MP4 file", hr); goto done; }
-    /* H.264: about 2.5 Mbit/s for the disc's 640x480 */
+    /* H.264: about 2.5 Mbit/s for the disc's 640x480 (less for a cropped picture) */
     MFCreateMediaType(&t);
     IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
     IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFVideoFormat_H264);
-    IMFMediaType_SetUINT32(t, &MF_MT_AVG_BITRATE, 2500000);
+    IMFMediaType_SetUINT32(t, &MF_MT_AVG_BITRATE, (UINT32)(2500000.0 * w * h / (640.0 * 480.0)));
     IMFMediaType_SetUINT32(t, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     IMFMediaType_SetUINT64(t, &MF_MT_FRAME_SIZE, ((UINT64)w << 32) | (UINT32)h);
     IMFMediaType_SetUINT64(t, &MF_MT_FRAME_RATE, fps > 29.9 && fps < 30.0 ? ((UINT64)30000 << 32) | 1001
@@ -688,7 +803,7 @@ int media_encode_mp4(const WCHAR *const *src, int n, const WCHAR *dst, void (*pr
         /* one picture */
         if (FAILED(MFCreateMemoryBuffer((DWORD)((size_t)w * h * 3 / 2), &b))) break;
         IMFMediaBuffer_Lock(b, &p, NULL, NULL);
-        media_frame_nv12(m, p);
+        frame_nv12_crop(m, p, cx, cy, cw, chh);
         IMFMediaBuffer_Unlock(b);
         IMFMediaBuffer_SetCurrentLength(b, (DWORD)((size_t)w * h * 3 / 2));
         MFCreateSample(&s);
@@ -719,7 +834,7 @@ int media_encode_mp4(const WCHAR *const *src, int n, const WCHAR *dst, void (*pr
             if (FAILED(hr)) { have_audio = 0; break; }
             apos += got;
         }
-        if (progress && (frames % 30) == 0) progress(media_progress(m), user);
+        if (progress && (frames % 30) == 0) crop_progress_fn(media_progress(m), &cp);
         if (!media_next_frame(m, &vt)) { ok = 1; break; }
     }
     if (ok == 1) {

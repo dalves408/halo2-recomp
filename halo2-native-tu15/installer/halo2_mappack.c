@@ -18,6 +18,8 @@
  * (default: English and the Windows display language). A video already re-encoded (an .mp4 beside where its .sfd
  * would go) is not copied again.
  *
+ * On success it writes <data dir>\mappack.txt (maps=1, videos=0/1), which Setup reads to skip its Map Pack page.
+ *
  * Progress goes to stdout as "PROGRESS done total". Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image,
  * 4 not the Halo 2 Multiplayer Map Pack disc, 5 files missing or damaged, 6 cannot write. */
 #include <windows.h>
@@ -376,6 +378,27 @@ static int reencoded(const WCHAR *sfd)
     return GetFileAttributesW(t) != INVALID_FILE_ATTRIBUTES;
 }
 
+/* <data dir>\mappack.txt: the Map Pack disc was installed here (Setup does not ask for it again on an update or a
+ * repair). Written after every successful run; "videos=1" once a run copied the videos too. */
+static void write_marker(const WCHAR *data, int videos)
+{
+    WCHAR path[MAX_PATH];
+    char old[256] = "";
+    SYSTEMTIME t;
+    FILE *f;
+    swprintf_s(path, MAX_PATH, L"%s\\mappack.txt", data);
+    if ((f = _wfopen(path, L"rb")) != NULL) {   /* videos copied by an earlier run stay noted */
+        fread(old, 1, sizeof old - 1, f);
+        fclose(f);
+        if (strstr(old, "videos=1")) videos = 1;
+    }
+    GetLocalTime(&t);
+    if ((f = _wfopen(path, L"wb")) == NULL) return;
+    fprintf(f, "Halo 2 Multiplayer Map Pack disc installed by halo2_mappack\r\n"
+               "maps=1\r\nvideos=%d\r\ndate=%04d-%02d-%02d\r\n", videos, t.wYear, t.wMonth, t.wDay);
+    fclose(f);
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     const WCHAR *source, *data, *extras = NULL;
@@ -430,6 +453,7 @@ int wmain(int argc, wchar_t **argv)
     if (missing) { printf("ERROR %d files are missing or damaged (bad or incomplete dump).\n", missing); return 5; }
     g_done = g_total;
     progress();
+    write_marker(data, extras != NULL);
     printf("OK map packs installed%s\n", extras ? ", videos copied" : "");
     return 0;
 }

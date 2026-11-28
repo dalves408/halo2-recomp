@@ -513,7 +513,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         mem = CreateCompatibleDC(dc);
         bm = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
         old = SelectObject(mem, bm);
-        draw(mem, cr.right, cr.bottom);
+        if (extras_playing()) extras_draw_player(mem, &cr);   /* a bonus video, in this window */
+        else draw(mem, cr.right, cr.bottom);
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
         DeleteObject(bm);
@@ -525,6 +526,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l), row = -1, col = -1, b = -1, t = -1, i;
         POINT p;
         TRACKMOUSEEVENT tme;
+        if (extras_playing()) { extras_player_mouse(0); return 0; }
         p.x = x; p.y = y;
         hit(x, y, &row, &col);
         if (s_page == PAGE_VIDEO && row < 0)
@@ -552,9 +554,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         s_hover_row = s_hover_col = s_hover_btn = s_hover_tab = -1;
         refresh(h);
         return 0;
+    case WM_LBUTTONDBLCLK:
+        if (extras_playing()) { extras_player_mouse(1); return 0; }
+        m = WM_LBUTTONDOWN;          /* elsewhere a second click, as before CS_DBLCLKS */
+        /* fall through */
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN: {
         int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l), row, col, i;
         POINT p;
+        if (extras_playing()) return m == WM_XBUTTONDOWN ? TRUE : 0;   /* the video has the window */
         if (s_listen) {
             int vk = m == WM_LBUTTONDOWN ? 1 : m == WM_RBUTTONDOWN ? 2 : m == WM_MBUTTONDOWN ? 4
                    : (GET_XBUTTON_WPARAM(w) == XBUTTON1 ? 5 : 6);
@@ -623,12 +630,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return m == WM_XBUTTONDOWN ? TRUE : 0;
     }
     case WM_MOUSEWHEEL:
+        if (extras_playing()) return 0;
         if (s_listen) {
             bind_key(kb_name_from_vk(GET_WHEEL_DELTA_WPARAM(w) > 0 ? 0x0E : 0x0F));
             refresh(h);
         }
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        if (m == WM_KEYDOWN && extras_key((int)w)) return 0;   /* a bonus video playing here */
         if (s_listen) {
             if (w == VK_ESCAPE) { s_listen = 0; s_status[0] = 0; }
             else if (w == VK_DELETE) {
@@ -662,6 +671,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (ok_to_close(h)) DestroyWindow(h);
         return 0;
     case WM_DESTROY:
+        extras_stop();
         extras_cancel();
         PostQuitMessage(0);
         return 0;
@@ -684,6 +694,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ReleaseDC(NULL, dc);
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc;
+    wc.style = CS_DBLCLKS;                                    /* a double-click: a video full screen */
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;

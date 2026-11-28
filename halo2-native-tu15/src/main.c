@@ -464,6 +464,54 @@ static DWORD WINAPI halo2_dsp_probe(LPVOID arg)
 
 int g_halo2_single_vblank;
 
+/* The frame's wait for its vblank (gen patch 17, analysis/apply-gen-patches.py). Before each
+ * frame, sub_0012DDF0 spins on the vblank count the game's vblank callback (sub_00014260)
+ * keeps at 0x4922D0 (64 bits) until it reaches the frame's target. A spin on the Xbox; here it
+ * kept the game thread busy for the whole slack of every frame (21% of it in the Outskirts
+ * intro on an 8-core test PC, 2026-11-27), a core a 4-thread PC needs for the GPU-command thread and the
+ * driver. The callback now signals an event, and the frame waits on it.
+ * RECOMP_HALO2_VBLANK_WAIT=0 keeps the spin (test; release builds drop RECOMP_*). */
+void xbox_IrqSafePoint(void);   /* toolkit kernel_hal.c */
+static HANDLE s_h2_vbl_event;
+static int s_h2_vbl_wait = -1;
+
+void h2_vblank_signal(void)
+{
+    if (s_h2_vbl_event)
+        SetEvent(s_h2_vbl_event);
+}
+
+static uint64_t h2_vblank_count(void)
+{
+    volatile uint32_t *c = (volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x4922D0u);
+    uint32_t hi, lo;
+    do {
+        hi = c[1];
+        lo = c[0];
+    } while (hi != c[1]);
+    return ((uint64_t)hi << 32) | lo;
+}
+
+void h2_vblank_wait(uint32_t target_lo, uint32_t target_hi)
+{
+    int64_t target = (int64_t)(((uint64_t)target_hi << 32) | target_lo);
+    if (s_h2_vbl_wait < 0) {
+        const char *e = getenv("RECOMP_HALO2_VBLANK_WAIT");
+        s_h2_vbl_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        s_h2_vbl_wait = s_h2_vbl_event && !(e && e[0] == '0');
+        fprintf(stderr, "[FPS] frame waits for its vblank %s\n",
+                s_h2_vbl_wait ? "on an event" : "by spinning (RECOMP_HALO2_VBLANK_WAIT=0)");
+    }
+    if (!s_h2_vbl_wait)
+        return;
+    /* The caller's own loop checks again and leaves at once. A 2 ms timeout covers a
+     * callback that stops signalling (the count then still moves). */
+    while ((int64_t)h2_vblank_count() < target) {
+        WaitForSingleObject(s_h2_vbl_event, 2);
+        xbox_IrqSafePoint();
+    }
+}
+
 /* RECOMP_HALO2_UNLOCK_LEVELS=1 (testing; release builds drop RECOMP_*): every
  * campaign level is offered in Select Level. The hook is at the top of
  * sub_0019337D (1.0 0x190565, analysis/apply-gen-patches.py), which gives the
@@ -695,6 +743,10 @@ int main(void)
     /* D3D's flush kick waits on the pushbuffer thread's acknowledgement event instead of
      * spinning a core (patch 16, sub_00404EC0; 2026-11-26). =0 keeps the spin (test). */
     if (!getenv("RECOMP_PFB_FLUSH_WAIT")) _putenv_s("RECOMP_PFB_FLUSH_WAIT", "1");
+    /* The GPU-command thread sleeps when it has nothing to walk (toolkit nv2a_idle_wait.c, a
+     * 200 us backstop) instead of looping on Sleep(0): its CPU went 14.7 -> 10.6 ms a frame in
+     * Outskirts on an 8-core test PC with the same 60 fps and level loads (2026-11-27). =0 keeps the loop. */
+    if (!getenv("RECOMP_NV2A_IDLE_WAIT")) _putenv_s("RECOMP_NV2A_IDLE_WAIT", "1");
     if (!getenv("RECOMP_AC97_READY")) _putenv_s("RECOMP_AC97_READY", "1");
     if (!getenv("RECOMP_TITLE_KEVENTS")) _putenv_s("RECOMP_TITLE_KEVENTS", "1");
     if (!getenv("RECOMP_DISPATCH_GATE")) _putenv_s("RECOMP_DISPATCH_GATE", "1");

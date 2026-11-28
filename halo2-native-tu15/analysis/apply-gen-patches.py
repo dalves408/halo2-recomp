@@ -250,3 +250,23 @@ patch(p16, "    MEM32(eax + 0x100410) = ecx;\n\nloc_00404EE0: ;\n",
       "xbox_Nv2aPfbFlushWait()) { esp += 4; return; }")
 patch(p16, "#include <math.h>\n", "#include <math.h>\n\nint xbox_Nv2aPfbFlushWait(void);\n",
       "int xbox_Nv2aPfbFlushWait(void);")
+
+# 17. The frame's vblank wait (src/main.c h2_vblank_wait): sub_0012DDF0 spins at 0x0012DE40 until
+#     the 64-bit vblank count at 0x4922D0 reaches eax:ecx, the frame's target -- the game thread
+#     busy for all of every frame's slack (21% of it in the Outskirts intro, 2026-11-27). The hook
+#     waits on an event the vblank callback (sub_00014260, which counts) now signals; the loop
+#     then finds the count reached and leaves. RECOMP_HALO2_VBLANK_WAIT=0 keeps the spin.
+p17 = find("void sub_0012DDF0(void)\n")
+patch(p17, "loc_0012DE3E: ;\n    edi = edi;\n\nloc_0012DE40: ;\n",
+      "loc_0012DE3E: ;\n    edi = edi;\n\nloc_0012DE40: ;\n"
+      "    h2_vblank_wait(ecx, eax);   /* event wait for the target vblank (hand hook) */\n",
+      "h2_vblank_wait(ecx, eax);")
+patch(p17, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_vblank_wait(uint32_t target_lo, uint32_t target_hi);\n",
+      "void h2_vblank_wait(uint32_t target_lo, uint32_t target_hi);")
+p17b = find("void sub_00014260(void)\n")
+patch(p17b, "    MEM32(0x4922D0) = edx;\n    MEM32(0x4922D4) = esi;\n",
+      "    MEM32(0x4922D0) = edx;\n    MEM32(0x4922D4) = esi;\n"
+      "    h2_vblank_signal();   /* wakes h2_vblank_wait (hand hook) */\n",
+      "h2_vblank_signal();   /* wakes")
+patch(p17b, "#include <math.h>\n", "#include <math.h>\n\nvoid h2_vblank_signal(void);\n",
+      "void h2_vblank_signal(void);")

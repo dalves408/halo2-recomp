@@ -5,8 +5,12 @@
  *
  * The bonus videos, in <install>\extras as the disc has them (MPEG-1 + CRI ADX/AIX, media.c) or as the .mp4 that
  * RE-ENCODE TO H.264 makes of each (Windows' own H.264 and AAC encoders; the .sfd goes once its .mp4 is complete).
- * PLAY opens a player window: the picture at 4:3, the sound through waveOut (5.1 where the video has it; Windows mixes
- * it down for stereo), Killtacular's subtitles in the Windows display language where the disc has one.
+ * PLAY plays it in the page's own window (config.exe's, or the game's F1 menu): the picture at its own shape, the sound
+ * through waveOut (5.1 where the video has it; Windows mixes it down for stereo), Killtacular's subtitles in the Windows display language where the disc has one.
+ *
+ * The game's F1 menu shows the same page (extras_init_game): the map packs installed and the videos to play, chosen
+ * with the keyboard, the mouse or a pad. Adding the disc and re-encoding stay in config.exe (a file dialog, and
+ * minutes of CPU), so the game page has neither. Its player covers the game's picture and closes back to the menu.
  */
 #include <windows.h>
 #include <windowsx.h>
@@ -53,6 +57,15 @@ static HWND s_owner;
 static HBITMAP s_prev[NVID];
 static RECT s_play_r[NVID], s_add_r, s_enc_r;
 static int s_hover = -1;      /* 0..NVID-1 play, 100 add, 101 encode */
+static int s_sel = -1;        /* the game page: the video selected with the keys or a pad */
+static int s_ingame;          /* extras_init_game: the F1 menu's page */
+static HWND s_game;           /* the game page: the window the player covers */
+
+/* What is installed, read when the page opens and after a job (the game repaints its menu 60 times a second). */
+static int s_vstate[NVID];    /* video_state */
+static int s_any_sfd;
+static char s_pack_names[96];
+static int s_npacks;
 
 /* the job: copying from the disc or re-encoding */
 enum { JOB_NONE, JOB_COPY, JOB_ENCODE };
@@ -147,6 +160,15 @@ void extras_init(HWND owner, const char *root)
         if (s_prev[i]) DeleteObject(s_prev[i]);
         s_prev[i] = (HBITMAP)LoadImageA(NULL, p, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE | LR_CREATEDIBSECTION);
     }
+    extras_refresh();
+}
+
+void extras_init_game(HWND game, const char *root)
+{
+    s_ingame = 1;
+    s_game = game;
+    extras_init(NULL, root);
+    if (s_sel < 0 || !s_vstate[s_sel]) s_sel = extras_next_video(-1, 1);
 }
 
 const char *extras_status(void) { return s_status; }
@@ -179,6 +201,32 @@ static int any_sfd(void)
     return 0;
 }
 
+void extras_refresh(void)
+{
+    char names[96];
+    int i, n = packs_installed(names, sizeof names), st[NVID], sfd = any_sfd();
+    for (i = 0; i < NVID; i++) st[i] = video_state(i);
+    EnterCriticalSection(&s_lock);
+    memcpy(s_vstate, st, sizeof st);
+    s_any_sfd = sfd;
+    s_npacks = n;
+    memcpy(s_pack_names, names, sizeof names);
+    LeaveCriticalSection(&s_lock);
+}
+
+int extras_next_video(int cur, int dir)
+{
+    int i;
+    for (i = cur + dir; i >= 0 && i < NVID; i += dir)
+        if (s_vstate[i]) return i;
+    if (cur >= 0 && cur < NVID && s_vstate[cur]) return cur;
+    for (i = 0; i < NVID; i++) if (s_vstate[i]) return i;
+    return -1;
+}
+
+int  extras_selected(void) { return s_sel; }
+void extras_select(int i) { s_sel = i; }
+
 void extras_draw(HDC dc, const UiFonts *f, const RECT *area)
 {
     RECT r, sec;
@@ -190,16 +238,24 @@ void extras_draw(HDC dc, const UiFonts *f, const RECT *area)
     SetRect(&sec, x0, area->top, x1, area->top + ui_px(f, 30));
     ui_section(dc, f, &sec, "Multiplayer Map Pack");
     y = sec.bottom + ui_px(f, 6);
-    n = packs_installed(names, sizeof names);
+    EnterCriticalSection(&s_lock);
+    n = s_npacks;
+    memcpy(names, s_pack_names, sizeof names);
+    LeaveCriticalSection(&s_lock);
     if (n) snprintf(t, sizeof t, "Installed: %s.%s", names,
                     strstr(names, "Blastacular") ? "" : " Blastacular was never on a disc: it comes from the in-game "
                                                        "content download (Xbox Live).");
+    else if (s_ingame) snprintf(t, sizeof t, "No map packs installed. Add them from your Halo 2 Multiplayer Map Pack "
+                                             "disc in Config.exe (EXTRAS), or download them here through Xbox Live.");
     else snprintf(t, sizeof t, "No map packs installed. Add them from your Halo 2 Multiplayer Map Pack disc, "
                                 "or download them in the game through Xbox Live.");
-    SetRect(&r, x0 + ui_px(f, 12), y, x1 - ui_px(f, 250), y + ui_px(f, 44));
+    SetRect(&r, x0 + ui_px(f, 12), y, x1 - (s_ingame ? 0 : ui_px(f, 250)), y + ui_px(f, 44));
     ui_text(dc, f->fine, RGB(190, 214, 240), &r, t, DT_LEFT | DT_WORDBREAK);
-    SetRect(&s_add_r, x1 - ui_px(f, 236), y + ui_px(f, 2), x1, y + ui_px(f, 38));
-    ui_button(dc, f, &s_add_r, busy && s_job == JOB_COPY ? "CANCEL" : "ADD MAP PACK DISC...", 0, s_hover == 100);
+    SetRect(&s_add_r, 0, 0, 0, 0);
+    if (!s_ingame) {
+        SetRect(&s_add_r, x1 - ui_px(f, 236), y + ui_px(f, 2), x1, y + ui_px(f, 38));
+        ui_button(dc, f, &s_add_r, busy && s_job == JOB_COPY ? "CANCEL" : "ADD MAP PACK DISC...", 0, s_hover == 100);
+    }
     y += ui_px(f, 52);
 
     /* the videos */
@@ -207,7 +263,7 @@ void extras_draw(HDC dc, const UiFonts *f, const RECT *area)
     ui_section(dc, f, &sec, "Bonus videos");
     y = sec.bottom + ui_px(f, 6);
     for (i = 0; i < NVID; i++) {
-        int st = video_state(i), rh = ui_px(f, 58);
+        int st = s_vstate[i], rh = ui_px(f, 58);
         RECT pr, tr, dr;
         any |= st != 0;
         SetRect(&pr, x0 + ui_px(f, 12), y, x0 + ui_px(f, 12) + ui_px(f, 96), y + ui_px(f, 54));
@@ -232,16 +288,23 @@ void extras_draw(HDC dc, const UiFonts *f, const RECT *area)
                  st == 2 ? "  (H.264)" : st == 0 ? "  Not installed." : "");
         ui_text(dc, f->fine, RGB(150, 178, 210), &dr, t, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
         SetRect(&s_play_r[i], x1 - ui_px(f, 116), y + ui_px(f, 10), x1, y + ui_px(f, 46));
-        if (st) ui_button(dc, f, &s_play_r[i], "PLAY", 0, s_hover == i);
+        if (st) ui_button(dc, f, &s_play_r[i], "PLAY", s_ingame && s_sel == i, s_hover == i);
         else SetRect(&s_play_r[i], 0, 0, 0, 0);
         y += rh;
     }
     /* re-encode */
     SetRect(&s_enc_r, 0, 0, 0, 0);
-    if (busy && s_job == JOB_ENCODE) {
+    if (s_ingame) {
+        if (!any) {
+            SetRect(&r, x0 + ui_px(f, 12), y + ui_px(f, 4), x1, y + ui_px(f, 44));
+            ui_text(dc, f->fine, RGB(150, 178, 210), &r,
+                    "To watch these, add your Map Pack disc in Config.exe (EXTRAS) and choose to copy its videos.",
+                    DT_LEFT | DT_WORDBREAK);
+        }
+    } else if (busy && s_job == JOB_ENCODE) {
         SetRect(&s_enc_r, x1 - ui_px(f, 236), y + ui_px(f, 4), x1, y + ui_px(f, 40));
         ui_button(dc, f, &s_enc_r, "STOP RE-ENCODING", 0, s_hover == 101);
-    } else if (any && any_sfd()) {
+    } else if (any && s_any_sfd) {
         SetRect(&s_enc_r, x1 - ui_px(f, 236), y + ui_px(f, 4), x1, y + ui_px(f, 40));
         ui_button(dc, f, &s_enc_r, "RE-ENCODE TO H.264", 0, s_hover == 101);
         SetRect(&r, x0 + ui_px(f, 12), y + ui_px(f, 4), s_enc_r.left - ui_px(f, 12), y + ui_px(f, 44));
@@ -458,6 +521,7 @@ static DWORD WINAPI encode_thread(LPVOID arg)
                                   ok == 1 ? "" : "s");
     else set_status("%d video%s re-encoded: %llu MB now, was %llu MB.", ok, ok == 1 ? "" : "s", after >> 20, before >> 20);
     memset(&s_enc, 0, sizeof s_enc);
+    extras_refresh();
     InterlockedExchange(&s_job, JOB_NONE);
     PostMessageA(s_owner, WM_APP_EXTRAS, 0, 0);
     return 0;
@@ -483,7 +547,8 @@ static const GUID SUBTYPE_PCM = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00
 typedef struct { int start, end; WCHAR text[200]; } Sub;
 
 static struct {
-    HWND w;
+    int active, video;
+    HWND host;                                /* config.exe's window, repainted for each picture; NULL in the game */
     Media *m;
     HANDLE thread;
     volatile LONG stop, paused, done;
@@ -492,6 +557,7 @@ static struct {
     int vw, vh, have_pic;
     double clock;
     int fullscreen;
+    LONG style;
     WINDOWPLACEMENT place;
     DWORD hint_until;
     Sub *subs;
@@ -663,7 +729,7 @@ static DWORD WINAPI player_thread(LPVOID unused)
                 media_frame_bgrx(m, P.px, P.vw * 4);
                 P.have_pic = 1;
                 LeaveCriticalSection(&P.lock);
-                InvalidateRect(P.w, NULL, FALSE);
+                if (P.host) InvalidateRect(P.host, NULL, FALSE);
             }
             pending = 0;
             continue;
@@ -688,49 +754,79 @@ static DWORD WINAPI player_thread(LPVOID unused)
     for (i = 0; i < NBUF; i++) free(buf[i]);
     free(first);
     InterlockedExchange(&P.done, 1);
-    if (!P.stop) PostMessageA(P.w, WM_CLOSE, 0, 0);
+    if (!P.stop && P.host) PostMessageA(P.host, WM_APP_EXTRAS, 0, 0);   /* the end: back to the page */
     return 0;
 }
 
+/* config.exe: its window full screen on its monitor while a video plays (F11, Enter or a double-click), and back */
 static void set_fullscreen(HWND w, int on)
 {
-    if (on == P.fullscreen) return;
+    if (!w || on == P.fullscreen) return;
     if (on) {
         MONITORINFO mi;
         P.place.length = sizeof P.place;
         GetWindowPlacement(w, &P.place);
+        P.style = GetWindowLongA(w, GWL_STYLE);
         mi.cbSize = sizeof mi;
         GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi);
         SetWindowLongA(w, GWL_STYLE, WS_POPUP | WS_VISIBLE);
         SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED);
     } else {
-        SetWindowLongA(w, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowLongA(w, GWL_STYLE, P.style);
         SetWindowPlacement(w, &P.place);
         SetWindowPos(w, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     }
     P.fullscreen = on;
 }
 
-static void player_paint(HWND w)
+static void player_stop(void)
 {
-    PAINTSTRUCT ps;
-    RECT cr, vr;
-    HDC dc = BeginPaint(w, &ps), mem;
-    HBITMAP bm;
-    HGDIOBJ old;
-    int cw, chh, vw, vh;
-    GetClientRect(w, &cr);
-    cw = cr.right; chh = cr.bottom;
-    mem = CreateCompatibleDC(dc);
-    bm = CreateCompatibleBitmap(dc, cw, chh);
-    old = SelectObject(mem, bm);
-    FillRect(mem, &cr, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    /* 4:3, as the disc's 640x480 is shown on a TV */
-    vw = cw; vh = cw * 3 / 4;
-    if (vh > chh) { vh = chh; vw = chh * 4 / 3; }
-    SetRect(&vr, (cw - vw) / 2, (chh - vh) / 2, (cw - vw) / 2 + vw, (chh - vh) / 2 + vh);
-    if (P.have_pic) {
+    if (!P.active) return;
+    InterlockedExchange(&P.stop, 1);
+    if (P.thread) { WaitForSingleObject(P.thread, 5000); CloseHandle(P.thread); P.thread = NULL; }
+    if (P.fullscreen) set_fullscreen(P.host, 0);
+    media_close(P.m);
+    P.m = NULL;
+    EnterCriticalSection(&P.lock);
+    free(P.px);
+    P.px = NULL;
+    P.have_pic = 0;
+    LeaveCriticalSection(&P.lock);
+    free(P.subs);
+    P.subs = NULL;
+    P.nsubs = 0;
+    P.active = 0;
+    if (P.host) InvalidateRect(P.host, NULL, FALSE);
+}
+
+/* 1 while a video plays; a video that ended is closed here, back to the page. */
+int extras_playing(void)
+{
+    if (P.active && P.done && !P.stop) player_stop();
+    return P.active;
+}
+
+void extras_stop(void) { player_stop(); }
+
+static void player_hud(HDC dc, const RECT *area);
+
+void extras_draw_player(HDC dc, const RECT *area)
+{
+    RECT vr;
+    int cw = area->right - area->left, chh = area->bottom - area->top, vw, vh;
+    FillRect(dc, area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    /* the video's own shape: the disc's 640x480 is 4:3 with square pixels, and a re-encoded video keeps only the
+     * picture's area at the same square pixels (media_encode_mp4) */
+    {
+        int sw = P.vw > 0 ? P.vw : 4, sh = P.vh > 0 ? P.vh : 3;
+        vw = cw; vh = (int)((long long)cw * sh / sw);
+        if (vh > chh) { vh = chh; vw = (int)((long long)chh * sw / sh); }
+    }
+    SetRect(&vr, area->left + (cw - vw) / 2, area->top + (chh - vh) / 2, area->left + (cw - vw) / 2 + vw,
+            area->top + (chh - vh) / 2 + vh);
+    EnterCriticalSection(&P.lock);
+    if (P.have_pic && P.px) {
         BITMAPINFO bi;
         memset(&bi, 0, sizeof bi);
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
@@ -738,98 +834,158 @@ static void player_paint(HWND w)
         bi.bmiHeader.biHeight = -P.vh;
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
-        SetStretchBltMode(mem, HALFTONE);
-        EnterCriticalSection(&P.lock);
-        StretchDIBits(mem, vr.left, vr.top, vw, vh, 0, 0, P.vw, P.vh, P.px, &bi, DIB_RGB_COLORS, SRCCOPY);
-        LeaveCriticalSection(&P.lock);
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, NULL);
+        StretchDIBits(dc, vr.left, vr.top, vw, vh, 0, 0, P.vw, P.vh, P.px, &bi, DIB_RGB_COLORS, SRCCOPY);
     }
-    SetBkMode(mem, TRANSPARENT);
+    LeaveCriticalSection(&P.lock);
+    SetBkMode(dc, TRANSPARENT);
     if (P.sub_on && P.nsubs) {   /* the subtitle on screen now */
         int ms = (int)(P.clock * 1000), k;
         for (k = 0; k < P.nsubs; k++)
             if (ms >= P.subs[k].start && ms < P.subs[k].end) {
                 HFONT f = CreateFontA(-(vh / 18), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                                       CLEARTYPE_QUALITY, 0, "Segoe UI");
-                HGDIOBJ of = SelectObject(mem, f);
+                HGDIOBJ of = SelectObject(dc, f);
                 RECT tr, sh;
                 SetRect(&tr, vr.left + vw / 12, vr.top + vh * 3 / 4, vr.right - vw / 12, vr.bottom - vh / 30);
                 sh = tr;
                 OffsetRect(&sh, 2, 2);
-                SetTextColor(mem, RGB(0, 0, 0));
-                DrawTextW(mem, P.subs[k].text, -1, &sh, DT_CENTER | DT_BOTTOM | DT_WORDBREAK);
-                SetTextColor(mem, RGB(255, 255, 255));
-                DrawTextW(mem, P.subs[k].text, -1, &tr, DT_CENTER | DT_BOTTOM | DT_WORDBREAK);
-                SelectObject(mem, of);
+                SetTextColor(dc, RGB(0, 0, 0));
+                DrawTextW(dc, P.subs[k].text, -1, &sh, DT_CENTER | DT_BOTTOM | DT_WORDBREAK);
+                SetTextColor(dc, RGB(255, 255, 255));
+                DrawTextW(dc, P.subs[k].text, -1, &tr, DT_CENTER | DT_BOTTOM | DT_WORDBREAK);
+                SelectObject(dc, of);
                 DeleteObject(f);
                 break;
             }
     }
-    if (GetTickCount() < P.hint_until || P.paused) {
-        HFONT f = CreateFontA(-(chh / 34 > 13 ? chh / 34 : 13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
-                              CLEARTYPE_QUALITY, 0, "Segoe UI");
-        HGDIOBJ of = SelectObject(mem, f);
-        char h[160];
-        RECT tr;
-        snprintf(h, sizeof h, "%sSpace pause   F11 or double-click full screen%s   Esc close",
-                 P.paused ? "PAUSED   " : "", P.nsubs || P.sub_lang >= 0 ? "   S subtitles" : "");
-        SetRect(&tr, 12, 8, cw - 12, 8 + chh / 20 + 8);
-        SetTextColor(mem, RGB(200, 220, 240));
-        DrawTextA(mem, h, -1, &tr, DT_LEFT | DT_TOP | DT_SINGLELINE);
-        SelectObject(mem, of);
-        DeleteObject(f);
-    }
-    BitBlt(dc, 0, 0, cw, chh, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteObject(bm);
-    DeleteDC(mem);
-    EndPaint(w, &ps);
+    if (GetTickCount() < P.hint_until || P.paused)
+        player_hud(dc, area);
 }
 
-static LRESULT CALLBACK player_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
+/* One control in the player's bar: the key in a small panel, as on the CONTROLS page, then what it does.
+ * Returns the x after it. */
+static int hud_key(HDC dc, const UiFonts *f, int x, int y, int h, const char *key, const char *what)
 {
-    switch (msg) {
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: player_paint(w); return 0;
-    case WM_TIMER: InvalidateRect(w, NULL, FALSE); return 0;    /* subtitles and the hint */
-    case WM_LBUTTONDBLCLK: set_fullscreen(w, !P.fullscreen); return 0;
-    case WM_MOUSEMOVE: P.hint_until = GetTickCount() + 2500; return 0;
-    case WM_SYSKEYDOWN:
-        if (wp == VK_RETURN) { set_fullscreen(w, !P.fullscreen); return 0; }
-        break;
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) { if (P.fullscreen) set_fullscreen(w, 0); else DestroyWindow(w); return 0; }
-        if (wp == VK_F11) { set_fullscreen(w, !P.fullscreen); return 0; }
-        if (wp == VK_SPACE) { InterlockedExchange(&P.paused, !P.paused); InvalidateRect(w, NULL, FALSE); return 0; }
-        if (wp == 'S' && P.sub_lang >= -1 && P.nsubs >= 0) {   /* off, then each language in turn */
-            int n = (int)(sizeof SUB_FILES / sizeof *SUB_FILES);
-            P.sub_lang = P.sub_on ? (P.sub_lang + 1 < n ? P.sub_lang + 1 : -1) : 0;
-            P.sub_on = P.sub_lang >= 0;
-            subs_load(P.sub_lang);
-            P.hint_until = GetTickCount() + 2500;
-            {
-                WCHAR t[96];
-                swprintf_s(t, 96, L"%s%s%S", P.title, P.sub_on ? L" - subtitles: " : L"",
-                           P.sub_on ? SUB_NAME[P.sub_lang] : "");
-                SetWindowTextW(w, t);
-            }
-            return 0;
-        }
-        return 0;
-    case WM_CLOSE: DestroyWindow(w); return 0;
-    case WM_DESTROY:
-        InterlockedExchange(&P.stop, 1);
-        KillTimer(w, 1);
-        if (P.thread) { WaitForSingleObject(P.thread, 5000); CloseHandle(P.thread); P.thread = NULL; }
-        media_close(P.m);
-        P.m = NULL;
-        free(P.px);
-        P.px = NULL;
-        free(P.subs);
-        P.subs = NULL;
-        P.w = NULL;
-        return 0;
+    RECT k, t;
+    SIZE sz;
+    HGDIOBJ of = SelectObject(dc, f->key);
+    GetTextExtentPoint32A(dc, key, (int)strlen(key), &sz);
+    SelectObject(dc, of);
+    SetRect(&k, x, y, x + sz.cx + ui_px(f, 18), y + h);
+    ui_chamfer(dc, &k, ui_px(f, 5), RGB(20, 74, 140), RGB(130, 206, 255));
+    ui_text(dc, f->key, RGB(242, 246, 251), &k, key, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    of = SelectObject(dc, f->body);
+    GetTextExtentPoint32A(dc, what, (int)strlen(what), &sz);
+    SelectObject(dc, of);
+    SetRect(&t, k.right + ui_px(f, 8), y, k.right + ui_px(f, 8) + sz.cx + 2, y + h);
+    ui_text(dc, f->body, RGB(210, 224, 240), &t, what, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    return t.right + ui_px(f, 22);
+}
+
+/* The player's controls and notices in the menus' look (halo_ui.c): a panel along the bottom with the video's title,
+ * how far it is and the keys, and a PAUSED panel in the middle while paused. Shown for a moment after a key or a
+ * move of the pointer, and all the time while paused. */
+static void player_hud(HDC dc, const RECT *area)
+{
+    UiFonts f;
+    RECT bar, r, track, fill;
+    int cw = area->right - area->left, chh = area->bottom - area->top, x, ky, kh, secs;
+    float sc = (float)chh / 640.0f;
+    char t[160];
+    HBRUSH b;
+    double prog = P.m ? media_progress(P.m) : 0;
+    int subs = P.nsubs || P.sub_lang >= 0;
+
+    if ((float)cw / 960.0f < sc) sc = (float)cw / 960.0f;
+    ui_fonts_make(&f, sc);
+    SetBkMode(dc, TRANSPARENT);
+
+    /* PAUSED, in the middle */
+    if (P.paused) {
+        RECT p;
+        int pw = ui_px(&f, 220), ph = ui_px(&f, 64);
+        SetRect(&p, area->left + (cw - pw) / 2, area->top + (chh - ph) / 2, area->left + (cw + pw) / 2,
+                area->top + (chh + ph) / 2);
+        ui_chamfer(dc, &p, ui_px(&f, 14), RGB(6, 24, 54), RGB(70, 140, 214));
+        ui_text(dc, f.title, RGB(242, 246, 251), &p, "PAUSED", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
-    return DefWindowProcA(w, msg, wp, lp);
+
+    /* the bar: title and time on the left, the keys under them, the progress along the bottom */
+    SetRect(&bar, area->left + ui_px(&f, 16), area->bottom - ui_px(&f, 16) - ui_px(&f, 92), area->right - ui_px(&f, 16),
+            area->bottom - ui_px(&f, 16));
+    ui_chamfer(dc, &bar, ui_px(&f, 16), RGB(6, 24, 54), RGB(70, 140, 214));
+    secs = (int)P.clock;
+    snprintf(t, sizeof t, "%s", VIDEOS[P.video].title);
+    SetRect(&r, bar.left + ui_px(&f, 20), bar.top + ui_px(&f, 8), bar.right - ui_px(&f, 160), bar.top + ui_px(&f, 34));
+    ui_text(dc, f.head, RGB(242, 246, 251), &r, t, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (P.sub_lang >= 0 && P.sub_on) snprintf(t, sizeof t, "Subtitles: %s   %d:%02d", SUB_NAME[P.sub_lang], secs / 60, secs % 60);
+    else if (P.sub_lang == -1) snprintf(t, sizeof t, "Subtitles off   %d:%02d", secs / 60, secs % 60);
+    else snprintf(t, sizeof t, "%d:%02d", secs / 60, secs % 60);
+    SetRect(&r, bar.right - ui_px(&f, 380), bar.top + ui_px(&f, 8), bar.right - ui_px(&f, 20), bar.top + ui_px(&f, 34));
+    ui_text(dc, f.body, RGB(130, 206, 255), &r, t, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+    ky = bar.top + ui_px(&f, 40);
+    kh = ui_px(&f, 26);
+    x = bar.left + ui_px(&f, 20);
+    if (s_ingame) {
+        x = hud_key(dc, &f, x, ky, kh, "SPACE / A", P.paused ? "Play" : "Pause");
+        if (subs) x = hud_key(dc, &f, x, ky, kh, "S / X", "Subtitles");
+        x = hud_key(dc, &f, x, ky, kh, "ESC / B", "Back to the menu");
+    } else {
+        x = hud_key(dc, &f, x, ky, kh, "SPACE", P.paused ? "Play" : "Pause");
+        if (subs) x = hud_key(dc, &f, x, ky, kh, "S", "Subtitles");
+        x = hud_key(dc, &f, x, ky, kh, "F11", P.fullscreen ? "Window" : "Full screen");
+        x = hud_key(dc, &f, x, ky, kh, "ESC", P.fullscreen ? "Leave full screen" : "Close");
+    }
+
+    /* how far through: a thin bar along the panel's bottom edge */
+    SetRect(&track, bar.left + ui_px(&f, 20), bar.bottom - ui_px(&f, 14), bar.right - ui_px(&f, 20),
+            bar.bottom - ui_px(&f, 10));
+    b = CreateSolidBrush(RGB(16, 44, 86));
+    FillRect(dc, &track, b);
+    DeleteObject(b);
+    fill = track;
+    if (prog < 0) prog = 0;
+    if (prog > 1) prog = 1;
+    fill.right = track.left + (int)((track.right - track.left) * prog);
+    if (fill.right > fill.left) {
+        b = CreateSolidBrush(RGB(130, 206, 255));
+        FillRect(dc, &fill, b);
+        DeleteObject(b);
+    }
+    ui_fonts_free(&f);
+}
+
+/* A key while a video plays: 1 when the player took it. */
+int extras_key(int vk)
+{
+    if (!extras_playing()) return 0;
+    P.hint_until = GetTickCount() + 2500;
+    if (vk == VK_ESCAPE) {
+        if (P.fullscreen) set_fullscreen(P.host, 0);
+        else player_stop();
+    } else if ((vk == VK_F11 || vk == VK_RETURN) && !s_ingame) {
+        set_fullscreen(P.host, !P.fullscreen);
+    } else if (vk == VK_SPACE) {
+        InterlockedExchange(&P.paused, !P.paused);
+    } else if (vk == 'S' && P.sub_lang >= -1) {   /* off, then each language in turn */
+        int n = (int)(sizeof SUB_FILES / sizeof *SUB_FILES);
+        P.sub_lang = P.sub_on ? (P.sub_lang + 1 < n ? P.sub_lang + 1 : -1) : 0;
+        P.sub_on = P.sub_lang >= 0;
+        subs_load(P.sub_lang);
+    }
+    if (P.host) InvalidateRect(P.host, NULL, FALSE);
+    return 1;
+}
+
+/* The pointer while a video plays: a move shows the hint, a double-click (config.exe) goes full screen. */
+void extras_player_mouse(int dblclick)
+{
+    if (!P.active) return;
+    P.hint_until = GetTickCount() + 2500;
+    if (dblclick && !s_ingame) set_fullscreen(P.host, !P.fullscreen);
 }
 
 static void play(HWND owner, int i)
@@ -838,33 +994,22 @@ static void play(HWND owner, int i)
     WCHAR wf[3][MAX_PATH];
     const WCHAR *wp[3];
     int mp4, n, k;
-    static int reg;
-    RECT r;
-    if (P.w) { SetForegroundWindow(P.w); return; }
+    static int init;
+    if (P.active) return;
     n = video_files(i, i == 0 ? beach_lang() : "", f, &mp4);
     if (!n) return;
     for (k = 0; k < n; k++) {
         MultiByteToWideChar(CP_ACP, 0, f[k], -1, wf[k], MAX_PATH);
         wp[k] = wf[k];
     }
-    if (!reg) {
-        WNDCLASSA wc;
-        memset(&wc, 0, sizeof wc);
-        wc.style = CS_DBLCLKS;
-        wc.lpfnWndProc = player_proc;
-        wc.hInstance = GetModuleHandleA(NULL);
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
-        wc.lpszClassName = "Halo2RecompPlayer";
-        RegisterClassA(&wc);
-        InitializeCriticalSection(&P.lock);
-        reg = 1;
-    }
+    if (!init) { InitializeCriticalSection(&P.lock); init = 1; }
     P.m = media_open(wp, n);
     if (!P.m) {
-        MessageBoxA(owner, "This video could not be opened.", "Halo 2 Recomp", MB_ICONERROR);
+        if (!s_ingame) MessageBoxA(owner, "This video could not be opened.", "Halo 2 Recomp", MB_ICONERROR);
         return;
     }
+    P.host = s_ingame ? NULL : owner;   /* the game's menu repaints itself 60 times a second */
+    P.video = i;
     P.vw = media_width(P.m);
     P.vh = media_height(P.m);
     P.px = (uint8_t *)calloc((size_t)P.vw * P.vh, 4);
@@ -873,20 +1018,20 @@ static void play(HWND owner, int i)
     P.sub_lang = -1; P.sub_on = 0; P.nsubs = 0;
     if (VIDEOS[i].subtitles) {   /* Killtacular is spoken in English: subtitles in the display language, if any */
         const char *ul = ui_lang();
-        P.nsubs = 0;
         for (k = 0; k < (int)(sizeof SUB_LANG / sizeof *SUB_LANG); k++)
             if (!strcmp(ul, SUB_LANG[k])) { P.sub_lang = k; P.sub_on = 1; subs_load(k); }
         if (!P.sub_on) P.sub_lang = -1;
     } else {
         P.sub_lang = -2;   /* no subtitles for this video */
     }
-    MultiByteToWideChar(CP_UTF8, 0, VIDEOS[i].title, -1, P.title, 64);
-    SetRect(&r, 0, 0, 960, 720);
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    P.w = CreateWindowExW(0, L"Halo2RecompPlayer", P.title, WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
-                          CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, GetModuleHandleA(NULL), NULL);
-    SetTimer(P.w, 1, 250, NULL);
+    P.active = 1;
     P.thread = CreateThread(NULL, 0, player_thread, NULL, 0, NULL);
+    if (P.host) InvalidateRect(P.host, NULL, FALSE);
+}
+
+void extras_play(int i)
+{
+    if (i >= 0 && i < NVID && s_vstate[i]) play(s_owner, i);
 }
 
 /* ---- clicks ------------------------------------------------------------------------------------------------------ */
@@ -896,7 +1041,7 @@ int extras_click(HWND owner, int x, int y)
     int i;
     p.x = x; p.y = y;
     for (i = 0; i < NVID; i++)
-        if (PtInRect(&s_play_r[i], p)) { play(owner, i); return 1; }
+        if (PtInRect(&s_play_r[i], p)) { s_sel = i; play(owner ? owner : s_owner, i); return 1; }
     if (PtInRect(&s_add_r, p)) {
         if (s_job == JOB_COPY) extras_cancel();
         else if (!extras_busy()) add_disc(owner);

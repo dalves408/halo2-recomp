@@ -1476,6 +1476,9 @@ static int nv2a_ack_busy_bits(int flip_held)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
     int did_work = 0;
+    /* Asked once a pass, not once a register: it reads the clock, and this runs
+     * thousands of times a frame (6% of the GPU-command thread, 2026-11-27). */
+    int vbl_held = -1;
 
     if (!regs)
         return 0;
@@ -1493,7 +1496,9 @@ static int nv2a_ack_busy_bits(int flip_held)
          * vblank and the DPC's read of PMC_INTR_0 took the vblank away
          * from the DPC: no ack, no count, and the title's present at
          * vblank slipped a frame. */
-        if (xbox_VblankAckHeld()) {
+        if ((NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0 ||
+             NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0) &&
+            (vbl_held < 0 ? (vbl_held = xbox_VblankAckHeld()) : vbl_held)) {
             if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
                 mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
             else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)

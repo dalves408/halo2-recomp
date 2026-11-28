@@ -120,6 +120,9 @@ add_executable(${PROJECT_NAME}
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp winhttp)
+# The F1 menu's EXTRAS page (src/overlay.c): config.exe's page and video player, not in the downloader.
+target_sources(${PROJECT_NAME} PRIVATE native/config/extras.c native/config/media.c)
+target_link_libraries(${PROJECT_NAME} PRIVATE comdlg32 mfplat mfreadwrite mfuuid ole32)
 
 # SDL3 controllers (Windows, 1.5 only): Xbox pads stay on XInput, every other
 # pad (PlayStation, Switch, generic) comes from SDL3. The toolkit's

@@ -75,11 +75,31 @@ def manifest():
             'label': 'Your Halo 2 (USA, Europe) Xbox disc image, or the folder with its files (the one that holds default.xbe).',
             'check': {'file': 'default.xbe', 'xdvdfs': 'default.xbe'},
         },
+        # The Halo 2 Multiplayer Map Pack disc, optional: halo2_import hands it to halo2_mappack after the game files
+        # (maps into data\TDATA, the bonus videos into extras when the tick below is on). Left empty, the
+        # --mappack= argument is left out (SETUP-INPUTS.md: an argument with an unavailable input is omitted).
+        'inputs': [{
+            'id': 'dlc1',
+            'label': 'Halo 2 Multiplayer Map Pack disc (optional): its image, or the folder with its files. Adds '
+                     'Bonus, Killtacular and Maptacular, and the bonus videos if you tick them below.',
+            'role': 'dlc',
+            'optional': True,
+            'formats': [{'type': 'file', 'extensions': ['iso', 'xiso']}, {'type': 'folder'}],
+            'check': {'file': 'default.xbe', 'xdvdfs': 'default.xbe'},
+        }],
         'start': {'program': ['halo2_recomp.exe']},
         'prepare': {
             'program': ['halo2_import.exe'],
-            'args': ['--prepare', '{game}', '{install}/game_files'],
-            'label': 'Game files from your disc (brought to title update 1.5)',
+            'args': ['--prepare', '{game}', '{install}/game_files', '--mappack={input:dlc1}'],
+            'label': 'Game files from your disc (brought to title update 1.5), and the Map Pack disc if given',
+            'options': [{
+                'id': 'mappack_videos',
+                'label': "Also copy the Map Pack disc's bonus videos (about 2.8 GB)",
+                'note': 'Only with the Map Pack disc. Config.exe (EXTRAS) and the F1 menu play them; Config.exe can '
+                        'shrink them to H.264.',
+                'args': ['--mappack-videos'],
+                'default': False,
+            }],
         },
         'config': [{
             'format': 'ini',
@@ -115,6 +135,9 @@ def manifest():
             '5': 'The disc image is damaged or incomplete.',
             '6': 'The game files could not be written to the install folder.',
             '7': "Title update 1.5 could not be made from your disc's files: the disc image may be damaged.",
+            '8': 'That is not the Halo 2 Multiplayer Map Pack disc, or it could not be read. Pick it again, or '
+                 'leave the Map Pack disc empty.',
+            '9': 'The Map Pack disc image is damaged or incomplete.',
         },
         'looks': {'graphics': 'd3d11', 'lines': 480},
     }

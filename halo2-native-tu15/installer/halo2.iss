@@ -141,6 +141,22 @@ begin
             FileExists(Dir + '\game_files\maps\mainmenu.map');
 end;
 
+{ The Map Pack disc was installed (data\mappack.txt, halo2_mappack's marker), or its three packs (Bonus, Killtacular,
+  Maptacular) are already in Dir's data folder, from an earlier
+  Setup, config.exe's EXTRAS page or an Xbox Live download: an update or repair does not ask for the disc again (its
+  videos, if wanted later, come from the EXTRAS page). }
+function MapPacksPresent(Dir: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := FileExists(Dir + '\data\mappack.txt');   { halo2_mappack's marker }
+  if Result then Exit;
+  Result := True;
+  for I := 1 to 3 do
+    if not FileExists(Dir + '\data\TDATA\4d530064\$c\4d5300640000000' + IntToStr(I) + '\ContentMeta.xbx') then
+      Result := False;
+end;
+
 { The version of the game in Dir, from its exe ('' when unknown) }
 function InstalledVersion(Dir: String): String;
 var
@@ -487,11 +503,12 @@ begin
   end;
 end;
 
-{ No disc is needed when the game files are already in the chosen folder. }
+{ No disc is needed when the game files are already in the chosen folder, and no Map Pack disc when its maps are. }
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := ((PageID = SrcPage.ID) and GameFilesPresent(WizardDirValue)) or
-            ((PageID = UpdatePage.ID) and not GameFilesPresent(WizardDirValue));
+            ((PageID = UpdatePage.ID) and not GameFilesPresent(WizardDirValue)) or
+            ((PageID = MapPage.ID) and MapPacksPresent(RemoveBackslashUnlessRoot(WizardDirValue)));
 end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);

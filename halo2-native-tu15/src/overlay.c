@@ -13,8 +13,14 @@
 #include <windows.h>
 #include <xinput.h>
 
+#ifndef H2_DOWNLOADER
+#include "../native/config/extras.h"   /* the EXTRAS page, shared with config.exe */
+#endif
+
 /* The F1 menu: a layered window over the game, drawn like Config.exe
- * (halo_ui.c) with two pages, VIDEO and CONTROLS. In single player the game
+ * (halo_ui.c) with three pages, VIDEO, CONTROLS and EXTRAS (the Map Pack's
+ * maps and bonus videos, native/config/extras.c; a video plays in this
+ * window, and the downloader has no EXTRAS page). In single player the game
  * is paused while it is open; in any multiplayer game it keeps running
  * (game_may_pause). Keyboard: arrows, Enter, Esc or F1 to close. Pad: D-pad or
  * stick, A, B or Start. Mouse: the pointer is freed while a menu is open
@@ -52,14 +58,19 @@ enum { MODE_NONE, MODE_QUIT, MODE_SET, MODE_BUILD };
 /* gpu/d3d11_backend.c: the first-start shader build (rc_prebuild_scan). */
 int halo2_shader_build_status(int *done, int *total);
 void halo2_shader_build_background(void);
-enum { PAGE_VIDEO, PAGE_CONTROLS };
+#ifndef H2_DOWNLOADER
+enum { PAGE_VIDEO, PAGE_CONTROLS, PAGE_EXTRAS, PAGE_COUNT };
+#else
+enum { PAGE_VIDEO, PAGE_CONTROLS, PAGE_COUNT, PAGE_EXTRAS = -100 };
+#endif
 enum { M_AIM, M_SENS, M_INV };
+static void extras_page_shown(void);
 
 static const char *const ITEM_NAME[IT_COUNT] = {
     "Render scale", "Fullscreen", "VSync", "Frame rate", "Smooth motion", "Anisotropic filter", "Anti-aliasing",
     "Widescreen (at next start)", "Hi-res textures", "System Link (at next start)", "Close menu", "Quit game"
 };
-static const char *const TABS[2] = { "VIDEO", "CONTROLS" };
+static const char *const TABS[3] = { "VIDEO", "CONTROLS", "EXTRAS" };
 static const char *const M_LABEL[UI_MOUSE_ROWS] = { "Mouse aim (off in Xbox Live)", "Sensitivity", "Invert" };
 
 static HWND s_game, s_hwnd;
@@ -84,7 +95,7 @@ static unsigned char s_mouse_prev[16];
 static RECT s_upd_r;            /* the UPDATE button, in window coordinates */
 
 /* Where the last paint put things, for the mouse (window coordinates). */
-static RECT s_tab_r[2];
+static RECT s_tab_r[3];
 static RECT s_row_r[IT_COUNT], s_prev_r[IT_COUNT], s_next_r[IT_COUNT];   /* VIDEO page */
 static UiHit s_hits[160];                                              /* CONTROLS page */
 static int s_nhits;
@@ -333,6 +344,9 @@ static void close_overlay(void)
 {
     if (s_mode == MODE_NONE)
         return;
+#ifndef H2_DOWNLOADER
+    extras_stop();                       /* a video playing stops with the menu */
+#endif
     InterlockedExchange(&s_listen, 0);
     InterlockedExchange(&s_mode, MODE_NONE);
     s_set_armed = 0;
@@ -414,6 +428,8 @@ static void open_settings(void)
     s_col = 0;
     s_set_armed = 0;
     s_status[0] = 0;
+    if (s_page == PAGE_EXTRAS)
+        extras_page_shown();
     InterlockedExchange(&s_listen, 0);
     InterlockedExchange(&s_mode, MODE_SET);
     pointer_to_menu();
@@ -442,7 +458,46 @@ static int sens_ix(int v)
 
 /* The VIDEO page's last row is the UPDATE button while a new version is out. */
 #define IT_UPDATE IT_COUNT
-static int page_rows(void) { return s_page == PAGE_VIDEO ? IT_COUNT + update_available() : ui_controls_rows(); }
+static int page_rows(void)
+{
+    if (s_page == PAGE_EXTRAS) return 5;          /* the videos (extras.c); only installed ones are selected */
+    return s_page == PAGE_VIDEO ? IT_COUNT + update_available() : ui_controls_rows();
+}
+
+#ifndef H2_DOWNLOADER
+/* The EXTRAS page: read what is installed when it is shown; the selection is a video's index. */
+static void extras_page_shown(void)
+{
+    static int inited;
+    char root[MAX_PATH];
+    halo2_install_root(root, sizeof root);
+    if (!inited) { extras_init_game(s_game, root); inited = 1; }
+    else extras_refresh();
+    if (s_sel >= 0) s_sel = extras_next_video(-1, 1);
+}
+
+/* While a video plays the game's sound is off; afterwards it is as the menu left it. */
+static int s_video_mute;
+static void video_sound_tick(void)
+{
+    int playing = extras_playing();
+    if (playing && !s_video_mute) { s_video_mute = 1; g_audio_muted = 1; }
+    else if (!playing && s_video_mute) { s_video_mute = 0; g_audio_muted = s_paused ? 1 : 0; }
+}
+static int video_playing(void) { return extras_playing(); }
+#else
+static void extras_page_shown(void) {}
+static int video_playing(void) { return 0; }
+#endif
+
+static void set_page(int page)
+{
+    s_page = (page + PAGE_COUNT) % PAGE_COUNT;
+    s_col = 0;
+    s_status[0] = 0;
+    if (s_page == PAGE_EXTRAS) extras_page_shown();
+    else if (s_sel >= page_rows()) s_sel = page_rows() - 1;
+}
 
 /* The hi-res texture pack (the texture addon) is in <game folder>\textures, where src/gpu/tex_pack.c loads it. */
 static int hires_installed(void)
@@ -567,6 +622,12 @@ static void activate(int item)
             nudge(item, 1);
         return;
     }
+#ifndef H2_DOWNLOADER
+    if (s_page == PAGE_EXTRAS) {
+        extras_play(item);
+        return;
+    }
+#endif
     if (item == IT_UPDATE)
         start_update();
     else if (item == IT_CLOSE)
@@ -602,8 +663,18 @@ static void draw_settings(HDC hdc, int w, int h)
     SetRect(&all, 0, 0, w, h);
     ui_background(hdc, &all);
     SetRect(&band, x + ui_px(&f, 16), y + ui_px(&f, 16), x + bw - ui_px(&f, 16), y + ui_px(&f, 84));
-    ui_header(hdc, &f, &band, "SETTINGS", TABS, 2, s_page, s_sel < 0, s_page == PAGE_CONTROLS, s_tab_r);
+    ui_header(hdc, &f, &band, "SETTINGS", TABS, PAGE_COUNT, s_page, s_sel < 0, s_page == PAGE_CONTROLS, s_tab_r);
 
+#ifndef H2_DOWNLOADER
+    if (s_page == PAGE_EXTRAS) {
+        SetRect(&box, x + ui_px(&f, 48), y + ui_px(&f, 100), x + bw - ui_px(&f, 48), y + bh - ui_px(&f, 64));
+        extras_select(s_sel);
+        extras_draw(hdc, &f, &box);
+        hint = extras_next_video(-1, 1) >= 0
+             ? "Select a video and press Enter or A to play it here. Add a Map Pack disc in Config.exe (EXTRAS)."
+             : "Your Map Pack disc's maps and bonus videos: add the disc in Config.exe (EXTRAS). F1 or Esc closes.";
+    } else
+#endif
     if (s_page == PAGE_CONTROLS) {
         UiControls c;
         char vals[UI_MOUSE_ROWS][24];
@@ -650,7 +721,7 @@ static void draw_settings(HDC hdc, int w, int h)
                 ui_option_row(hdc, &f, &row, ITEM_NAME[i], val, i == s_sel, 0, &s_prev_r[i], &s_next_r[i]);
         }
         hint = "Click or use the arrows to change a setting (widescreen: next start). Tabs or Page Down: "
-               "CONTROLS. F1 or Esc closes.";
+               "the other pages. F1 or Esc closes.";
     }
     SetRect(&foot, x + ui_px(&f, 36), y + bh - ui_px(&f, 52), x + bw - ui_px(&f, 36), y + bh - ui_px(&f, 16));
     SetRect(&s_upd_r, 0, 0, 0, 0);
@@ -820,6 +891,11 @@ static void paint(void)
     }
     bm = CreateCompatibleBitmap(hdc, w, h);
     old = SelectObject(mem, bm);
+#ifndef H2_DOWNLOADER
+    if (video_playing())
+        extras_draw_player(mem, &cr);          /* a bonus video over the whole picture */
+    else
+#endif
     draw_settings(mem, w, h);
     size.cx = w;
     size.cy = h;
@@ -827,7 +903,7 @@ static void paint(void)
     { RECT wr; GetWindowRect(s_hwnd, &wr); dst.x = wr.left; dst.y = wr.top; }
     memset(&blend, 0, sizeof blend);
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 242;
+    blend.SourceConstantAlpha = video_playing() ? 255 : 242;
     UpdateLayeredWindow(s_hwnd, hdc, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
     SelectObject(mem, old);
     DeleteObject(bm);
@@ -841,6 +917,15 @@ static void paint(void)
 static void move_row(int dir)
 {
     int n = page_rows();
+#ifndef H2_DOWNLOADER
+    if (s_page == PAGE_EXTRAS) {               /* the installed videos; up from the first: the tabs */
+        int next = extras_next_video(s_sel, dir);
+        if (s_sel < 0) s_sel = dir > 0 ? next : -1;
+        else if (dir < 0 && (next == s_sel || next > s_sel)) s_sel = -1;
+        else s_sel = next;
+        return;
+    }
+#endif
     if (s_sel < 0) {
         if (dir > 0) s_sel = 0;
         return;
@@ -876,6 +961,15 @@ static void on_key(WPARAM w)
             skip_build();
         return;
     }
+#ifndef H2_DOWNLOADER
+    if (mode == MODE_SET && video_playing()) { /* a bonus video: Esc back to the menu, F1 closes both */
+        if (w == VK_F1)
+            close_overlay();
+        else
+            extras_key((int)w);
+        return;
+    }
+#endif
     if (w == VK_ESCAPE) {
         if (mode == MODE_NONE)
             open_quit();
@@ -911,10 +1005,9 @@ static void on_key(WPARAM w)
     if (w == VK_UP) move_row(-1);
     else if (w == VK_DOWN) move_row(1);
     else if (w == VK_PRIOR || w == VK_NEXT || ((w == VK_LEFT || w == VK_RIGHT) && s_sel < 0)) {
-        s_page = !s_page;
-        s_col = 0;
-        s_status[0] = 0;
-        if (s_sel >= page_rows()) s_sel = page_rows() - 1;
+        set_page(s_page + (w == VK_NEXT || w == VK_RIGHT ? 1 : -1));
+    } else if (s_page == PAGE_EXTRAS && (w == VK_LEFT || w == VK_RIGHT)) {
+        /* nothing to step on the EXTRAS page */
     } else if (w == VK_LEFT || w == VK_RIGHT) {
         int dir = w == VK_RIGHT ? 1 : -1;
         if (s_page == PAGE_CONTROLS && s_sel < kb_action_count)
@@ -922,7 +1015,7 @@ static void on_key(WPARAM w)
         else
             nudge(s_sel, dir);
     } else if (w == VK_RETURN || w == VK_SPACE) {
-        if (s_sel < 0) s_sel = 0;
+        if (s_sel < 0) s_sel = s_page == PAGE_EXTRAS ? -1 : 0;
         else activate(s_sel);
     } else if (w == 'U' && update_available()) {
         start_update();
@@ -1005,6 +1098,16 @@ static void poll_pad(void)
     }
     if (mode == MODE_NONE || s_listen)
         return;
+    if (mode == MODE_SET && video_playing()) {   /* A or START pause, X subtitles, B or BACK back to the menu */
+        if (press & (0x1000 | 0x0010)) on_key(VK_SPACE);
+        if (press & 0x4000) on_key('S');
+        if (press & (0x2000 | 0x0020)) {
+            on_key(VK_ESCAPE);
+            s_unblock = 1;                        /* the B still held does not close the menu */
+        }
+        s_repeat_dir = 0;
+        return;
+    }
 
     if (press & 0x0001) on_key(VK_UP);
     if (press & 0x0002) on_key(VK_DOWN);
@@ -1014,7 +1117,7 @@ static void poll_pad(void)
     if (press & (0x2000 | 0x0010)) on_key(VK_ESCAPE);
 
     /* Repeat left/right while held, after a short delay (settings only). */
-    if (mode == MODE_SET && (b & 0x000C) && !(s_page == PAGE_CONTROLS && s_sel < kb_action_count)) {
+    if (mode == MODE_SET && (b & 0x000C) && s_page != PAGE_EXTRAS && !(s_page == PAGE_CONTROLS && s_sel < kb_action_count)) {
         int dir = (b & 0x0008) ? 1 : -1;
         if (s_repeat_dir != dir) {
             s_repeat_dir = dir;
@@ -1061,6 +1164,12 @@ static int on_mouse(UINT m, WPARAM w, LPARAM l)
         SetCursor(LoadCursorA(NULL, IDC_ARROW));
         return 1;
     }
+#ifndef H2_DOWNLOADER
+    if (mode == MODE_SET && video_playing() && (m == WM_MOUSEWHEEL || (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST))) {
+        if (m == WM_MOUSEMOVE) extras_player_mouse(0);   /* the video has the window: a move shows its keys */
+        return 1;
+    }
+#endif
     if (m == WM_MOUSEWHEEL) {
         if (mode == MODE_SET)
             move_row(GET_WHEEL_DELTA_WPARAM(w) > 0 ? -1 : 1);
@@ -1093,17 +1202,25 @@ static int on_mouse(UINT m, WPARAM w, LPARAM l)
         return 1;
     }
     if (left)
-        for (i = 0; i < 2; i++)
+        for (i = 0; i < PAGE_COUNT; i++)
             if (PtInRect(&s_tab_r[i], p)) {
                 if (s_page != i) {
-                    s_page = i;
                     s_sel = 0;
-                    s_col = 0;
-                    s_status[0] = 0;
+                    set_page(i);
                 }
                 s_set_armed = 0;
                 return 1;
             }
+#ifndef H2_DOWNLOADER
+    if (s_page == PAGE_EXTRAS) {
+        extras_hover(p.x, p.y);
+        if (left) {
+            extras_click(NULL, p.x, p.y);       /* PLAY: the video starts here */
+            if (extras_selected() >= 0) s_sel = extras_selected();
+        }
+        return 1;
+    }
+#endif
     if (s_page == PAGE_VIDEO) {
         if (update_available() && PtInRect(&s_upd_r, p))
             s_sel = IT_UPDATE;                       /* pointing at UPDATE selects it */
@@ -1204,6 +1321,9 @@ static LRESULT CALLBACK overlay_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             poll_listen_mouse();
         build_tick();
         poll_pad();
+#ifndef H2_DOWNLOADER
+        video_sound_tick();
+#endif
 #ifdef RECOMP_DEBUG_TOOLS
         fps_tick();
 #endif

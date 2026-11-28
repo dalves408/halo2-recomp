@@ -94,7 +94,9 @@ static void note_n(uint32_t subch, uint32_t method, uint32_t count)
 {
     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
 
-    if (!count)
+    /* Only RECOMP_PB_SCAN prints the inventory (nv2a_pb_scan_report); counting it
+     * for every word otherwise was 2-3% of the GPU-command thread (2026-11-27). */
+    if (!count || s_scan_enabled != 1)
         return;
     if (*slot) {
         s_seen[*slot - 1].count += count;

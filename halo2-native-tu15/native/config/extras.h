@@ -18,6 +18,25 @@ const char *extras_status(void);
 int  extras_busy(void);
 void extras_cancel(void);
 
+/* The game's F1 menu: the same page without ADD MAP PACK DISC and re-encoding (config.exe keeps those). */
+void extras_init_game(HWND game, const char *root);
+/* Reads again what is installed (extras_init does it). */
+void extras_refresh(void);
+/* The next installed video from cur in dir (+1 / -1), else cur when installed, else the first; -1 = none. */
+int  extras_next_video(int cur, int dir);
+int  extras_selected(void);
+void extras_select(int i);
+
+/* The player plays in the page's own window: while extras_playing(), the window draws extras_draw_player over its
+ * whole client area and passes its keys to extras_key (Space pause, S subtitles, Esc close; config.exe also F11 and
+ * Enter full screen). A video that ends closes by itself (config.exe gets WM_APP_EXTRAS). */
+void extras_play(int i);
+int  extras_playing(void);
+void extras_stop(void);
+void extras_draw_player(HDC dc, const RECT *area);
+int  extras_key(int vk);
+void extras_player_mouse(int dblclick);
+
 #define WM_APP_EXTRAS (WM_APP + 21)
 
 #endif

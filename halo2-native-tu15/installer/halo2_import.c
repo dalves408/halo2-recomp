@@ -2,7 +2,7 @@
  * (after Marvel vs. Capcom 2's mvc2_import).
  *
  *   halo2_import <source> <dest_dir> [--update <title update>]
- *   halo2_import --prepare <source> <dest_dir>       (RecompLauncher setup: see below)
+ *   halo2_import --prepare <source> <dest_dir> [--mappack=<disc>] [--mappack-videos]   (RecompLauncher setup)
  *
  * <source> is an Xbox disc image (.iso: a full Redump image or a plain XISO) or a folder holding the disc's files
  * (the one with default.xbe). A folder that already has title update 1.5 applied is a complete source on its own.
@@ -23,6 +23,13 @@
  * in at the end, so a failed run never leaves a half-written game folder (an existing one is kept until then).
  * A folder that already holds every file is kept, with no copy (RecompLauncher runs this again for every new
  * release; see sdk_prepare).
+ *
+ * --mappack=<disc> (RecompLauncher's optional "Map Pack disc" input; the argument is left out when the player gives
+ * none): once the game files are ready, halo2_mappack.exe (beside this program) installs the Halo 2 Multiplayer Map
+ * Pack disc's maps into <install>\data, and with --mappack-videos (a tick on the launcher's setup screen) its bonus
+ * videos into <install>\extras, <install> being <dest_dir>'s parent. Its progress is the last part of this step's.
+ * Files already there and right are kept, so running it again costs only the checks. Exit codes 8 (not the Map Pack
+ * disc, or it could not be read) and 9 (its files are damaged) are the Map Pack's; 6 is any failed write.
  *
  * Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image, 4 not the supported Halo 2 disc, 5 files missing
  * or damaged, 6 cannot write, 7 title update 1.5 not found or not the right one (and no patch to make it). */
@@ -49,6 +56,7 @@ static DiscFile g_disc[MANIFEST_COUNT];
 static unsigned long long g_disc_xbe_sector;
 static int g_disc_xbe_found;
 static int g_sdk;
+static double g_sdk_span = 1.0;   /* the game files' share of the progress (less with a Map Pack disc after them) */
 /* the retail disc's default.xbe and downloader.xbe, kept for the title update patch */
 static const unsigned char DISC_DL_SHA256[32] = {   /* 9b10c579...c03c698 */
     0x9b,0x10,0xc5,0x79,0x6f,0x73,0x75,0xdc,0x73,0x35,0x2d,0x77,0x51,0xae,0x45,0xa8,
@@ -65,7 +73,7 @@ static const char *g_progress_text = "Copying game files";
 static void progress(void)
 {
     if (g_sdk)
-        printf("progress %.4f %s\n", 0.05 + 0.9 * (double)g_done / (double)(g_total ? g_total : 1),
+        printf("progress %.4f %s\n", g_sdk_span * (0.05 + 0.9 * (double)g_done / (double)(g_total ? g_total : 1)),
                g_progress_text);
     else
         printf("PROGRESS %llu %llu\n", g_done, g_total);
@@ -758,7 +766,7 @@ static int folder_complete(const WCHAR *dir)
     return 1;
 }
 
-static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
+static int sdk_prepare_game(const WCHAR *source, const WCHAR *destination)
 {
     WCHAR dest[MAX_PATH], stage[MAX_PATH], backup[MAX_PATH], parent[MAX_PATH], *sl;
     DWORD n = GetFullPathNameW(destination, MAX_PATH, dest, NULL), attr;
@@ -777,13 +785,13 @@ static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
     if (id[0] && attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
         !(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
         if (stamp_matches(dest, id)) {
-            puts("progress 1 Already built");
+            printf("progress %g Already built\n", g_sdk_span);
             fflush(stdout);
             return 0;
         }
         if (folder_complete(dest)) {
             stamp_write(dest, id);
-            puts("progress 1 Game files are ready (already in place)");
+            printf("progress %g Game files are ready (already in place)\n", g_sdk_span);
             fflush(stdout);
             return 0;
         }
@@ -809,17 +817,111 @@ static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
     if (had_old) remove_tree(backup);
     if (id[0])
         stamp_write(dest, id);
-    puts("progress 1 Game files are ready");
+    printf("progress %g Game files are ready\n", g_sdk_span);
     fflush(stdout);
     return 0;
 }
 
+/* The Map Pack disc after the game files: halo2_mappack.exe <disc> <install>\data [--videos <install>\extras], its
+ * "PROGRESS done total" lines turned into this step's progress and its "ERROR ..." line passed on. */
+static int sdk_mappack(const WCHAR *disc, const WCHAR *destination, int videos)
+{
+    WCHAR dest[MAX_PATH], root[MAX_PATH], exe[MAX_PATH], data[MAX_PATH], extras[MAX_PATH], *sl;
+    WCHAR *cmd;
+    SECURITY_ATTRIBUTES sa;
+    HANDLE rd = NULL, wr = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD code = 99, n;
+    char line[512], c;
+    size_t ln = 0, cn;
+    const char *what = videos ? "Map Pack disc: maps and bonus videos" : "Map Pack disc: maps";
+
+    GetFullPathNameW(destination, MAX_PATH, dest, NULL);
+    n = (DWORD)wcslen(dest);
+    while (n > 3 && (dest[n - 1] == L'\\' || dest[n - 1] == L'/')) dest[--n] = 0;
+    wcscpy_s(root, MAX_PATH, dest);
+    if ((sl = wcsrchr(root, L'\\')) != NULL) *sl = 0;
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if ((sl = wcsrchr(exe, L'\\')) != NULL) wcscpy_s(sl + 1, MAX_PATH - (sl + 1 - exe), L"halo2_mappack.exe");
+    swprintf_s(data, MAX_PATH, L"%s\\data", root);
+    swprintf_s(extras, MAX_PATH, L"%s\\extras", root);
+    cn = wcslen(exe) + wcslen(disc) + wcslen(data) + wcslen(extras) + 64;
+    cmd = (WCHAR *)calloc(cn, sizeof(WCHAR));
+    if (!cmd) return 6;
+    if (videos) swprintf_s(cmd, cn, L"\"%s\" \"%s\" \"%s\" --videos \"%s\"", exe, disc, data, extras);
+    else swprintf_s(cmd, cn, L"\"%s\" \"%s\" \"%s\"", exe, disc, data);
+    memset(&sa, 0, sizeof sa);
+    sa.nLength = sizeof sa;
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) { free(cmd); return 6; }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = wr;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    printf("progress %.4f %s\n", g_sdk_span, what);
+    fflush(stdout);
+    if (!CreateProcessW(exe, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        printf("ERROR halo2_mappack.exe could not be started (error %lu).\n", GetLastError());
+        CloseHandle(rd); CloseHandle(wr); free(cmd);
+        return 6;
+    }
+    free(cmd);
+    CloseHandle(wr);
+    while (ReadFile(rd, &c, 1, &n, NULL) && n) {
+        if (c == '\r') continue;
+        if (c != '\n') { if (ln < sizeof line - 1) line[ln++] = c; continue; }
+        line[ln] = 0;
+        ln = 0;
+        if (!strncmp(line, "PROGRESS ", 9)) {
+            unsigned long long done = 0, total = 0;
+            if (sscanf(line + 9, "%llu %llu", &done, &total) == 2 && total) {
+                printf("progress %.4f %s\n", g_sdk_span + (1.0 - g_sdk_span) * (double)done / (double)total, what);
+                fflush(stdout);
+            }
+        } else if (!strncmp(line, "ERROR ", 6)) {
+            printf("%s\n", line);
+            fflush(stdout);
+        }
+    }
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (code == 0) {
+        printf("progress 1 %s installed\n", videos ? "Map Pack maps and videos" : "Map Pack maps");
+        fflush(stdout);
+        return 0;
+    }
+    return code == 6 ? 6 : code == 5 ? 9 : 8;
+}
+
+static int sdk_prepare(const WCHAR *source, const WCHAR *destination, const WCHAR *mappack, int videos)
+{
+    int r;
+    g_sdk_span = mappack && *mappack ? 0.6 : 1.0;
+    r = sdk_prepare_game(source, destination);
+    if (r || !mappack || !*mappack) return r;
+    return sdk_mappack(mappack, destination, videos);
+}
+
 int wmain(int argc, wchar_t **argv)
 {
-    if (argc == 4 && !wcscmp(argv[1], L"--prepare")) return sdk_prepare(argv[2], argv[3]);
+    if (argc >= 4 && !wcscmp(argv[1], L"--prepare")) {
+        const WCHAR *mappack = NULL;
+        int i, videos = 0;
+        for (i = 4; i < argc; i++) {
+            if (!wcsncmp(argv[i], L"--mappack=", 10)) mappack = argv[i] + 10;
+            else if (!wcscmp(argv[i], L"--mappack-videos")) videos = 1;
+        }
+        return sdk_prepare(argv[2], argv[3], mappack, videos);
+    }
     if (argc == 3) return run_import(argv[1], argv[2], NULL, argv[2]);
     if (argc == 5 && !wcscmp(argv[3], L"--update")) return run_import(argv[1], argv[2], argv[4], argv[2]);
     printf("usage: halo2_import <iso or folder> <dest folder> [--update <title update folder>]\n"
-           "       halo2_import --prepare <iso or folder> <dest folder>\n");
+           "       halo2_import --prepare <iso or folder> <dest folder> [--mappack=<disc>] [--mappack-videos]\n");
     return 2;
 }
